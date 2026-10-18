@@ -10,7 +10,7 @@ export TERM="${TERM:-xterm-256color}"
 # 0. ROOT CHECK, USER ENVIRONMENT & LOCAL LOGGING
 # ------------------------------------------------------------------------------
 if [[ "$EUID" -ne 0 ]]; then
-    echo -e "\033[0;31m[ERROR]\033[0m Please run this script with sudo: sudo ./manjaro_maintain.sh"
+    echo -e "\033[0;31m[ERROR]\033[0m Please run this script with sudo: sudo ./Manjaro-OPT.sh"
     exit 1
 fi
 
@@ -247,7 +247,7 @@ optimize_system() {
         timedatectl set-local-rtc 1 --adjust-system-clock
     fi
 
-    log_info "6/11: Applying Btrfs NVMe 'noatime' mount optimization..."
+    log_info "6/12: Applying Btrfs NVMe 'noatime' mount optimization..."
     if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "noatime"; then
         sed -i 's/defaults,compress=zstd/defaults,noatime,compress=zstd/g' /etc/fstab
         mount -o remount / 2>/dev/null || true
@@ -257,7 +257,10 @@ optimize_system() {
         log_ok "Btrfs subvolumes remounted with noatime."
     fi
 
-    log_info "7/11: Setting up ZRAM (RAM-compressed swap)..."
+    log_info "7/12: Configuring permanent partition mounts (fstab auto-mount, release user sessions, UI labels)..."
+    configure_permanent_partitions
+
+    log_info "8/12: Setting up ZRAM (RAM-compressed swap)..."
     pacman -S --needed --noconfirm zram-generator > /dev/null 2>&1 || true
     if [[ ! -f /etc/systemd/zram-generator.conf ]]; then
         cat << 'EOF' > /etc/systemd/zram-generator.conf
@@ -270,7 +273,7 @@ EOF
     modprobe zram 2>/dev/null || true
     systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
 
-    log_info "8/11: Tuning kernel sysctl parameters for 32GB RAM & TCP BBR..."
+    log_info "9/12: Tuning kernel sysctl parameters for 32GB RAM & TCP BBR..."
     cat << 'EOF' > /etc/sysctl.d/99-dell-perf.conf
 vm.swappiness = 100
 vm.vfs_cache_pressure = 50
@@ -281,7 +284,7 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
     sysctl --system > /dev/null 2>&1 || true
 
-    log_info "9/11: Enabling Intel GuC/HuC microcontrollers & thermald..."
+    log_info "10/12: Enabling Intel GuC/HuC microcontrollers & thermald..."
     cat << 'EOF' > /etc/modprobe.d/i915.conf
 options i915 enable_guc=3
 EOF
@@ -292,11 +295,11 @@ EOF
     systemctl enable --now fstrim.timer > /dev/null 2>&1 || true
     systemctl enable --now paccache.timer > /dev/null 2>&1 || true
 
-    log_info "10/11: Enabling Desktop Icons & Disabling Top-Left Hot Corner..."
+    log_info "11/12: Enabling Desktop Icons & Disabling Top-Left Hot Corner..."
     configure_desktop_icons enable
     configure_hot_corner disable
 
-    log_info "11/11: Performing Deep System Clutter Cleanup..."
+    log_info "12/12: Performing Deep System Clutter Cleanup..."
     rm -rf /var/tmp/pamac-build-* /var/tmp/pamac-*
     sudo -u "$REAL_USER" rm -rf "$USER_HOME/.cache/pamac" 2>/dev/null || true
     paccache -r -k 2 > /dev/null 2>&1 || true
@@ -307,7 +310,7 @@ EOF
     log_info "Running SSD TRIM..."
     fstrim -va > /dev/null 2>&1 || true
 
-    log_ok "Optimization complete! Desktop icons enabled, hot corners disabled, and hardware peak tuned."
+    log_ok "Optimization complete! Desktop icons enabled, permanent partitions mounted, hot corners disabled, and hardware peak tuned."
     read -rp "Press [Enter] to return to the main menu..."
 }
 
@@ -611,7 +614,208 @@ menu_uninstall() {
 }
 
 # ------------------------------------------------------------------------------
-# 6. SUBMENU: DESKTOP & GNOME UI SETTINGS
+# 6. STORAGE & PERMANENT PARTITION MANAGEMENT
+# ------------------------------------------------------------------------------
+configure_permanent_partitions() {
+    echo ""
+    log_info "=== CONFIGURING PERMANENT STORAGE MOUNTS & UI LABELS ==="
+    log_info "Scanning all disk partitions to eliminate temporary user-session mounts..."
+
+    local root_uuid boot_uuid efi_uuid home_uuid
+    root_uuid=$(findmnt -n -o UUID / 2>/dev/null || true)
+    boot_uuid=$(findmnt -n -o UUID /boot 2>/dev/null || true)
+    efi_uuid=$(findmnt -n -o UUID /boot/efi 2>/dev/null || true)
+    home_uuid=$(findmnt -n -o UUID /home 2>/dev/null || true)
+
+    local fstab_bak="/etc/fstab.bak.$(date +%Y%m%d_%H%M%S)"
+    cp -p /etc/fstab "$fstab_bak"
+    log_ok "Created safety backup of /etc/fstab at: $fstab_bak"
+
+    mkdir -p /mnt /media 2>/dev/null || true
+
+    # Ensure desktop volume display is enabled in GNOME desktop icons extensions
+    run_as_user gsettings set org.gnome.shell.extensions.gtk4-ding show-volumes true 2>/dev/null || true
+    run_as_user gsettings set org.gnome.shell.extensions.ding show-volumes true 2>/dev/null || true
+
+    local configured_count=0
+    local skipped_count=0
+
+    while IFS= read -r blk_line; do
+        unset NAME TYPE FSTYPE LABEL UUID
+        eval "$blk_line"
+
+        # Only process block device partitions and decrypted LUKS volumes
+        [[ "$TYPE" != "part" && "$TYPE" != "crypt" ]] && continue
+        [[ -z "$FSTYPE" || "$FSTYPE" == "swap" ]] && continue
+        [[ -z "$UUID" ]] && continue
+
+        # Skip core OS system partitions
+        if [[ "$UUID" == "$root_uuid" || "$UUID" == "$boot_uuid" || "$UUID" == "$efi_uuid" ]]; then
+            ((skipped_count++))
+            continue
+        fi
+
+        # Skip partitions already assigned to system root hierarchies in fstab (e.g., /home, /var, /usr)
+        if awk -v u="$UUID" '$1 ~ u && $2 ~ /^\/(boot|efi|home|var|usr|etc)?$/ { found=1 } END { exit !found }' /etc/fstab 2>/dev/null; then
+            ((skipped_count++))
+            continue
+        fi
+
+        local dev_path="/dev/$NAME"
+
+        # Resolve or generate clean label
+        if [[ -z "$LABEL" ]]; then
+            LABEL=$(blkid -s LABEL -o value "$dev_path" 2>/dev/null || true)
+            [[ -z "$LABEL" ]] && LABEL="disk-${UUID:0:8}"
+        fi
+
+        # Sanitize directory name for /mnt mount point (replace spaces/slashes with -/_)
+        local clean_label
+        clean_label=$(echo "$LABEL" | tr ' /' '_-' | tr -cd '[:alnum:]_.-')
+        [[ -z "$clean_label" ]] && clean_label="disk-${UUID:0:8}"
+
+        local mount_point="/mnt/$clean_label"
+        local encoded_label
+        encoded_label=$(echo "$LABEL" | sed 's/ /%20/g')
+
+        log_info "Processing partition: ${BOLD}$NAME${NC} [Label: ${CYAN}$LABEL${NC}, UUID: $UUID, FS: $FSTYPE]"
+
+        # 1. Detect and remove existing user session mounts (e.g. /run/media/$USER/*)
+        local user_mounts
+        user_mounts=$(findmnt -n -l -o TARGET -S "$dev_path" 2>/dev/null | grep -E "^/run/media/" || true)
+        if [[ -z "$user_mounts" ]]; then
+            user_mounts=$(findmnt -n -l -o TARGET -S "UUID=$UUID" 2>/dev/null | grep -E "^/run/media/" || true)
+        fi
+
+        local was_busy=false
+        if [[ -n "$user_mounts" ]]; then
+            while IFS= read -r um_path; do
+                [[ -z "$um_path" ]] && continue
+                log_info "Detected user-session mount for $LABEL at $um_path. Releasing user session..."
+                if umount "$um_path" 2>/dev/null; then
+                    log_ok "Successfully released user-session mount: $um_path"
+                    rmdir "$um_path" 2>/dev/null || true
+                else
+                    log_warn "Target $um_path is currently in active use (busy). Configured in /etc/fstab for boot mount; will cleanly transition to $mount_point on reboot."
+                    was_busy=true
+                fi
+            done <<< "$user_mounts"
+        fi
+
+        # 2. Determine optimal fstab driver and options
+        local fs_driver="$FSTYPE"
+        local fs_opts="defaults,noatime,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
+        local dump_val=0
+        local pass_val=0
+
+        case "$FSTYPE" in
+            btrfs)
+                fs_driver="btrfs"
+                local existing_subvol
+                existing_subvol=$(findmnt -n -o OPTIONS -S "$dev_path" 2>/dev/null | grep -o 'subvol=[^,]*' | head -n1 || true)
+                local subvol_opt=""
+                if [[ -n "$existing_subvol" && "$existing_subvol" != "subvol=/" ]]; then
+                    subvol_opt="${existing_subvol},"
+                fi
+                fs_opts="defaults,noatime,${subvol_opt}compress=zstd,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
+                dump_val=0
+                pass_val=0
+                ;;
+            ntfs)
+                if modprobe ntfs3 2>/dev/null || lsmod | grep -q "^ntfs3"; then
+                    fs_driver="ntfs3"
+                elif command -v ntfs-3g &>/dev/null; then
+                    fs_driver="ntfs-3g"
+                else
+                    fs_driver="ntfs"
+                fi
+                fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
+                dump_val=0
+                pass_val=0
+                ;;
+            vfat|exfat)
+                fs_driver="$FSTYPE"
+                fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
+                dump_val=0
+                pass_val=0
+                ;;
+            ext4|ext3|ext2)
+                fs_driver="$FSTYPE"
+                fs_opts="defaults,noatime,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
+                dump_val=0
+                pass_val=2
+                ;;
+            *)
+                fs_driver="$FSTYPE"
+                fs_opts="defaults,noatime,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
+                dump_val=0
+                pass_val=0
+                ;;
+        esac
+
+        mkdir -p "$mount_point"
+
+        # 3. Add or update in /etc/fstab
+        if grep -q "UUID=$UUID" /etc/fstab; then
+            log_info "Updating existing /etc/fstab entry for $NAME ($LABEL)..."
+            sed -i "\|UUID=$UUID|d" /etc/fstab
+        else
+            log_info "Adding new startup mount for $NAME ($LABEL) to /etc/fstab..."
+        fi
+
+        [[ -n "$(tail -c1 /etc/fstab 2>/dev/null)" ]] && echo "" >> /etc/fstab
+        printf "UUID=%-36s %-20s %-8s %-65s %d %d\n" \
+            "$UUID" "$mount_point" "$fs_driver" "$fs_opts" "$dump_val" "$pass_val" >> /etc/fstab
+
+        # 4. Mount partition now to the permanent mount point
+        if ! findmnt -n "$mount_point" &>/dev/null; then
+            mount "$mount_point" 2>/dev/null || mount -t "$fs_driver" -o "$fs_opts" "UUID=$UUID" "$mount_point" 2>/dev/null || true
+        fi
+
+        if findmnt -n "$mount_point" &>/dev/null; then
+            log_ok "Mounted $NAME ($LABEL) at $mount_point"
+            # Set directory ownership for non-root user if Linux filesystem
+            if [[ "$fs_driver" =~ ^(btrfs|ext[234]|xfs|f2fs)$ ]] && [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+                chown "$REAL_USER:" "$mount_point" 2>/dev/null || true
+                chmod 755 "$mount_point" 2>/dev/null || true
+            fi
+        else
+            log_warn "Partition $NAME ($LABEL) added to /etc/fstab for boot mount (could not mount immediately, possibly Windows hibernation/lock)."
+        fi
+
+        # 5. Create symlinks for universal backward compatibility
+        ln -sfn "$mount_point" "/media/$clean_label" 2>/dev/null || true
+        if [[ -d "/run/media/$REAL_USER" ]] && [[ "$was_busy" != "true" ]]; then
+            ln -sfn "$mount_point" "/run/media/$REAL_USER/$clean_label" 2>/dev/null || true
+        fi
+
+        ((configured_count++))
+    done < <(lsblk -P -o NAME,TYPE,FSTYPE,LABEL,UUID)
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    echo ""
+    log_ok "Permanent storage setup complete! ($configured_count partition(s) configured, $skipped_count system partition(s) preserved)"
+    echo -e "${BOLD}Summary of Persistent Partitions:${NC}"
+    printf "%-12s %-16s %-10s %-22s %-20s\n" "DEVICE" "LABEL" "FILESYSTEM" "STARTUP MOUNT" "UI DISPLAY NAME"
+    echo "----------------------------------------------------------------------------------------"
+    while IFS= read -r blk_line; do
+        unset NAME TYPE FSTYPE LABEL UUID
+        eval "$blk_line"
+        [[ "$TYPE" != "part" && "$TYPE" != "crypt" ]] && continue
+        if grep -q "UUID=$UUID" /etc/fstab && grep "UUID=$UUID" /etc/fstab | grep -q "x-gvfs-show"; then
+            local mp gvfs_name
+            mp=$(awk -v u="$UUID" '$1 ~ u { print $2 }' /etc/fstab)
+            gvfs_name=$(grep "UUID=$UUID" /etc/fstab | grep -o 'x-gvfs-name=[^, ]*' | cut -d= -f2 | sed 's/%20/ /g')
+            printf "%-12s %-16s %-10s %-22s %-20s\n" "$NAME" "${LABEL:-N/A}" "$FSTYPE" "$mp" "$gvfs_name"
+        fi
+    done < <(lsblk -P -o NAME,TYPE,FSTYPE,LABEL,UUID)
+    echo "----------------------------------------------------------------------------------------"
+    log_info "All partitions are set to mount at system startup and display identified by label in GNOME Files & Desktop."
+}
+
+# ------------------------------------------------------------------------------
+# 7. SUBMENU: DESKTOP & GNOME UI SETTINGS
 # ------------------------------------------------------------------------------
 menu_desktop_settings() {
     while true; do
@@ -631,10 +835,12 @@ menu_desktop_settings() {
         echo -e " 2) Top-Left Hot Corner          $hc_st"
         echo -e "    ${BLUE}↳${NC} Toggle Activities overview trigger when hitting top-left corner."
         echo -e " 3) Apply Recommended Preset (Desktop Icons ON, Hot Corner OFF)"
+        echo -e " 4) Configure Permanent Drive Mounts & UI Labels"
+        echo -e "    ${BLUE}↳${NC} Auto-mount all data partitions at boot and display labeled in Files & Desktop."
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-3 / B): " choice
+        read -rp "Select an option (1-4 / B): " choice
 
         case "$choice" in
             1)
@@ -659,6 +865,10 @@ menu_desktop_settings() {
                 log_ok "Applied recommended preset: Desktop Icons Enabled & Hot Corner Disabled."
                 read -rp "Press [Enter] to continue..."
                 ;;
+            4)
+                configure_permanent_partitions
+                read -rp "Press [Enter] to continue..."
+                ;;
             [bB]) break ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -666,7 +876,7 @@ menu_desktop_settings() {
 }
 
 # ------------------------------------------------------------------------------
-# 7. MAIN MENU
+# 8. MAIN MENU
 # ------------------------------------------------------------------------------
 while true; do
     echo ""
@@ -698,3 +908,4 @@ while true; do
             ;;
     esac
 done
+
