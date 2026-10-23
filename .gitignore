@@ -1,2 +1,4 @@
-manjaro_maintain.log
 Manjaro-Optimization.log
+drivers/goodix-538d/src/
+drivers/goodix-538d/pkg/
+drivers/goodix-538d/libfprint/

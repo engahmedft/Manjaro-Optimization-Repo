@@ -76,11 +76,11 @@ NC='\033[0m'
 # Session-wide snapshot guard (ensures only 1 restore point is created per script run)
 SESSION_SNAPSHOT_TAKEN=false
 
-timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
-log_info()    { echo -e "[$(timestamp)] ${BLUE}[INFO]${NC} $1"; }
-log_ok()      { echo -e "[$(timestamp)] ${GREEN}[OK]${NC} $1"; }
-log_warn()    { echo -e "[$(timestamp)] ${YELLOW}[WARN]${NC} $1"; }
-log_error()   { echo -e "[$(timestamp)] ${RED}[ERROR]${NC} $1"; }
+timestamp() { printf '%(%Y-%m-%d %H:%M:%S)T' -1; }
+log_info()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;34m[INFO]\033[0m %b\n' -1 "$1"; }
+log_ok()      { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;32m[OK]\033[0m %b\n' -1 "$1"; }
+log_warn()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[1;33m[WARN]\033[0m %b\n' -1 "$1"; }
+log_error()   { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;31m[ERROR]\033[0m %b\n' -1 "$1"; }
 
 check_pacman_lock() {
     if [[ -f /var/lib/pacman/db.lck ]]; then
@@ -96,15 +96,13 @@ check_pacman_lock() {
 }
 
 is_pkg_installed() {
-    local out
-    out=$(pacman -Qq "$1" 2>/dev/null) || return 1
-    grep -Fxq "$1" <<< "$out"
+    pacman -Q "$1" &>/dev/null
 }
 
 is_bin_installed() { 
-    command -v "$1" &> /dev/null || \
+    command -v "$1" &>/dev/null || \
     [[ -x "$USER_HOME/.local/bin/$1" ]] || \
-    sudo -u "$REAL_USER" bash -c "command -v '$1'" &> /dev/null
+    [[ -x "/usr/bin/$1" ]] || [[ -x "/usr/local/bin/$1" ]]
 }
 
 sync_grub_snapshots() {
@@ -236,6 +234,8 @@ init_downloads() {
             sed -i "s|'http::/usr/bin/curl.*'|$aria_rule_http|" "$conf"
             # Optimize makepkg to utilize all CPU threads (i7-1165G7 8 threads)
             sed -i 's/^#*MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' "$conf"
+            # Enable multi-threaded zstd package compression for rapid AUR building
+            sed -i 's/^COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' "$conf"
         fi
     done
 
@@ -522,6 +522,10 @@ EOF
     systemctl enable --now power-profiles-daemon.service > /dev/null 2>&1 || true
     systemctl enable --now fstrim.timer > /dev/null 2>&1 || true
     systemctl enable --now paccache.timer > /dev/null 2>&1 || true
+
+    # Optimize NVMe SSD read-ahead (256KB) for faster sequential reads & project indexing
+    echo 'ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/read_ahead_kb}="256"' > /etc/udev/rules.d/60-nvme-readahead.rules
+    udevadm control --reload-rules && udevadm trigger --subsystem-match=block 2>/dev/null || true
 
     # Check and configure Goodix 27c6:538d fingerprint sensor
     if lsusb | grep -qi "27c6:538d"; then
@@ -1311,6 +1315,15 @@ maintain_btrfs_storage() {
             btrfs filesystem df "$mp" || true
             log_info "Executing block group balance on $mp (usage <= 10%)..."
             btrfs balance start -dusage=10 -musage=10 "$mp" 2>/dev/null || true
+
+            log_info "Auditing NVMe Btrfs hardware health and I/O error stats on $mp..."
+            local dev_stats
+            dev_stats=$(btrfs device stats "$mp" 2>/dev/null || true)
+            if echo "$dev_stats" | grep -v " 0$" | grep -qE "errs"; then
+                log_warn "Btrfs detected hardware device errors on $mp:\n$dev_stats"
+            else
+                log_ok "Btrfs hardware device stats on $mp clean (0 write/read/flush/corruption errors)."
+            fi
         fi
     done
 
@@ -1374,7 +1387,7 @@ configure_goodix_fingerprint() {
     # Tier 2: Makepkg / AUR build fallback
     if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
         log_info "Tier 2: Building patched driver from PKGBUILD via makepkg..."
-        pacman -S --needed --noconfirm git cmake pkg-config libgudev libgusb nss pixman openssl
+        pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
         if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -f --nodeps" 2>/dev/null; then
             local new_pkg
             new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)

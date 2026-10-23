@@ -69,7 +69,7 @@ fi
 # ------------------------------------------------------------------------------
 if [[ "$INSTALLED" == "false" && -f "$SCRIPT_DIR/PKGBUILD" ]]; then
     log_info "Tier 2: Building package from local PKGBUILD using makepkg..."
-    pacman -S --needed --noconfirm git cmake pkg-config libgudev libgusb nss pixman openssl
+    pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
     
     # Run makepkg as the regular user
     if sudo -u "$REAL_USER" bash -c "cd '$SCRIPT_DIR' && makepkg -f --nodeps"; then
