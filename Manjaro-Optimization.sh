@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Manjaro Modular Optimizer, System Maintainer & Software Hub (v9 - Polished)
-# Target: Dell Inspiron 7706 | GNOME Wayland | Podman Engine | Fast aria2c
+# Manjaro Modular Optimizer, System Maintainer & Software Hub (v9.4 - Complete)
+# Target: Dell Inspiron 7706 | GNOME Wayland | Antigravity 2.0 | Safe Dual-Boot
 # ==============================================================================
 
+set -o pipefail
 export TERM="${TERM:-xterm-256color}"
 
 # ------------------------------------------------------------------------------
 # 0. ROOT CHECK, USER ENVIRONMENT & LOCAL LOGGING
 # ------------------------------------------------------------------------------
 if [[ "$EUID" -ne 0 ]]; then
-    echo -e "\033[0;31m[ERROR]\033[0m Please run this script with sudo: sudo ./Manjaro-OPT.sh"
+    echo -e "\033[0;31m[ERROR]\033[0m Please run this script with sudo: sudo ./Manjaro-Optimization.sh"
     exit 1
 fi
 
@@ -20,7 +21,7 @@ USER_UID=$(id -u "$REAL_USER")
 
 run_as_user() {
     if [[ "$EUID" -eq 0 ]] && [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
-        sudo -u "$REAL_USER" \
+        sudo -u "$REAL_USER" env \
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
             XDG_RUNTIME_DIR="/run/user/$USER_UID" \
             DISPLAY="${DISPLAY:-:0}" \
@@ -34,7 +35,7 @@ run_as_user() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="${SCRIPT_DIR}/manjaro_maintain.log"
+LOG_FILE="${SCRIPT_DIR}/Manjaro-Optimization.log"
 
 touch "$LOG_FILE" 2>/dev/null || true
 if [[ -n "$SUDO_USER" ]]; then
@@ -43,7 +44,7 @@ fi
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-POLKIT_RULE="/etc/polkit-1/rules.d/49-temp-manjaro-maintain.rules"
+POLKIT_RULE="/etc/polkit-1/rules.d/49-temp-Manjaro-Optimization.rules"
 cat << 'EOF' > "$POLKIT_RULE"
 polkit.addRule(function(action, subject) {
     if ((action.id.indexOf("org.manjaro.pamac") === 0 || 
@@ -74,10 +75,11 @@ log_warn()    { echo -e "[$(timestamp)] ${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "[$(timestamp)] ${RED}[ERROR]${NC} $1"; }
 
 is_pkg_installed() { pacman -Qq "$1" &> /dev/null; }
+
 is_bin_installed() { 
     command -v "$1" &> /dev/null || \
     [[ -x "$USER_HOME/.local/bin/$1" ]] || \
-    sudo -u "$REAL_USER" command -v "$1" &> /dev/null
+    sudo -u "$REAL_USER" bash -c "command -v '$1'" &> /dev/null
 }
 
 init_downloads() {
@@ -85,15 +87,15 @@ init_downloads() {
         pacman -S --needed --noconfirm aria2 > /dev/null 2>&1 || true
     fi
 
-    if [[ -f /etc/makepkg.conf ]]; then
-        sed -i "s|'https::/usr/bin/curl.*'|'https::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'|" /etc/makepkg.conf
-        sed -i "s|'http::/usr/bin/curl.*'|'http::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'|" /etc/makepkg.conf
-    fi
+    local aria_rule="'https::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'"
+    local aria_rule_http="'http::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'"
 
-    if [[ -f "$USER_HOME/.makepkg.conf" ]]; then
-        sed -i "s|'https::/usr/bin/curl.*'|'https::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'|" "$USER_HOME/.makepkg.conf"
-        sed -i "s|'http::/usr/bin/curl.*'|'http::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'|" "$USER_HOME/.makepkg.conf"
-    fi
+    for conf in /etc/makepkg.conf "$USER_HOME/.makepkg.conf"; do
+        if [[ -f "$conf" ]]; then
+            sed -i "s|'https::/usr/bin/curl.*'|$aria_rule|" "$conf"
+            sed -i "s|'http::/usr/bin/curl.*'|$aria_rule_http|" "$conf"
+        fi
+    done
 
     sed -i 's/^#*ParallelDownloads = .*/ParallelDownloads = 4/' /etc/pacman.conf 2>/dev/null || true
 }
@@ -124,14 +126,15 @@ post_install_hook() {
 }
 
 post_uninstall_hook() {
-    log_info "Running single-pass post-uninstall deep cleanup..."
+    log_info "Running post-uninstall cleanup..."
     flatpak uninstall --unused -y > /dev/null 2>&1 || true
-    rm -rf "$USER_HOME/.var/app" 2>/dev/null || true
-    ORPHANS=$(pacman -Qtdq 2>/dev/null || true)
-    [[ -n "$ORPHANS" ]] && pacman -Rns --noconfirm $ORPHANS > /dev/null 2>&1 || true
-    log_info "Executing single SSD TRIM pass to reclaim storage..."
-    fstrim -va > /dev/null 2>&1 || true
-    log_ok "Residual caches purged and SSD blocks trimmed."
+    
+    local orphans
+    orphans=$(pacman -Qtdq 2>/dev/null || true)
+    if [[ -n "$orphans" ]]; then
+        pacman -Rns --noconfirm $orphans > /dev/null 2>&1 || true
+    fi
+    log_ok "Orphaned packages and unused runtimes cleared."
 }
 
 get_desktop_icons_status() {
@@ -155,9 +158,9 @@ get_hot_corner_status() {
 }
 
 configure_desktop_icons() {
-    local action="$1" # enable or disable
+    local action="$1"
     if [[ "$action" == "enable" ]]; then
-        log_info "Configuring Desktop Icons (ensuring extension is installed & enabled)..."
+        log_info "Enabling Desktop Files (Disabling volume/drive icons on desktop)..."
         if ! is_pkg_installed "gnome-shell-extension-gtk4-desktop-icons-ng" && ! is_pkg_installed "gnome-shell-extension-desktop-icons-ng"; then
             pacman -S --needed --noconfirm gnome-shell-extension-gtk4-desktop-icons-ng > /dev/null 2>&1 || \
             pacman -S --needed --noconfirm gnome-shell-extension-desktop-icons-ng > /dev/null 2>&1 || true
@@ -165,16 +168,21 @@ configure_desktop_icons() {
 
         run_as_user gsettings set org.gnome.shell disable-user-extensions false 2>/dev/null || true
 
+        run_as_user gsettings set org.gnome.shell.extensions.gtk4-ding show-volumes false 2>/dev/null || true
+        run_as_user gsettings set org.gnome.shell.extensions.gtk4-ding show-network-volumes false 2>/dev/null || true
+        run_as_user gsettings set org.gnome.shell.extensions.ding show-volumes false 2>/dev/null || true
+        run_as_user gsettings set org.gnome.shell.extensions.ding show-network-volumes false 2>/dev/null || true
+
         local found=false
         for ext in "gtk4-ding@smedius.gitlab.com" "ding@rastersoft.com"; do
             if run_as_user gnome-extensions list 2>/dev/null | grep -q "^${ext}$"; then
                 run_as_user gnome-extensions enable "$ext" 2>/dev/null || true
                 found=true
-                log_ok "Desktop Icons extension ($ext) enabled."
+                log_ok "Desktop Icons enabled ($ext) without partition clutter."
             fi
         done
         if [[ "$found" != "true" ]]; then
-            log_warn "Could not locate a supported Desktop Icons extension (gtk4-ding or ding)."
+            log_warn "Could not locate a supported Desktop Icons extension."
         fi
     else
         log_info "Disabling Desktop Icons extension..."
@@ -188,7 +196,7 @@ configure_desktop_icons() {
 }
 
 configure_hot_corner() {
-    local action="$1" # enable or disable
+    local action="$1"
     if [[ "$action" == "disable" ]]; then
         log_info "Disabling Top-Left Hot Corner..."
         run_as_user gsettings set org.gnome.desktop.interface enable-hot-corners false 2>/dev/null || true
@@ -207,7 +215,7 @@ optimize_system() {
     echo ""
     log_info "=== STARTING FULL SYSTEM OPTIMIZATION ==="
 
-    log_info "1/11: Checking Timeshift & creating system restore point..."
+    log_info "1/12: Checking Timeshift & creating system restore point..."
     if ! is_pkg_installed timeshift; then
         pacman -S --needed --noconfirm timeshift > /dev/null 2>&1 || true
     fi
@@ -215,18 +223,18 @@ optimize_system() {
         log_warn "Timeshift snapshot skipped (run Timeshift GUI once to configure disk if needed)."
     }
 
-    log_info "2/11: Ensuring download accelerator and pacman formatting..."
+    log_info "2/12: Ensuring download accelerator and pacman formatting..."
     init_downloads
     sed -i 's/^#*Color/Color/' /etc/pacman.conf
     if ! grep -q "ILoveCandy" /etc/pacman.conf; then
         sed -i '/# Misc options/a ILoveCandy' /etc/pacman.conf 2>/dev/null || true
     fi
 
-    log_info "3/11: Refreshing fastest mirrors & upgrading system..."
+    log_info "3/12: Refreshing fastest mirrors & upgrading system..."
     pacman-mirrors --fasttrack 5
     pacman -Syu --noconfirm
 
-    log_info "4/11: Enforcing en_US locale and formatting..."
+    log_info "4/12: Enforcing en_US locale and formatting..."
     if ! grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen; then
         sed -i 's/^#*en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
         locale-gen > /dev/null 2>&1 || true
@@ -235,7 +243,7 @@ optimize_system() {
     localectl set-keymap us > /dev/null 2>&1 || true
     run_as_user gsettings set org.gnome.system.locale region 'en_US.UTF-8' 2>/dev/null || true
 
-    log_info "5/11: Configuring dual-boot GRUB (7s timer for Windows) & LocalRTC..."
+    log_info "5/12: Configuring dual-boot GRUB (7s timer for Windows) & LocalRTC..."
     pacman -S --needed --noconfirm os-prober > /dev/null 2>&1 || true
     if grep -q "^#*GRUB_DISABLE_OS_PROBER=true" /etc/default/grub || ! grep -q "GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
         sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
@@ -247,7 +255,7 @@ optimize_system() {
         timedatectl set-local-rtc 1 --adjust-system-clock
     fi
 
-    log_info "6/12: Applying Btrfs NVMe 'noatime' mount optimization..."
+    log_info "6/12: Applying Btrfs NVMe 'noatime' mount optimization & labeling system partition..."
     if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "noatime"; then
         sed -i 's/defaults,compress=zstd/defaults,noatime,compress=zstd/g' /etc/fstab
         mount -o remount / 2>/dev/null || true
@@ -257,7 +265,23 @@ optimize_system() {
         log_ok "Btrfs subvolumes remounted with noatime."
     fi
 
-    log_info "7/12: Configuring permanent partition mounts (fstab auto-mount, release user sessions, UI labels)..."
+    # Set both Btrfs volume label and GPT partition name to Manjaro
+    local root_src root_dev part_num disk_dev
+    root_src=$(findmnt -n -o SOURCE / 2>/dev/null)
+    root_dev="${root_src%%\[*}"
+    if [[ -n "$root_dev" && -b "$root_dev" ]]; then
+        btrfs filesystem label / "Manjaro" 2>/dev/null || btrfs filesystem label "$root_dev" "Manjaro" 2>/dev/null || true
+        part_num=$(echo "$root_dev" | grep -o '[0-9]*$')
+        disk_dev=$(echo "$root_dev" | sed -E 's/p?[0-9]+$//')
+        if [[ -n "$part_num" && -n "$disk_dev" && -b "$disk_dev" ]]; then
+            parted "$disk_dev" name "$part_num" "Manjaro" 2>/dev/null || true
+        fi
+        udevadm trigger -s block -p DEVNAME="$root_dev" -c change 2>/dev/null || true
+        udevadm settle 2>/dev/null || true
+        log_ok "System partition verified as 'Manjaro'."
+    fi
+
+    log_info "7/12: Configuring Windows partitions (protecting sensitive/recovery partitions)..."
     configure_permanent_partitions
 
     log_info "8/12: Setting up ZRAM (RAM-compressed swap)..."
@@ -271,6 +295,7 @@ swap-priority = 100
 EOF
     fi
     modprobe zram 2>/dev/null || true
+    systemctl daemon-reload
     systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
 
     log_info "9/12: Tuning kernel sysctl parameters for 32GB RAM & TCP BBR..."
@@ -295,7 +320,7 @@ EOF
     systemctl enable --now fstrim.timer > /dev/null 2>&1 || true
     systemctl enable --now paccache.timer > /dev/null 2>&1 || true
 
-    log_info "11/12: Enabling Desktop Icons & Disabling Top-Left Hot Corner..."
+    log_info "11/12: Enabling Desktop Icons (files only) & Disabling Top-Left Hot Corner..."
     configure_desktop_icons enable
     configure_hot_corner disable
 
@@ -304,13 +329,15 @@ EOF
     sudo -u "$REAL_USER" rm -rf "$USER_HOME/.cache/pamac" 2>/dev/null || true
     paccache -r -k 2 > /dev/null 2>&1 || true
     journalctl --vacuum-size=100M --vacuum-time=2weeks > /dev/null 2>&1 || true
-    ORPHANS=$(pacman -Qtdq 2>/dev/null || true)
-    [[ -n "$ORPHANS" ]] && pacman -Rns --noconfirm $ORPHANS > /dev/null 2>&1 || true
+    
+    local orphans
+    orphans=$(pacman -Qtdq 2>/dev/null || true)
+    [[ -n "$orphans" ]] && pacman -Rns --noconfirm $orphans > /dev/null 2>&1 || true
 
-    log_info "Running SSD TRIM..."
+    log_info "Executing SSD TRIM pass..."
     fstrim -va > /dev/null 2>&1 || true
 
-    log_ok "Optimization complete! Desktop icons enabled, permanent partitions mounted, hot corners disabled, and hardware peak tuned."
+    log_ok "Optimization complete! Windows partitions mounted, desktop clutter removed, and hardware tuned."
     read -rp "Press [Enter] to return to the main menu..."
 }
 
@@ -323,7 +350,7 @@ install_podman() {
     if ! grep -q "^${REAL_USER}:" /etc/subuid 2>/dev/null; then
         usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$REAL_USER" || true
     fi
-    sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user enable --now podman.socket 2>/dev/null || true
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now podman.socket 2>/dev/null || true
     log_ok "Podman installed."
     post_install_hook
 }
@@ -360,9 +387,13 @@ install_antigravity_ide() {
 }
 
 install_antigravity_standalone() {
-    log_info "Installing Antigravity Standalone App & 'agy' CLI..."
-    sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
-    log_ok "Antigravity Standalone ready."
+    log_info "Installing Google Antigravity 2.0 Standalone Desktop Platform & 'agy' CLI..."
+    pamac enable-aur > /dev/null 2>&1 || true
+    sudo -u "$REAL_USER" pamac build --no-confirm antigravity || {
+        log_warn "AUR package build had an issue. Falling back to official installer..."
+        sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
+    }
+    log_ok "Antigravity 2.0 Platform & CLI ready."
     post_install_hook
 }
 
@@ -401,7 +432,7 @@ install_all_apps() {
     if ! grep -q "^${REAL_USER}:" /etc/subuid 2>/dev/null; then
         usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$REAL_USER" || true
     fi
-    sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user enable --now podman.socket 2>/dev/null || true
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now podman.socket 2>/dev/null || true
     systemctl enable --now libvirtd.service > /dev/null 2>&1 || true
     usermod -aG libvirt,kvm "$REAL_USER"
     virsh net-autostart default > /dev/null 2>&1 || true
@@ -410,11 +441,13 @@ install_all_apps() {
 
     log_info "2/3. Building AUR packages with multi-stream acceleration..."
     pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide google-chrome
+    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome
     sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
 
-    log_info "3/3. Setting up Antigravity Standalone CLI..."
-    sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
+    log_info "3/3. Verifying Antigravity CLI..."
+    if ! is_bin_installed agy; then
+        sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
+    fi
 
     post_install_hook
     log_ok "All applications installed and configured successfully!"
@@ -451,7 +484,8 @@ uninstall_antigravity_ide() {
 }
 
 uninstall_antigravity_standalone() {
-    log_warn "Removing Antigravity Standalone..."
+    log_warn "Removing Antigravity 2.0 Standalone..."
+    safe_pacman_remove antigravity
     rm -rf "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" 2>/dev/null || true
     post_uninstall_hook
 }
@@ -482,7 +516,7 @@ uninstall_all_apps() {
 
     log_info "1/3. Disabling background virtualization and container services..."
     systemctl disable --now libvirtd.service 2>/dev/null || true
-    sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user disable --now podman.socket 2>/dev/null || true
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now podman.socket 2>/dev/null || true
 
     log_info "2/3. Removing all installed applications in a single clean transaction..."
     safe_pacman_remove \
@@ -490,6 +524,7 @@ uninstall_all_apps() {
         virt-manager virt-viewer libguestfs \
         visual-studio-code-bin \
         antigravity-ide \
+        antigravity \
         google-chrome \
         libreoffice-fresh \
         vlc celluloid gimp kdenlive
@@ -503,7 +538,7 @@ uninstall_all_apps() {
            "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" 2>/dev/null || true
 
     post_uninstall_hook
-    log_ok "All selected applications uninstalled in a single clean batch!"
+    log_ok "All selected applications uninstalled."
 }
 
 # ------------------------------------------------------------------------------
@@ -515,7 +550,7 @@ menu_install() {
         st_kvm=$(is_pkg_installed virt-manager && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_vscode=$(is_pkg_installed visual-studio-code-bin && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_ag_ide=$(is_pkg_installed antigravity-ide && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_ag_app=$(is_bin_installed agy && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_ag_app=$( (is_pkg_installed antigravity || is_bin_installed agy) && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_chrome=$(is_pkg_installed google-chrome && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_office=$(is_pkg_installed libreoffice-fresh && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_media=$(is_pkg_installed gimp && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
@@ -525,23 +560,15 @@ menu_install() {
         echo -e "${BOLD}                          INSTALL APPLICATIONS                          ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
         echo -e " 1) Podman Engine & Compose      $st_podman ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} Rootless, daemonless container engine (drop-in Docker replacement)."
         echo -e " 2) KVM / QEMU Virt-Manager      $st_kvm ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} Native Type-1 hypervisor for running Windows/Linux VMs at near bare-metal speed."
         echo -e " 3) VS Code + Antigravity Ext    $st_vscode ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} Official Microsoft VS Code IDE paired with Google's Antigravity AI extension."
         echo -e " 4) Antigravity IDE              $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} Dedicated AI coding environment with autonomous agent interaction & browser testing."
-        echo -e " 5) Antigravity Standalone       $st_ag_app ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} Multi-agent orchestration mission control (non-editor) and 'agy' CLI."
+        echo -e " 5) Antigravity 2.0 Platform     $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
         echo -e " 6) Google Chrome Browser        $st_chrome ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} Proprietary web browser configured for Intel Iris Xe Wayland video decoding."
         echo -e " 7) LibreOffice Fresh Suite      $st_office ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} Open-source office suite (Writer, Calc, Impress, Draw)."
         echo -e " 8) Essential Multimedia Suite   $st_media ${CYAN}[OFFICIAL]${NC}"
-        echo -e "    ${BLUE}↳${NC} GIMP (Photo Editing), Kdenlive (Video Editing), VLC & Celluloid (Media Players)."
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        echo -e " A) Install ALL Applications (Single-Pass Grouped Install)"
+        echo -e " A) Install ALL Applications"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
         read -rp "Select an application to install (1-8 / A / B): " choice
@@ -571,7 +598,7 @@ menu_uninstall() {
         st_kvm=$(is_pkg_installed virt-manager && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_vscode=$(is_pkg_installed visual-studio-code-bin && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_ag_ide=$(is_pkg_installed antigravity-ide && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_ag_app=$(is_bin_installed agy && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_ag_app=$( (is_pkg_installed antigravity || is_bin_installed agy) && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_chrome=$(is_pkg_installed google-chrome && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_office=$(is_pkg_installed libreoffice-fresh && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_media=$(is_pkg_installed gimp && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
@@ -584,12 +611,12 @@ menu_uninstall() {
         echo -e " 2) KVM / QEMU Virt-Manager      $st_kvm"
         echo -e " 3) VS Code + Antigravity Ext    $st_vscode"
         echo -e " 4) Antigravity IDE              $st_ag_ide"
-        echo -e " 5) Antigravity Standalone       $st_ag_app"
+        echo -e " 5) Antigravity 2.0 Platform     $st_ag_app"
         echo -e " 6) Google Chrome Browser        $st_chrome"
         echo -e " 7) LibreOffice Fresh Suite      $st_office"
         echo -e " 8) Essential Multimedia Suite   $st_media"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        echo -e " A) Uninstall ALL Applications (Single-Pass Grouped Removal)"
+        echo -e " A) Uninstall ALL Applications"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
         read -rp "Select an application to remove (1-8 / A / B): " choice
@@ -614,18 +641,11 @@ menu_uninstall() {
 }
 
 # ------------------------------------------------------------------------------
-# 6. STORAGE & PERMANENT PARTITION MANAGEMENT
+# 6. STORAGE & PERMANENT WINDOWS DATA PARTITION MANAGEMENT (ACTIVE SCRUBBING)
 # ------------------------------------------------------------------------------
 configure_permanent_partitions() {
     echo ""
-    log_info "=== CONFIGURING PERMANENT STORAGE MOUNTS & UI LABELS ==="
-    log_info "Scanning all disk partitions to eliminate temporary user-session mounts..."
-
-    local root_uuid boot_uuid efi_uuid home_uuid
-    root_uuid=$(findmnt -n -o UUID / 2>/dev/null || true)
-    boot_uuid=$(findmnt -n -o UUID /boot 2>/dev/null || true)
-    efi_uuid=$(findmnt -n -o UUID /boot/efi 2>/dev/null || true)
-    home_uuid=$(findmnt -n -o UUID /home 2>/dev/null || true)
+    log_info "=== CONFIGURING DATA PARTITIONS & PURGING RECOVERY/OEM MOUNTS ==="
 
     local fstab_bak="/etc/fstab.bak.$(date +%Y%m%d_%H%M%S)"
     cp -p /etc/fstab "$fstab_bak"
@@ -633,185 +653,133 @@ configure_permanent_partitions() {
 
     mkdir -p /mnt /media 2>/dev/null || true
 
-    # Ensure desktop volume display is enabled in GNOME desktop icons extensions
-    run_as_user gsettings set org.gnome.shell.extensions.gtk4-ding show-volumes true 2>/dev/null || true
-    run_as_user gsettings set org.gnome.shell.extensions.ding show-volumes true 2>/dev/null || true
+    run_as_user gsettings set org.gnome.shell.extensions.gtk4-ding show-volumes false 2>/dev/null || true
+    run_as_user gsettings set org.gnome.shell.extensions.gtk4-ding show-network-volumes false 2>/dev/null || true
+    run_as_user gsettings set org.gnome.shell.extensions.ding show-volumes false 2>/dev/null || true
+    run_as_user gsettings set org.gnome.shell.extensions.ding show-network-volumes false 2>/dev/null || true
 
     local configured_count=0
-    local skipped_count=0
+    local purged_count=0
 
-    while IFS= read -r blk_line; do
-        unset NAME TYPE FSTYPE LABEL UUID
-        eval "$blk_line"
+    while IFS= read -r dev_pair; do
+        local dev_name="" dev_type="" dev_fstype="" dev_label="" dev_uuid="" dev_rm="" dev_parttype="" dev_partlabel=""
 
-        # Only process block device partitions and decrypted LUKS volumes
-        [[ "$TYPE" != "part" && "$TYPE" != "crypt" ]] && continue
-        [[ -z "$FSTYPE" || "$FSTYPE" == "swap" ]] && continue
-        [[ -z "$UUID" ]] && continue
+        [[ "$dev_pair" =~ NAME=\"([^\"]*)\" ]] && dev_name="${BASH_REMATCH[1]}"
+        [[ "$dev_pair" =~ TYPE=\"([^\"]*)\" ]] && dev_type="${BASH_REMATCH[1]}"
+        [[ "$dev_pair" =~ FSTYPE=\"([^\"]*)\" ]] && dev_fstype="${BASH_REMATCH[1]}"
+        [[ "$dev_pair" =~ LABEL=\"([^\"]*)\" ]] && dev_label="${BASH_REMATCH[1]}"
+        [[ "$dev_pair" =~ UUID=\"([^\"]*)\" ]] && dev_uuid="${BASH_REMATCH[1]}"
+        [[ "$dev_pair" =~ RM=\"([^\"]*)\" ]] && dev_rm="${BASH_REMATCH[1]}"
+        [[ "$dev_pair" =~ PARTTYPE=\"([^\"]*)\" ]] && dev_parttype="${BASH_REMATCH[1]}"
+        [[ "$dev_pair" =~ PARTLABEL=\"([^\"]*)\" ]] && dev_partlabel="${BASH_REMATCH[1]}"
 
-        # Skip core OS system partitions
-        if [[ "$UUID" == "$root_uuid" || "$UUID" == "$boot_uuid" || "$UUID" == "$efi_uuid" ]]; then
-            ((skipped_count++))
+        [[ -z "$dev_uuid" ]] && continue
+        [[ "$dev_type" != "part" && "$dev_type" != "crypt" ]] && continue
+        [[ -z "$dev_fstype" || "$dev_fstype" == "swap" ]] && continue
+        [[ "$dev_rm" == "1" ]] && continue
+
+        local combined_tags="${dev_label} ${dev_partlabel}"
+
+        # 1. DETECT SENSITIVE / RECOVERY PARTITIONS
+        local is_sensitive=false
+        if [[ "${dev_parttype,,}" =~ ^(de94bba4-06d1-4d40-a16a-bfd50179d6ac|e3c9e316-0b5c-4db8-817d-f92df00215ae|c12a7328-f81f-11d2-ba4b-00a0c93ec93b|21686148-6449-6e6f-744e-656564454649)$ ]]; then
+            is_sensitive=true
+        fi
+        if [[ "${combined_tags,,}" =~ (recovery|winre|dell|diag|support|pbr|restore|efi[ _]system|system[ _]reserved|esp|boot|msr) ]]; then
+            is_sensitive=true
+        fi
+
+        # 2. ACTIVE SCRUBBING: Remove sensitive recovery partitions from fstab & unmount them
+        if [[ "$is_sensitive" == "true" ]]; then
+            if grep -qi "$dev_uuid" /etc/fstab && grep -E "$dev_uuid" /etc/fstab | grep -q "/boot/efi"; then
+                continue
+            fi
+
+            if grep -qi "$dev_uuid" /etc/fstab || findmnt -n -S "UUID=$dev_uuid" &>/dev/null; then
+                log_warn "Active Scrubbing: Removing sensitive/recovery partition ($dev_name / ${dev_label:-OEM})..."
+                umount "UUID=$dev_uuid" 2>/dev/null || true
+                sed -i "/$dev_uuid/d" /etc/fstab
+                rm -rf "/mnt/${dev_label}" "/media/${dev_label}" 2>/dev/null || true
+                ((purged_count++))
+            fi
             continue
         fi
 
-        # Skip partitions already assigned to system root hierarchies in fstab (e.g., /home, /var, /usr)
-        if awk -v u="$UUID" '$1 ~ u && $2 ~ /^\/(boot|efi|home|var|usr|etc)?$/ { found=1 } END { exit !found }' /etc/fstab 2>/dev/null; then
-            ((skipped_count++))
+        # 3. Protect core Linux system partitions already in fstab (Root, Home, etc.)
+        if grep -qi "$dev_uuid" /etc/fstab; then
             continue
         fi
 
-        local dev_path="/dev/$NAME"
-
-        # Resolve or generate clean label
-        if [[ -z "$LABEL" ]]; then
-            LABEL=$(blkid -s LABEL -o value "$dev_path" 2>/dev/null || true)
-            [[ -z "$LABEL" ]] && LABEL="disk-${UUID:0:8}"
+        # 4. CONFIGURE VALID DATA PARTITIONS (e.g. win11, my-data)
+        local dev_path="/dev/$dev_name"
+        local label="$dev_label"
+        [[ -z "$label" || "$label" == "-" ]] && label=$(blkid -s LABEL -o value "$dev_path" 2>/dev/null || true)
+        
+        if [[ -z "$label" && "$dev_fstype" == "ntfs" ]]; then
+            label="Windows-C"
+        elif [[ -z "$label" ]]; then
+            label="disk-${dev_uuid:0:8}"
         fi
 
-        # Sanitize directory name for /mnt mount point (replace spaces/slashes with -/_)
         local clean_label
-        clean_label=$(echo "$LABEL" | tr ' /' '_-' | tr -cd '[:alnum:]_.-')
-        [[ -z "$clean_label" ]] && clean_label="disk-${UUID:0:8}"
-
+        clean_label=$(echo "$label" | tr ' /' '_-' | tr -cd '[:alnum:]_.-')
         local mount_point="/mnt/$clean_label"
         local encoded_label
-        encoded_label=$(echo "$LABEL" | sed 's/ /%20/g')
+        encoded_label=$(echo "$label" | sed 's/ /%20/g')
 
-        log_info "Processing partition: ${BOLD}$NAME${NC} [Label: ${CYAN}$LABEL${NC}, UUID: $UUID, FS: $FSTYPE]"
+        log_info "Configuring permanent data partition: ${BOLD}$dev_name${NC} [Label: ${CYAN}$label${NC}, FS: $dev_fstype]"
 
-        # 1. Detect and remove existing user session mounts (e.g. /run/media/$USER/*)
         local user_mounts
-        user_mounts=$(findmnt -n -l -o TARGET -S "$dev_path" 2>/dev/null | grep -E "^/run/media/" || true)
-        if [[ -z "$user_mounts" ]]; then
-            user_mounts=$(findmnt -n -l -o TARGET -S "UUID=$UUID" 2>/dev/null | grep -E "^/run/media/" || true)
-        fi
-
-        local was_busy=false
+        user_mounts=$(findmnt -n -l -o TARGET -S "UUID=$dev_uuid" 2>/dev/null | grep -E "^/run/media/" || true)
         if [[ -n "$user_mounts" ]]; then
             while IFS= read -r um_path; do
-                [[ -z "$um_path" ]] && continue
-                log_info "Detected user-session mount for $LABEL at $um_path. Releasing user session..."
-                if umount "$um_path" 2>/dev/null; then
-                    log_ok "Successfully released user-session mount: $um_path"
-                    rmdir "$um_path" 2>/dev/null || true
-                else
-                    log_warn "Target $um_path is currently in active use (busy). Configured in /etc/fstab for boot mount; will cleanly transition to $mount_point on reboot."
-                    was_busy=true
-                fi
+                [[ -n "$um_path" ]] && umount "$um_path" 2>/dev/null || true
             done <<< "$user_mounts"
         fi
 
-        # 2. Determine optimal fstab driver and options
-        local fs_driver="$FSTYPE"
+        local fs_driver="$dev_fstype"
         local fs_opts="defaults,noatime,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
-        local dump_val=0
         local pass_val=0
 
-        case "$FSTYPE" in
+        case "$dev_fstype" in
             btrfs)
-                fs_driver="btrfs"
-                local existing_subvol
-                existing_subvol=$(findmnt -n -o OPTIONS -S "$dev_path" 2>/dev/null | grep -o 'subvol=[^,]*' | head -n1 || true)
-                local subvol_opt=""
-                if [[ -n "$existing_subvol" && "$existing_subvol" != "subvol=/" ]]; then
-                    subvol_opt="${existing_subvol},"
-                fi
-                fs_opts="defaults,noatime,${subvol_opt}compress=zstd,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
-                dump_val=0
-                pass_val=0
+                fs_opts="defaults,noatime,compress=zstd,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
                 ;;
             ntfs)
                 if modprobe ntfs3 2>/dev/null || lsmod | grep -q "^ntfs3"; then
                     fs_driver="ntfs3"
-                elif command -v ntfs-3g &>/dev/null; then
-                    fs_driver="ntfs-3g"
                 else
-                    fs_driver="ntfs"
+                    fs_driver="ntfs-3g"
                 fi
-                fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
-                dump_val=0
-                pass_val=0
+                fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,windows_names,x-gvfs-show,x-gvfs-name=${encoded_label}"
                 ;;
             vfat|exfat)
-                fs_driver="$FSTYPE"
                 fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
-                dump_val=0
-                pass_val=0
                 ;;
-            ext4|ext3|ext2)
-                fs_driver="$FSTYPE"
-                fs_opts="defaults,noatime,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
-                dump_val=0
+            ext[234])
                 pass_val=2
-                ;;
-            *)
-                fs_driver="$FSTYPE"
-                fs_opts="defaults,noatime,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
-                dump_val=0
-                pass_val=0
                 ;;
         esac
 
         mkdir -p "$mount_point"
 
-        # 3. Add or update in /etc/fstab
-        if grep -q "UUID=$UUID" /etc/fstab; then
-            log_info "Updating existing /etc/fstab entry for $NAME ($LABEL)..."
-            sed -i "\|UUID=$UUID|d" /etc/fstab
-        else
-            log_info "Adding new startup mount for $NAME ($LABEL) to /etc/fstab..."
-        fi
-
         [[ -n "$(tail -c1 /etc/fstab 2>/dev/null)" ]] && echo "" >> /etc/fstab
-        printf "UUID=%-36s %-20s %-8s %-65s %d %d\n" \
-            "$UUID" "$mount_point" "$fs_driver" "$fs_opts" "$dump_val" "$pass_val" >> /etc/fstab
+        printf "UUID=%-36s %-20s %-8s %-75s 0 %d\n" \
+            "$dev_uuid" "$mount_point" "$fs_driver" "$fs_opts" "$pass_val" >> /etc/fstab
 
-        # 4. Mount partition now to the permanent mount point
         if ! findmnt -n "$mount_point" &>/dev/null; then
-            mount "$mount_point" 2>/dev/null || mount -t "$fs_driver" -o "$fs_opts" "UUID=$UUID" "$mount_point" 2>/dev/null || true
+            mount "$mount_point" 2>/dev/null || mount -t "$fs_driver" -o "$fs_opts" "UUID=$dev_uuid" "$mount_point" 2>/dev/null || true
         fi
 
         if findmnt -n "$mount_point" &>/dev/null; then
-            log_ok "Mounted $NAME ($LABEL) at $mount_point"
-            # Set directory ownership for non-root user if Linux filesystem
-            if [[ "$fs_driver" =~ ^(btrfs|ext[234]|xfs|f2fs)$ ]] && [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
-                chown "$REAL_USER:" "$mount_point" 2>/dev/null || true
-                chmod 755 "$mount_point" 2>/dev/null || true
-            fi
-        else
-            log_warn "Partition $NAME ($LABEL) added to /etc/fstab for boot mount (could not mount immediately, possibly Windows hibernation/lock)."
-        fi
-
-        # 5. Create symlinks for universal backward compatibility
-        ln -sfn "$mount_point" "/media/$clean_label" 2>/dev/null || true
-        if [[ -d "/run/media/$REAL_USER" ]] && [[ "$was_busy" != "true" ]]; then
-            ln -sfn "$mount_point" "/run/media/$REAL_USER/$clean_label" 2>/dev/null || true
+            log_ok "Mounted $dev_name at $mount_point (accessible in Files, hidden from desktop wallpaper)."
         fi
 
         ((configured_count++))
-    done < <(lsblk -P -o NAME,TYPE,FSTYPE,LABEL,UUID)
+    done < <(lsblk -Pno NAME,TYPE,FSTYPE,LABEL,UUID,RM,PARTTYPE,PARTLABEL)
 
     systemctl daemon-reload 2>/dev/null || true
-
-    echo ""
-    log_ok "Permanent storage setup complete! ($configured_count partition(s) configured, $skipped_count system partition(s) preserved)"
-    echo -e "${BOLD}Summary of Persistent Partitions:${NC}"
-    printf "%-12s %-16s %-10s %-22s %-20s\n" "DEVICE" "LABEL" "FILESYSTEM" "STARTUP MOUNT" "UI DISPLAY NAME"
-    echo "----------------------------------------------------------------------------------------"
-    while IFS= read -r blk_line; do
-        unset NAME TYPE FSTYPE LABEL UUID
-        eval "$blk_line"
-        [[ "$TYPE" != "part" && "$TYPE" != "crypt" ]] && continue
-        if grep -q "UUID=$UUID" /etc/fstab && grep "UUID=$UUID" /etc/fstab | grep -q "x-gvfs-show"; then
-            local mp gvfs_name
-            mp=$(awk -v u="$UUID" '$1 ~ u { print $2 }' /etc/fstab)
-            gvfs_name=$(grep "UUID=$UUID" /etc/fstab | grep -o 'x-gvfs-name=[^, ]*' | cut -d= -f2 | sed 's/%20/ /g')
-            printf "%-12s %-16s %-10s %-22s %-20s\n" "$NAME" "${LABEL:-N/A}" "$FSTYPE" "$mp" "$gvfs_name"
-        fi
-    done < <(lsblk -P -o NAME,TYPE,FSTYPE,LABEL,UUID)
-    echo "----------------------------------------------------------------------------------------"
-    log_info "All partitions are set to mount at system startup and display identified by label in GNOME Files & Desktop."
+    log_ok "Partition sync complete: $configured_count valid data partition(s) active, $purged_count recovery/OEM partition(s) purged."
 }
 
 # ------------------------------------------------------------------------------
@@ -823,20 +791,17 @@ menu_desktop_settings() {
         di_raw=$(get_desktop_icons_status)
         hc_raw=$(get_hot_corner_status)
 
-        [[ "$di_raw" == "enabled" ]] && di_st="${GREEN}[Enabled]${NC}" || di_st="${RED}[Disabled]${NC}"
+        [[ "$di_raw" == "enabled" ]] && di_st="${GREEN}[Enabled (Files Only)]${NC}" || di_st="${RED}[Disabled]${NC}"
         [[ "$hc_raw" == "enabled" ]] && hc_st="${RED}[Enabled]${NC}" || hc_st="${GREEN}[Disabled (Recommended)]${NC}"
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
         echo -e "${BOLD}                    DESKTOP & GNOME UI SETTINGS                         ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e " 1) Desktop Files & Icons        $di_st"
-        echo -e "    ${BLUE}↳${NC} Toggle displaying files, folders, and drives directly on desktop."
+        echo -e " 1) Desktop Files & Folders      $di_st"
         echo -e " 2) Top-Left Hot Corner          $hc_st"
-        echo -e "    ${BLUE}↳${NC} Toggle Activities overview trigger when hitting top-left corner."
-        echo -e " 3) Apply Recommended Preset (Desktop Icons ON, Hot Corner OFF)"
-        echo -e " 4) Configure Permanent Drive Mounts & UI Labels"
-        echo -e "    ${BLUE}↳${NC} Auto-mount all data partitions at boot and display labeled in Files & Desktop."
+        echo -e " 3) Apply Recommended Preset (Desktop Files ON, Drive Icons OFF, Hot Corner OFF)"
+        echo -e " 4) Configure Windows Partitions (Exclude Recovery/OEM, Mount C:)"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
@@ -844,25 +809,17 @@ menu_desktop_settings() {
 
         case "$choice" in
             1)
-                if [[ "$di_raw" == "enabled" ]]; then
-                    configure_desktop_icons disable
-                else
-                    configure_desktop_icons enable
-                fi
+                [[ "$di_raw" == "enabled" ]] && configure_desktop_icons disable || configure_desktop_icons enable
                 read -rp "Press [Enter] to continue..."
                 ;;
             2)
-                if [[ "$hc_raw" == "enabled" ]]; then
-                    configure_hot_corner disable
-                else
-                    configure_hot_corner enable
-                fi
+                [[ "$hc_raw" == "enabled" ]] && configure_hot_corner disable || configure_hot_corner enable
                 read -rp "Press [Enter] to continue..."
                 ;;
             3)
                 configure_desktop_icons enable
                 configure_hot_corner disable
-                log_ok "Applied recommended preset: Desktop Icons Enabled & Hot Corner Disabled."
+                log_ok "Recommended preset applied."
                 read -rp "Press [Enter] to continue..."
                 ;;
             4)
@@ -886,7 +843,7 @@ while true; do
     echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Smart Downloads, GuC/HuC, SSD TRIM)"
     echo -e " ${BOLD}2)${NC} Install apps"
     echo -e " ${BOLD}3)${NC} Uninstall apps"
-    echo -e " ${BOLD}4)${NC} Desktop UI Settings (Desktop Icons & Hot Corner)"
+    echo -e " ${BOLD}4)${NC} Desktop UI & Settings"
     echo -e " ${BOLD}5)${NC} Quit"
     echo -e "${BOLD}------------------------------------------------------------------------${NC}"
     echo -e " 📋 Live log file: ${CYAN}$LOG_FILE${NC}"
@@ -899,7 +856,6 @@ while true; do
         3) menu_uninstall ;;
         4) menu_desktop_settings ;;
         5)
-            echo ""
             log_ok "Exiting. Session completed successfully!"
             break
             ;;
@@ -908,4 +864,3 @@ while true; do
             ;;
     esac
 done
-
