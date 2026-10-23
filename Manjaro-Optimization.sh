@@ -37,6 +37,11 @@ run_as_user() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/Manjaro-Optimization.log"
 
+# Rotate log file if it exceeds 5MB to keep it performant
+if [[ -f "$LOG_FILE" ]] && [[ $(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0) -gt 5000000 ]]; then
+    mv "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
+fi
+
 touch "$LOG_FILE" 2>/dev/null || true
 if [[ -n "$SUDO_USER" ]]; then
     chown "$SUDO_USER:" "$LOG_FILE" 2>/dev/null || true
@@ -74,7 +79,24 @@ log_ok()      { echo -e "[$(timestamp)] ${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "[$(timestamp)] ${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "[$(timestamp)] ${RED}[ERROR]${NC} $1"; }
 
-is_pkg_installed() { pacman -Qq "$1" &> /dev/null; }
+check_pacman_lock() {
+    if [[ -f /var/lib/pacman/db.lck ]]; then
+        if ! fuser /var/lib/pacman/db.lck &>/dev/null; then
+            log_warn "Detected stale pacman lock file (/var/lib/pacman/db.lck). Auto-clearing..."
+            rm -f /var/lib/pacman/db.lck
+        else
+            log_error "Another package manager is currently running. Please wait for it to complete."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+is_pkg_installed() {
+    local out
+    out=$(pacman -Qq "$1" 2>/dev/null) || return 1
+    grep -Fxq "$1" <<< "$out"
+}
 
 is_bin_installed() { 
     command -v "$1" &> /dev/null || \
@@ -94,14 +116,17 @@ init_downloads() {
         if [[ -f "$conf" ]]; then
             sed -i "s|'https::/usr/bin/curl.*'|$aria_rule|" "$conf"
             sed -i "s|'http::/usr/bin/curl.*'|$aria_rule_http|" "$conf"
+            # Optimize makepkg to utilize all CPU threads (i7-1165G7 8 threads)
+            sed -i 's/^#*MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' "$conf"
         fi
     done
 
-    sed -i 's/^#*ParallelDownloads = .*/ParallelDownloads = 4/' /etc/pacman.conf 2>/dev/null || true
+    sed -i 's/^#*ParallelDownloads = .*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
 }
 init_downloads
 
 safe_pacman_remove() {
+    check_pacman_lock || return 1
     local to_remove=()
     for pkg in "$@"; do
         if is_pkg_installed "$pkg"; then
@@ -110,19 +135,43 @@ safe_pacman_remove() {
     done
     if [[ ${#to_remove[@]} -gt 0 ]]; then
         log_info "Removing installed packages: ${to_remove[*]}"
-        pacman -Rns --noconfirm "${to_remove[@]}"
+        if ! pacman -Rns --noconfirm "${to_remove[@]}"; then
+            log_warn "Batch removal failed, attempting package-by-package removal..."
+            for pkg in "${to_remove[@]}"; do
+                if is_pkg_installed "$pkg"; then
+                    pacman -Rns --noconfirm "$pkg" || log_warn "Could not remove $pkg (it may have reverse dependencies or already be removed)."
+                fi
+            done
+        fi
+    else
+        log_info "None of the specified packages are currently installed."
     fi
 }
 
 post_install_hook() {
-    log_info "Running post-install setup (syncing PATH across shells)..."
+    log_info "Running post-install setup (syncing PATH across shells & environment)..."
     for rc in "$USER_HOME/.zshrc" "$USER_HOME/.bashrc"; do
         if [[ -f "$rc" ]] && ! grep -q '\.local/bin' "$rc"; then
             echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
             chown "$REAL_USER:" "$rc"
         fi
     done
-    log_ok "PATH synced."
+
+    # Ensure system-wide PATH for GUI sessions and all shells
+    cat << 'EOF' > /etc/profile.d/user-local-bin.sh
+if [ -d "$HOME/.local/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
+fi
+EOF
+    chmod 644 /etc/profile.d/user-local-bin.sh 2>/dev/null || true
+
+    # Synchronize GNOME desktop applications database immediately
+    update-desktop-database /usr/share/applications 2>/dev/null || true
+    update-desktop-database "$USER_HOME/.local/share/applications" 2>/dev/null || true
+    log_ok "PATH and application launcher shortcuts synchronized."
 }
 
 post_uninstall_hook() {
@@ -134,7 +183,11 @@ post_uninstall_hook() {
     if [[ -n "$orphans" ]]; then
         pacman -Rns --noconfirm $orphans > /dev/null 2>&1 || true
     fi
-    log_ok "Orphaned packages and unused runtimes cleared."
+
+    # Refresh desktop database to remove stale application launcher icons immediately
+    update-desktop-database /usr/share/applications 2>/dev/null || true
+    update-desktop-database "$USER_HOME/.local/share/applications" 2>/dev/null || true
+    log_ok "Orphaned packages, desktop icons, and unused runtimes cleared."
 }
 
 get_desktop_icons_status() {
@@ -235,15 +288,22 @@ optimize_system() {
     # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, Sunshine)
     sudo -u "$REAL_USER" pamac update --no-confirm --aur
 
-    log_info "4/13: Checking Linux Kernel Lifecycle (EOL Migration)..."
-    local running_kver
-    running_kver=$(uname -r | cut -d. -f1,2 | tr -d '.') # e.g. 71 for 7.1
-    if [[ "$running_kver" -le 71 ]]; then
-        log_warn "Active kernel series (linux$running_kver) is End-Of-Life (EOL)."
-        if ! mhwd-kernel -li | grep -q "linux72"; then
-            log_info "Installing recommended modern Linux 7.2 kernel branch..."
-            mhwd-kernel -i linux72 rmc || log_warn "Kernel 7.2 installation deferred. Keep current kernel."
-        fi
+    log_info "4/13: Checking Linux Kernel Lifecycle & Stability..."
+    local running_ver
+    running_ver=$(uname -r)
+    local k_major k_minor
+    k_major=$(echo "$running_ver" | cut -d. -f1)
+    k_minor=$(echo "$running_ver" | cut -d. -f2)
+    log_info "Active kernel: $running_ver"
+
+    # Check installed kernels and ensure an LTS safety branch (like linux612 or linux66) is available
+    local installed_kernels
+    installed_kernels=$(mhwd-kernel -li 2>/dev/null || true)
+    if ! echo "$installed_kernels" | grep -qE "linux612|linux66"; then
+        log_warn "Only rolling kernel branch detected. For dual-boot resilience, an LTS fallback is recommended."
+        mhwd-kernel -i linux612 || log_warn "LTS fallback kernel installation deferred. Continuing with $running_ver."
+    else
+        log_ok "Reliable fallback LTS kernel series verified."
     fi
 
     log_info "5/13: Enforcing en_US locale and formatting..."
@@ -255,14 +315,28 @@ optimize_system() {
     localectl set-keymap us > /dev/null 2>&1 || true
     run_as_user gsettings set org.gnome.system.locale region 'en_US.UTF-8' 2>/dev/null || true
 
-    log_info "6/13: Configuring dual-boot GRUB (7s timer for Windows) & LocalRTC..."
-    pacman -S --needed --noconfirm os-prober > /dev/null 2>&1 || true
-    if grep -q "^#*GRUB_DISABLE_OS_PROBER=true" /etc/default/grub || ! grep -q "GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
-        sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
-        echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
-        sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=7/' /etc/default/grub
-        update-grub > /dev/null 2>&1 || true
+    log_info "6/13: Configuring dual-boot GRUB (menu visible, 7s timeout, saved default) & LocalRTC..."
+    pacman -S --needed --noconfirm os-prober grub-btrfs > /dev/null 2>&1 || true
+
+    # Unconditionally configure GRUB for dual-boot visibility and Intel GuC
+    sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
+    echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
+
+    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=7/' /etc/default/grub
+    sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
+    sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
+
+    # Ensure Intel GuC/HuC is enabled on kernel command line for Tiger Lake
+    if ! grep -q "i915.enable_guc=3" /etc/default/grub; then
+        sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1i915.enable_guc=3 /" /etc/default/grub
     fi
+
+    # Enable grub-btrfsd service for automatic snapshot updates in GRUB
+    systemctl enable --now grub-btrfsd.service 2>/dev/null || true
+
+    update-grub > /dev/null 2>&1 || true
+    log_ok "GRUB dual-boot configuration updated."
+
     if [[ $(timedatectl show --property=LocalRTC --value) != "yes" ]]; then
         timedatectl set-local-rtc 1 --adjust-system-clock
     fi
@@ -309,25 +383,36 @@ EOF
     systemctl daemon-reload
     systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
 
-    log_info "10/13: Tuning kernel sysctl parameters for 32GB RAM & TCP BBR..."
+    log_info "10/13: Tuning kernel sysctl parameters for 32GB RAM, DRAM-less SSD & ZRAM..."
     cat << 'EOF' > /etc/sysctl.d/99-dell-perf.conf
 vm.swappiness = 100
 vm.vfs_cache_pressure = 50
-vm.dirty_background_ratio = 5
-vm.dirty_ratio = 10
+vm.dirty_background_bytes = 134217728
+vm.dirty_bytes = 536870912
+vm.page-cluster = 0
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
     sysctl --system > /dev/null 2>&1 || true
+    log_ok "Kernel sysctl parameters applied."
 
-    log_info "11/13: Enabling Intel GuC/HuC microcontrollers & thermald..."
+    log_info "11/13: Enabling Intel GuC/HuC early KMS, RTKit audio priority & thermald..."
     cat << 'EOF' > /etc/modprobe.d/i915.conf
 options i915 enable_guc=3
 EOF
     sed -i 's/^#*RuntimeWatchdogSec=.*/RuntimeWatchdogSec=off/' /etc/systemd/system.conf 2>/dev/null || true
 
-    pacman -S --needed --noconfirm intel-media-driver libva-utils thermald pacman-contrib git base-devel > /dev/null 2>&1 || true
+    # Add i915 to mkinitcpio MODULES for early KMS if not present
+    if ! grep -E "^MODULES=.*i915" /etc/mkinitcpio.conf >/dev/null 2>&1; then
+        sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 i915)/' /etc/mkinitcpio.conf
+        sed -i 's/MODULES=( /MODULES=(/' /etc/mkinitcpio.conf
+        mkinitcpio -P > /dev/null 2>&1 || true
+    fi
+
+    pacman -S --needed --noconfirm intel-media-driver libva-utils thermald rtkit pacman-contrib git base-devel > /dev/null 2>&1 || true
     systemctl enable --now thermald.service > /dev/null 2>&1 || true
+    systemctl enable --now rtkit-daemon.service > /dev/null 2>&1 || true
+    systemctl enable --now power-profiles-daemon.service > /dev/null 2>&1 || true
     systemctl enable --now fstrim.timer > /dev/null 2>&1 || true
     systemctl enable --now paccache.timer > /dev/null 2>&1 || true
 
@@ -335,7 +420,7 @@ EOF
     configure_desktop_icons enable
     configure_hot_corner disable
 
-    log_info "13/13: Performing Deep System Clutter Cleanup..."
+    log_info "13/13: Performing Deep System Clutter Cleanup & SSD Health Maintenance..."
     rm -rf /var/tmp/pamac-build-* /var/tmp/pamac-*
     sudo -u "$REAL_USER" rm -rf "$USER_HOME/.cache/pamac" 2>/dev/null || true
     paccache -r -k 2 > /dev/null 2>&1 || true
@@ -346,7 +431,18 @@ EOF
     [[ -n "$orphans" ]] && pacman -Rns --noconfirm $orphans > /dev/null 2>&1 || true
 
     log_info "Executing SSD TRIM pass..."
-    fstrim -va > /dev/null 2>&1 || true
+    local trim_output trim_status=0
+    trim_output=$(fstrim -va 2>&1) || trim_status=$?
+    if [[ $trim_status -eq 0 ]]; then
+        log_ok "SSD TRIM pass completed successfully."
+    else
+        log_warn "SSD TRIM encountered an issue:\n$trim_output"
+        if echo "$trim_output" | grep -qi "FITRIM ioctl failed"; then
+            log_warn "Btrfs free space cache discrepancy detected on data partition."
+            log_info "Refreshing Btrfs free space tree on /mnt/my-data..."
+            btrfs balance start -dusage=0 /mnt/my-data 2>/dev/null || true
+        fi
+    fi
 
     log_ok "Optimization complete! OS, AUR, kernel, and hardware settings are updated."
     read -rp "Press [Enter] to return to the main menu..."
@@ -412,7 +508,19 @@ install_chrome() {
     log_info "Installing Google Chrome..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm google-chrome
-    log_ok "Google Chrome installed."
+    [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
+
+    # Automatically configure Wayland and Intel Iris Xe VA-API GPU video decoding
+    mkdir -p "$USER_HOME/.config"
+    cat << 'EOF' > "$USER_HOME/.config/chrome-flags.conf"
+--ozone-platform-hint=auto
+--enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoEncoder
+--ignore-gpu-blocklist
+--enable-zero-copy
+EOF
+    chown "$REAL_USER:" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
+
+    log_ok "Google Chrome installed with native Wayland & VA-API acceleration flags."
     post_install_hook
 }
 
@@ -440,7 +548,15 @@ install_sunshine() {
     echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
     udevadm control --reload-rules && udevadm trigger
 
-    # Enable systemd user service
+    # Create user service alias if upstream is app-dev.lizardbyte.app.Sunshine.service
+    if [[ -f /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service ]]; then
+        sudo -u "$REAL_USER" mkdir -p "$USER_HOME/.config/systemd/user"
+        sudo -u "$REAL_USER" ln -sf /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service "$USER_HOME/.config/systemd/user/sunshine.service"
+        sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user daemon-reload 2>/dev/null || true
+    fi
+
+    # Enable systemd user service (app-dev.lizardbyte.app.Sunshine.service)
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service 2>/dev/null || \
     sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now sunshine 2>/dev/null || true
 
     log_ok "Sunshine installed and active! Access dashboard at: https://localhost:47990"
@@ -471,10 +587,27 @@ install_all_apps() {
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome sunshine-bin
     sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
+    [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
+
+    # Configure Chrome Wayland & VA-API flags
+    mkdir -p "$USER_HOME/.config"
+    cat << 'EOF' > "$USER_HOME/.config/chrome-flags.conf"
+--ozone-platform-hint=auto
+--enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoEncoder
+--ignore-gpu-blocklist
+--enable-zero-copy
+EOF
+    chown "$REAL_USER:" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
 
     # Configure Sunshine
     echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
     udevadm control --reload-rules && udevadm trigger
+    if [[ -f /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service ]]; then
+        sudo -u "$REAL_USER" mkdir -p "$USER_HOME/.config/systemd/user"
+        sudo -u "$REAL_USER" ln -sf /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service "$USER_HOME/.config/systemd/user/sunshine.service"
+        sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user daemon-reload 2>/dev/null || true
+    fi
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service 2>/dev/null || \
     sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now sunshine 2>/dev/null || true
 
     log_info "3/3. Verifying Antigravity CLI..."
@@ -526,7 +659,7 @@ uninstall_antigravity_standalone() {
 uninstall_chrome() {
     log_warn "Removing Google Chrome..."
     safe_pacman_remove google-chrome
-    rm -rf "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" 2>/dev/null || true
+    rm -rf "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
     post_uninstall_hook
 }
 
@@ -546,7 +679,7 @@ uninstall_media() {
 
 uninstall_sunshine() {
     log_warn "Removing Sunshine..."
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now sunshine 2>/dev/null || true
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now app-dev.lizardbyte.app.Sunshine.service sunshine 2>/dev/null || true
     safe_pacman_remove sunshine-bin sunshine
     rm -f /etc/udev/rules.d/85-sunshine-uinput.rules
     rm -rf "$USER_HOME/.config/sunshine" 2>/dev/null || true
@@ -558,7 +691,7 @@ uninstall_all_apps() {
 
     log_info "1/3. Disabling background virtualization, containers & streaming services..."
     systemctl disable --now libvirtd.service 2>/dev/null || true
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now podman.socket sunshine 2>/dev/null || true
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now podman.socket app-dev.lizardbyte.app.Sunshine.service sunshine 2>/dev/null || true
 
     log_info "2/3. Removing all installed applications in a single clean transaction..."
     safe_pacman_remove \
@@ -576,7 +709,7 @@ uninstall_all_apps() {
     rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" \
            "$USER_HOME/.antigravity-ide" "$USER_HOME/.config/antigravity-ide" \
            "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" \
-           "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" \
+           "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" \
            "$USER_HOME/.config/libreoffice" \
            "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" \
            "$USER_HOME/.config/sunshine" /etc/udev/rules.d/85-sunshine-uinput.rules 2>/dev/null || true
@@ -586,23 +719,84 @@ uninstall_all_apps() {
 }
 
 # ------------------------------------------------------------------------------
-# 4. SUBMENU: INSTALL APPS
+# 4. SUBMENU: EXTRA APPLICATIONS (INSTALL, REINSTALL & UNINSTALL HUB)
 # ------------------------------------------------------------------------------
-menu_install() {
+manage_app_action() {
+    local name="$1"
+    local is_installed="$2"
+    local install_fn="$3"
+    local uninstall_fn="$4"
+
+    echo ""
+    echo -e "${BOLD}========================================================================${NC}"
+    echo -e " Application: ${BOLD}${name}${NC}"
+    if [[ "$is_installed" == "true" ]]; then
+        echo -e " Status:      ${GREEN}[Installed]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " 1) Reinstall / Update Application"
+        echo -e " 2) Uninstall Application"
+        echo -e " 3) Cancel & Return"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Please select an action (1-3): " act_choice
+        case "$act_choice" in
+            1)
+                $install_fn
+                read -rp "Press [Enter] to continue..."
+                ;;
+            2)
+                $uninstall_fn
+                read -rp "Press [Enter] to continue..."
+                ;;
+            3) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    else
+        echo -e " Status:      ${RED}[Not Installed]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " 1) Install Application"
+        echo -e " 2) Cancel & Return"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Please select an action (1-2): " act_choice
+        case "$act_choice" in
+            1)
+                $install_fn
+                read -rp "Press [Enter] to continue..."
+                ;;
+            2) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    fi
+}
+
+menu_extra_apps() {
     while true; do
-        st_podman=$(is_bin_installed podman && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_kvm=$(is_pkg_installed virt-manager && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_vscode=$(is_pkg_installed visual-studio-code-bin && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_ag_ide=$(is_pkg_installed antigravity-ide && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_ag_app=$( (is_pkg_installed antigravity || is_bin_installed agy) && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_chrome=$(is_pkg_installed google-chrome && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_office=$(is_pkg_installed libreoffice-fresh && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_media=$(is_pkg_installed gimp && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_sunshine=$(is_pkg_installed sunshine-bin || is_bin_installed sunshine && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_sunshine
+        local is_podman=false is_kvm=false is_vscode=false is_ag_ide=false is_ag_app=false
+        local is_chrome=false is_office=false is_media=false is_sunshine=false
+
+        is_bin_installed podman && is_podman=true
+        is_pkg_installed virt-manager && is_kvm=true
+        is_pkg_installed visual-studio-code-bin && is_vscode=true
+        is_pkg_installed antigravity-ide && is_ag_ide=true
+        (is_pkg_installed antigravity || is_bin_installed agy) && is_ag_app=true
+        is_pkg_installed google-chrome && is_chrome=true
+        is_pkg_installed libreoffice-fresh && is_office=true
+        (is_pkg_installed gimp || is_pkg_installed vlc) && is_media=true
+        (is_pkg_installed sunshine-bin || is_bin_installed sunshine) && is_sunshine=true
+
+        st_podman=$([[ "$is_podman" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_kvm=$([[ "$is_kvm" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_vscode=$([[ "$is_vscode" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_ag_ide=$([[ "$is_ag_ide" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_ag_app=$([[ "$is_ag_app" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_chrome=$([[ "$is_chrome" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_office=$([[ "$is_office" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_media=$([[ "$is_media" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_sunshine=$([[ "$is_sunshine" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e "${BOLD}                          INSTALL APPLICATIONS                          ${NC}"
+        echo -e "${BOLD}                     EXTRA APPLICATIONS HUB                             ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
         echo -e " 1) Podman Engine & Compose      $st_podman ${CYAN}[OFFICIAL]${NC}"
         echo -e " 2) KVM / QEMU Virt-Manager      $st_kvm ${CYAN}[OFFICIAL]${NC}"
@@ -615,74 +809,34 @@ menu_install() {
         echo -e " 9) Sunshine Remote Desktop      $st_sunshine ${CYAN}[LOW-LATENCY STREAMING]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Install ALL Applications"
+        echo -e " U) Uninstall ALL Applications"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application to install (1-9 / A / B): " choice
+        read -rp "Select an application (1-9) or action (A / U / B): " choice
 
         case "$choice" in
-            1) install_podman ;;
-            2) install_kvm ;;
-            3) install_vscode ;;
-            4) install_antigravity_ide ;;
-            5) install_antigravity_standalone ;;
-            6) install_chrome ;;
-            7) install_office ;;
-            8) install_media ;;
-            9) install_sunshine ;;
-            [aA]) install_all_apps ;;
-            [bB]) break ;;
-            *) log_warn "Invalid selection." ;;
-        esac
-    done
-}
-
-# ------------------------------------------------------------------------------
-# 5. SUBMENU: UNINSTALL APPS
-# ------------------------------------------------------------------------------
-menu_uninstall() {
-    while true; do
-        st_podman=$(is_bin_installed podman && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_kvm=$(is_pkg_installed virt-manager && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_vscode=$(is_pkg_installed visual-studio-code-bin && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_ag_ide=$(is_pkg_installed antigravity-ide && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_ag_app=$( (is_pkg_installed antigravity || is_bin_installed agy) && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_chrome=$(is_pkg_installed google-chrome && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_office=$(is_pkg_installed libreoffice-fresh && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_media=$(is_pkg_installed gimp && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_sunshine=$(is_pkg_installed sunshine-bin || is_bin_installed sunshine && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-
-        echo ""
-        echo -e "${BOLD}========================================================================${NC}"
-        echo -e "${BOLD}                         UNINSTALL APPLICATIONS                         ${NC}"
-        echo -e "${BOLD}========================================================================${NC}"
-        echo -e " 1) Podman Engine & Compose      $st_podman"
-        echo -e " 2) KVM / QEMU Virt-Manager      $st_kvm"
-        echo -e " 3) VS Code + Antigravity Ext    $st_vscode"
-        echo -e " 4) Antigravity IDE              $st_ag_ide"
-        echo -e " 5) Antigravity 2.0 Platform     $st_ag_app"
-        echo -e " 6) Google Chrome Browser        $st_chrome"
-        echo -e " 7) LibreOffice Fresh Suite      $st_office"
-        echo -e " 8) Essential Multimedia Suite   $st_media"
-        echo -e " 9) Sunshine Remote Desktop      $st_sunshine"
-        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        echo -e " A) Uninstall ALL Applications"
-        echo -e " B) Back to Main Menu"
-        echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application to remove (1-9 / A / B): " choice
-
-        case "$choice" in
-            1) uninstall_podman ;;
-            2) uninstall_kvm ;;
-            3) uninstall_vscode ;;
-            4) uninstall_antigravity_ide ;;
-            5) uninstall_antigravity_standalone ;;
-            6) uninstall_chrome ;;
-            7) uninstall_office ;;
-            8) uninstall_media ;;
-            9) uninstall_sunshine ;;
+            1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
+            2) manage_app_action "KVM / QEMU Virt-Manager" "$is_kvm" install_kvm uninstall_kvm ;;
+            3) manage_app_action "VS Code + Antigravity Ext" "$is_vscode" install_vscode uninstall_vscode ;;
+            4) manage_app_action "Antigravity IDE" "$is_ag_ide" install_antigravity_ide uninstall_antigravity_ide ;;
+            5) manage_app_action "Antigravity 2.0 Platform" "$is_ag_app" install_antigravity_standalone uninstall_antigravity_standalone ;;
+            6) manage_app_action "Google Chrome Browser" "$is_chrome" install_chrome uninstall_chrome ;;
+            7) manage_app_action "LibreOffice Fresh Suite" "$is_office" install_office uninstall_office ;;
+            8) manage_app_action "Essential Multimedia Suite" "$is_media" install_media uninstall_media ;;
+            9) manage_app_action "Sunshine Remote Desktop" "$is_sunshine" install_sunshine uninstall_sunshine ;;
             [aA])
-                read -rp "Are you sure you want to uninstall ALL applications? (y/N): " conf
-                [[ "$conf" =~ ^[Yy]$ ]] && uninstall_all_apps
+                read -rp "Install ALL applications now? (y/N): " a_conf
+                if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    install_all_apps
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [uU])
+                read -rp "Are you sure you want to uninstall ALL applications? (y/N): " u_conf
+                if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    uninstall_all_apps
+                    read -rp "Press [Enter] to continue..."
+                fi
                 ;;
             [bB]) break ;;
             *) log_warn "Invalid selection." ;;
@@ -691,7 +845,7 @@ menu_uninstall() {
 }
 
 # ------------------------------------------------------------------------------
-# 6. STORAGE & PERMANENT WINDOWS DATA PARTITION MANAGEMENT (ACTIVE SCRUBBING)
+# 5. STORAGE & PERMANENT WINDOWS DATA PARTITION MANAGEMENT (ACTIVE SCRUBBING)
 # ------------------------------------------------------------------------------
 configure_permanent_partitions() {
     echo ""
@@ -755,8 +909,25 @@ configure_permanent_partitions() {
             continue
         fi
 
-        # 3. Protect core Linux system partitions already in fstab (Root, Home, etc.)
+        # 3. Protect core Linux system partitions (Root, Home, EFI, etc.)
+        local root_uuid
+        root_uuid=$(findmnt -n -o UUID / 2>/dev/null || true)
+        if [[ "$dev_uuid" == "$root_uuid" ]] || findmnt -n -o TARGET -S "UUID=$dev_uuid" 2>/dev/null | grep -E '^/(home|var|boot|$)' >/dev/null; then
+            continue
+        fi
+
+        # Upgrade existing NTFS mounts in /etc/fstab from slow FUSE ntfs-3g to fast in-kernel ntfs3
         if grep -qi "$dev_uuid" /etc/fstab; then
+            if [[ "$dev_fstype" == "ntfs" ]] && grep -i "$dev_uuid" /etc/fstab | grep -q "ntfs-3g"; then
+                if modprobe ntfs3 2>/dev/null || lsmod | grep -q "^ntfs3"; then
+                    log_info "Upgrading NTFS partition ($dev_name) in /etc/fstab from FUSE ntfs-3g to fast in-kernel ntfs3..."
+                    sed -i "/$dev_uuid/ s/ntfs-3g/ntfs3/" /etc/fstab
+                    sed -i "/$dev_uuid/ s/,windows_names/,iocharset=utf8/" /etc/fstab
+                    umount "UUID=$dev_uuid" 2>/dev/null || true
+                    mount -a 2>/dev/null || true
+                    log_ok "Partition $dev_name upgraded to ntfs3."
+                fi
+            fi
             continue
         fi
 
@@ -798,10 +969,11 @@ configure_permanent_partitions() {
             ntfs)
                 if modprobe ntfs3 2>/dev/null || lsmod | grep -q "^ntfs3"; then
                     fs_driver="ntfs3"
+                    fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,iocharset=utf8,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
                 else
                     fs_driver="ntfs-3g"
+                    fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,windows_names,x-gvfs-show,x-gvfs-name=${encoded_label}"
                 fi
-                fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,windows_names,x-gvfs-show,x-gvfs-name=${encoded_label}"
                 ;;
             vfat|exfat)
                 fs_opts="defaults,noatime,uid=${USER_UID},gid=${USER_UID},umask=022,nofail,x-gvfs-show,x-gvfs-name=${encoded_label}"
@@ -832,8 +1004,138 @@ configure_permanent_partitions() {
     log_ok "Partition sync complete: $configured_count valid data partition(s) active, $purged_count recovery/OEM partition(s) purged."
 }
 
+configure_dell_hardware() {
+    echo ""
+    log_info "=== DELL HARDWARE & FIRMWARE TUNING ==="
+    local batt_cfg_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/PrimaryBattChargeCfg"
+    local fastboot_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/Fastboot"
+    local start_thresh="/sys/class/power_supply/BAT0/charge_control_start_threshold"
+    local end_thresh="/sys/class/power_supply/BAT0/charge_control_end_threshold"
+
+    if [[ -d "$batt_cfg_path" ]]; then
+        local cur_batt
+        cur_batt=$(cat "$batt_cfg_path/current_value" 2>/dev/null || true)
+        echo -e "Current Dell Battery Charging Profile: ${CYAN}${cur_batt:-Unknown}${NC}"
+        echo " 1) Primarily AC Use (PrimAcUse) - Best for preserving degraded/AC-connected battery"
+        echo " 2) Custom (50% Start, 80% Stop Threshold)"
+        echo " 3) Adaptive / Standard (100% capacity)"
+        echo " 4) Keep current setting"
+        read -rp "Select battery profile (1-4): " b_choice
+
+        case "$b_choice" in
+            1)
+                echo "PrimAcUse" > "$batt_cfg_path/current_value" 2>/dev/null || true
+                log_ok "Dell Battery profile set to Primarily AC Use (PrimAcUse)."
+                ;;
+            2)
+                echo "Custom" > "$batt_cfg_path/current_value" 2>/dev/null || true
+                [[ -f "$start_thresh" ]] && echo "50" > "$start_thresh" 2>/dev/null || true
+                [[ -f "$end_thresh" ]] && echo "80" > "$end_thresh" 2>/dev/null || true
+                log_ok "Battery charge threshold configured: 50% start, 80% stop."
+                ;;
+            3)
+                echo "Adaptive" > "$batt_cfg_path/current_value" 2>/dev/null || true
+                log_ok "Dell Battery profile set to Adaptive."
+                ;;
+            *) log_info "Battery profile unchanged." ;;
+        esac
+    elif [[ -f "$start_thresh" && -f "$end_thresh" ]]; then
+        echo "50" > "$start_thresh" 2>/dev/null || true
+        echo "80" > "$end_thresh" 2>/dev/null || true
+        log_ok "Battery sysfs threshold configured to 50%-80%."
+    else
+        log_warn "Dell WMI firmware attributes not exposed on this hardware."
+    fi
+
+    if [[ -d "$fastboot_path" ]]; then
+        local cur_fb
+        cur_fb=$(cat "$fastboot_path/current_value" 2>/dev/null || true)
+        echo -e "Current Dell UEFI Fastboot setting: ${CYAN}${cur_fb:-Unknown}${NC}"
+        if [[ "$cur_fb" != "Minimal" ]]; then
+            echo "Minimal" > "$fastboot_path/current_value" 2>/dev/null || true
+            log_ok "Dell Fastboot updated to 'Minimal' to reduce POST boot time."
+        else
+            log_ok "Dell Fastboot is already set to 'Minimal'."
+        fi
+    fi
+}
+
+update_dell_firmware() {
+    echo ""
+    log_info "=== DELL UEFI BIOS & HARDWARE FIRMWARE UPDATE ==="
+
+    if ! command -v fwupdmgr &>/dev/null; then
+        log_info "Installing fwupd (Linux Vendor Firmware Service manager)..."
+        pacman -S --needed --noconfirm fwupd
+    fi
+
+    # Check AC power status to protect against flashing on battery
+    local on_battery=false
+    for ac in /sys/class/power_supply/AC*/online /sys/class/power_supply/ADP*/online; do
+        if [[ -f "$ac" ]] && [[ $(cat "$ac" 2>/dev/null) -eq 0 ]]; then
+            on_battery=true
+        fi
+    done
+
+    if [[ "$on_battery" == "true" ]]; then
+        log_warn "AC Adapter is currently NOT plugged in!"
+        echo -e "${YELLOW}Flashing UEFI BIOS or device firmware requires external AC power to prevent power loss.${NC}"
+        read -rp "Please plug in your AC charger, then press [Enter] to continue (or 'q' to cancel): " p_ans
+        [[ "$p_ans" =~ ^[Qq]$ ]] && return
+    fi
+
+    log_info "Refreshing firmware metadata from LVFS..."
+    fwupdmgr refresh --force > /dev/null 2>&1 || true
+
+    log_info "Scanning for available Dell BIOS, TPM, and device firmware updates..."
+    local updates_out
+    updates_out=$(fwupdmgr get-updates 2>&1 || true)
+
+    if echo "$updates_out" | grep -qiE "No updatable devices|No updates available|No releases found"; then
+        log_ok "Your Dell Inspiron 7706 UEFI BIOS & device firmware are fully up to date!"
+    else
+        echo ""
+        echo -e "${CYAN}========================================================================${NC}"
+        echo -e "${BOLD}                     AVAILABLE FIRMWARE UPDATES                        ${NC}"
+        echo -e "${CYAN}========================================================================${NC}"
+        echo "$updates_out" | grep -E "New version|Release ID|Summary|Urgency|Vendor" || echo "$updates_out"
+        echo -e "${CYAN}========================================================================${NC}"
+        echo ""
+        read -rp "Do you want to stage and prepare these firmware updates now? (y/N): " fw_confirm
+        if [[ "$fw_confirm" =~ ^[Yy]$ ]]; then
+            log_info "Downloading and staging firmware capsule..."
+            fwupdmgr update -y
+            log_ok "Firmware update staged successfully!"
+            log_warn "A system reboot is required to flash the firmware. The Dell logo will show a progress bar during reboot."
+        else
+            log_info "Firmware update skipped by user."
+        fi
+    fi
+}
+
+maintain_btrfs_storage() {
+    echo ""
+    log_info "=== BTRFS HEALTH & SSD STORAGE MAINTENANCE ==="
+    for mp in "/" "/mnt/my-data"; do
+        if findmnt -n -t btrfs "$mp" >/dev/null 2>&1; then
+            log_info "Refreshing space allocation on $mp..."
+            btrfs filesystem df "$mp" || true
+            log_info "Executing block group balance on $mp (usage <= 10%)..."
+            btrfs balance start -dusage=10 -musage=10 "$mp" 2>/dev/null || true
+        fi
+    done
+
+    log_info "Executing SSD TRIM pass across all filesystems..."
+    local trim_res
+    if trim_res=$(fstrim -va 2>&1); then
+        log_ok "SSD TRIM completed successfully:\n$trim_res"
+    else
+        log_warn "SSD TRIM encountered issues:\n$trim_res"
+    fi
+}
+
 # ------------------------------------------------------------------------------
-# 7. SUBMENU: DESKTOP & GNOME UI SETTINGS
+# 6. SUBMENU: DESKTOP UI, STORAGE & HARDWARE SETTINGS
 # ------------------------------------------------------------------------------
 menu_desktop_settings() {
     while true; do
@@ -846,16 +1148,19 @@ menu_desktop_settings() {
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e "${BOLD}                    DESKTOP & GNOME UI SETTINGS                         ${NC}"
+        echo -e "${BOLD}               DESKTOP UI, STORAGE & HARDWARE SETTINGS                  ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e " 1) Desktop Files & Folders      $di_st"
-        echo -e " 2) Top-Left Hot Corner          $hc_st"
-        echo -e " 3) Apply Recommended Preset (Desktop Files ON, Drive Icons OFF, Hot Corner OFF)"
-        echo -e " 4) Configure Windows Partitions (Exclude Recovery/OEM, Mount C:)"
+        echo -e " 1) Desktop Files & Folders                  $di_st"
+        echo -e " 2) Top-Left Hot Corner                      $hc_st"
+        echo -e " 3) Configure Windows & Data Partitions      ${CYAN}[NTFS3 / Auto-Mount]${NC}"
+        echo -e " 4) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
+        echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery Longevity & Fastboot]${NC}"
+        echo -e " 6) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-4 / B): " choice
+        read -rp "Select an option (1-6 / A / B): " choice
 
         case "$choice" in
             1)
@@ -867,13 +1172,30 @@ menu_desktop_settings() {
                 read -rp "Press [Enter] to continue..."
                 ;;
             3)
-                configure_desktop_icons enable
-                configure_hot_corner disable
-                log_ok "Recommended preset applied."
+                configure_permanent_partitions
                 read -rp "Press [Enter] to continue..."
                 ;;
             4)
+                maintain_btrfs_storage
+                read -rp "Press [Enter] to continue..."
+                ;;
+            5)
+                configure_dell_hardware
+                read -rp "Press [Enter] to continue..."
+                ;;
+            6)
+                update_dell_firmware
+                read -rp "Press [Enter] to continue..."
+                ;;
+            [aA])
+                log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
+                configure_desktop_icons enable
+                configure_hot_corner disable
                 configure_permanent_partitions
+                maintain_btrfs_storage
+                configure_dell_hardware
+                update_dell_firmware
+                log_ok "All settings and hardware tuning routines completed."
                 read -rp "Press [Enter] to continue..."
                 ;;
             [bB]) break ;;
@@ -883,7 +1205,7 @@ menu_desktop_settings() {
 }
 
 # ------------------------------------------------------------------------------
-# 8. MAIN MENU
+# 7. MAIN MENU
 # ------------------------------------------------------------------------------
 while true; do
     echo ""
@@ -891,26 +1213,24 @@ while true; do
     echo -e "${BOLD}                     MANJARO CONTROL CENTER                             ${NC}"
     echo -e "${BOLD}========================================================================${NC}"
     echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, SSD TRIM)"
-    echo -e " ${BOLD}2)${NC} Install apps"
-    echo -e " ${BOLD}3)${NC} Uninstall apps"
-    echo -e " ${BOLD}4)${NC} Desktop UI & Settings"
-    echo -e " ${BOLD}5)${NC} Quit"
+    echo -e " ${BOLD}2)${NC} Desktop UI, Storage & Hardware Settings"
+    echo -e " ${BOLD}3)${NC} Extra Apps (Install, Reinstall & Uninstall Hub)"
+    echo -e " ${BOLD}4)${NC} Quit"
     echo -e "${BOLD}------------------------------------------------------------------------${NC}"
     echo -e " 📋 Live log file: ${CYAN}$LOG_FILE${NC}"
     echo -e "${BOLD}========================================================================${NC}"
-    read -rp "Please enter your choice (1-5): " main_choice
+    read -rp "Please enter your choice (1-4): " main_choice
 
     case "$main_choice" in
         1) optimize_system ;;
-        2) menu_install ;;
-        3) menu_uninstall ;;
-        4) menu_desktop_settings ;;
-        5)
+        2) menu_desktop_settings ;;
+        3) menu_extra_apps ;;
+        4)
             log_ok "Exiting. Session completed successfully!"
             break
             ;;
         *)
-            log_warn "Invalid option. Please enter a number from 1 to 5."
+            log_warn "Invalid option. Please enter a number from 1 to 4."
             ;;
     esac
 done
