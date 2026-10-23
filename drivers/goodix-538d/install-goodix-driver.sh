@@ -47,6 +47,14 @@ fi
 
 INSTALLED=false
 
+# Ensure stock conflicting libfprint is cleanly replaced without breaking fprintd
+clean_stock_conflict() {
+    if pacman -Qq libfprint &>/dev/null && ! pacman -Qq libfprint-goodix-538d &>/dev/null; then
+        log_info "Safely detaching conflicting stock libfprint (preserving fprintd)..."
+        pacman -Rdd --noconfirm libfprint 2>/dev/null || true
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # TIER 1: Install from precompiled local package cache (.pkg.tar.zst)
 # ------------------------------------------------------------------------------
@@ -55,6 +63,7 @@ CACHED_PKG=$(ls -t "$SCRIPT_DIR"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | he
 
 if [[ -n "$CACHED_PKG" && -f "$CACHED_PKG" ]]; then
     log_info "Found cached package: $(basename "$CACHED_PKG")"
+    clean_stock_conflict
     log_info "Installing via pacman -U..."
     if pacman -U --noconfirm "$CACHED_PKG"; then
         log_ok "Precompiled driver package installed successfully!"
@@ -75,6 +84,7 @@ if [[ "$INSTALLED" == "false" && -f "$SCRIPT_DIR/PKGBUILD" ]]; then
     if sudo -u "$REAL_USER" bash -c "cd '$SCRIPT_DIR' && makepkg -f --nodeps"; then
         NEW_PKG=$(ls -t "$SCRIPT_DIR"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
         if [[ -n "$NEW_PKG" && -f "$NEW_PKG" ]]; then
+            clean_stock_conflict
             if pacman -U --noconfirm "$NEW_PKG"; then
                 log_ok "Built and installed package: $(basename "$NEW_PKG")"
                 INSTALLED=true

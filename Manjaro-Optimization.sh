@@ -1371,11 +1371,20 @@ configure_goodix_fingerprint() {
     local driver_dir="${SCRIPT_DIR}/drivers/goodix-538d"
     local installed=false
 
+    # Ensure stock conflicting libfprint is cleanly replaced without breaking fprintd
+    clean_stock_libfprint_conflict() {
+        if pacman -Qq libfprint &>/dev/null && ! pacman -Qq libfprint-goodix-538d &>/dev/null; then
+            log_info "Safely detaching conflicting stock libfprint (preserving fprintd)..."
+            pacman -Rdd --noconfirm libfprint 2>/dev/null || true
+        fi
+    }
+
     # Tier 1: Check precompiled local package cache (.pkg.tar.zst)
     local cached_pkg
     cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
     if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
         log_info "Tier 1: Installing cached driver package: $(basename "$cached_pkg")..."
+        clean_stock_libfprint_conflict
         if pacman -U --noconfirm "$cached_pkg" 2>/dev/null; then
             log_ok "Driver installed from local package cache."
             installed=true
@@ -1392,6 +1401,7 @@ configure_goodix_fingerprint() {
             local new_pkg
             new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
             if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
+                clean_stock_libfprint_conflict
                 if pacman -U --noconfirm "$new_pkg" 2>/dev/null; then
                     log_ok "Patched driver compiled and installed successfully."
                     installed=true
