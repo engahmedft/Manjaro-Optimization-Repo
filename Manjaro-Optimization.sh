@@ -109,13 +109,18 @@ is_bin_installed() {
 
 sync_grub_snapshots() {
     log_info "Synchronizing Timeshift snapshots with GRUB boot menu..."
-    if [[ -x /etc/grub.d/41_snapshots-btrfs ]]; then
-        /etc/grub.d/41_snapshots-btrfs > /dev/null 2>&1 || true
-    fi
-    if command -v update-grub &>/dev/null; then
-        update-grub > /dev/null 2>&1 || true
-    elif command -v grub-mkconfig &>/dev/null; then
-        grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+    # If grub.cfg already contains snapshots submenu hook, regenerating 41_snapshots-btrfs is instantaneous (<0.2s)
+    if grep -q "snapshots-btrfs" /boot/grub/grub.cfg 2>/dev/null; then
+        if [[ -x /etc/grub.d/41_snapshots-btrfs ]]; then
+            /etc/grub.d/41_snapshots-btrfs > /dev/null 2>&1 || true
+        fi
+    else
+        # Full generation needed only once to register submenu in grub.cfg
+        if command -v update-grub &>/dev/null; then
+            update-grub > /dev/null 2>&1 || true
+        elif command -v grub-mkconfig &>/dev/null; then
+            grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+        fi
     fi
     log_ok "GRUB boot menu snapshots synchronized."
 }
@@ -137,6 +142,7 @@ ensure_session_snapshot() {
         log_ok "Timeshift restore point created successfully."
         sync_grub_snapshots
     else
+        SESSION_SNAPSHOT_TAKEN=true
         log_warn "Timeshift snapshot skipped (run Timeshift GUI once to configure disk if needed)."
     fi
 }
@@ -168,10 +174,10 @@ EOF
         fi
     fi
 
-    # 2. Ensure inotify-tools is installed for grub-btrfsd daemon
-    if ! is_pkg_installed inotify-tools; then
-        log_info "Installing inotify-tools for real-time GRUB snapshot synchronization..."
-        pacman -S --needed --noconfirm inotify-tools > /dev/null 2>&1 || true
+    # 2. Ensure grub-btrfs and inotify-tools are installed for grub-btrfsd daemon
+    if ! is_pkg_installed grub-btrfs || ! is_pkg_installed inotify-tools; then
+        log_info "Installing grub-btrfs and inotify-tools for real-time GRUB snapshot synchronization..."
+        pacman -S --needed --noconfirm grub-btrfs inotify-tools > /dev/null 2>&1 || true
     fi
 
     # 3. Deploy systemd override for grub-btrfsd to watch Timeshift snapshots
@@ -185,6 +191,35 @@ EOF
     systemctl enable --now grub-btrfsd.service > /dev/null 2>&1 || true
     systemctl restart grub-btrfsd.service > /dev/null 2>&1 || true
     log_ok "Timeshift automated snapshot synchronization daemon (grub-btrfsd) active."
+}
+
+configure_grub_dual_boot() {
+    log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync)..."
+    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools > /dev/null 2>&1 || true
+
+    # Unconditionally configure GRUB for dual-boot visibility
+    sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
+    echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
+
+    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
+    sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
+    sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
+
+    # Ensure Intel GuC/HuC is enabled on kernel command line for Tiger Lake
+    if ! grep -q "i915.enable_guc=3" /etc/default/grub; then
+        sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1i915.enable_guc=3 /" /etc/default/grub
+    fi
+
+    # Configure GRUB boot enhancements (Shutdown & Reboot menu entries, grub-btrfsd daemon with timeshift-auto)
+    configure_grub_boot_enhancements
+
+    # Regenerate grub.cfg in a single pass to compile settings, shutdown entries, and snapshots submenu
+    if command -v update-grub &>/dev/null; then
+        update-grub > /dev/null 2>&1 || true
+    elif command -v grub-mkconfig &>/dev/null; then
+        grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+    fi
+    log_ok "GRUB dual-boot configuration updated."
 }
 
 init_downloads() {
@@ -395,27 +430,7 @@ optimize_system() {
     run_as_user gsettings set org.gnome.system.locale region 'en_US.UTF-8' 2>/dev/null || true
 
     log_info "6/13: Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync) & LocalRTC..."
-    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools > /dev/null 2>&1 || true
-
-    # Unconditionally configure GRUB for dual-boot visibility and Intel GuC
-    sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
-    echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
-
-    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
-    sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
-    sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
-
-    # Ensure Intel GuC/HuC is enabled on kernel command line for Tiger Lake
-    if ! grep -q "i915.enable_guc=3" /etc/default/grub; then
-        sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1i915.enable_guc=3 /" /etc/default/grub
-    fi
-
-    # Configure GRUB boot enhancements (Shutdown & Reboot menu entries, grub-btrfsd daemon with timeshift-auto)
-    configure_grub_boot_enhancements
-
-    update-grub > /dev/null 2>&1 || true
-    sync_grub_snapshots
-    log_ok "GRUB dual-boot configuration updated."
+    configure_grub_dual_boot
 
     if [[ $(timedatectl show --property=LocalRTC --value) != "yes" ]]; then
         timedatectl set-local-rtc 1 --adjust-system-clock
@@ -842,12 +857,10 @@ manage_app_action() {
         read -rp "Please select an action (1-3): " act_choice
         case "$act_choice" in
             1)
-                ensure_session_snapshot "Before App Reinstall/Update: ${name}"
                 $install_fn
                 read -rp "Press [Enter] to continue..."
                 ;;
             2)
-                ensure_session_snapshot "Before App Uninstall: ${name}"
                 $uninstall_fn
                 read -rp "Press [Enter] to continue..."
                 ;;
@@ -863,7 +876,6 @@ manage_app_action() {
         read -rp "Please select an action (1-2): " act_choice
         case "$act_choice" in
             1)
-                ensure_session_snapshot "Before App Installation: ${name}"
                 $install_fn
                 read -rp "Press [Enter] to continue..."
                 ;;
@@ -1116,8 +1128,14 @@ configure_dell_hardware() {
     local custom_start_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/CustomChargeStart"
     local custom_stop_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/CustomChargeStop"
     local fastboot_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/Fastboot"
-    local start_thresh="/sys/class/power_supply/BAT0/charge_control_start_threshold"
-    local end_thresh="/sys/class/power_supply/BAT0/charge_control_end_threshold"
+    local start_thresh
+    start_thresh=$(ls /sys/class/power_supply/BAT*/charge_control_start_threshold 2>/dev/null | head -n 1)
+    local end_thresh
+    end_thresh=$(ls /sys/class/power_supply/BAT*/charge_control_end_threshold 2>/dev/null | head -n 1)
+    local bat_name="BAT0"
+    if [[ -n "$start_thresh" ]]; then
+        bat_name=$(basename "$(dirname "$start_thresh")")
+    fi
 
     if [[ -d "$batt_cfg_path" ]]; then
         local cur_batt
@@ -1139,14 +1157,14 @@ configure_dell_hardware() {
                 echo "Custom" > "$batt_cfg_path/current_value" 2>/dev/null || true
                 [[ -f "$custom_start_path/current_value" ]] && echo "50" > "$custom_start_path/current_value" 2>/dev/null || true
                 [[ -f "$custom_stop_path/current_value" ]] && echo "90" > "$custom_stop_path/current_value" 2>/dev/null || true
-                [[ -f "$start_thresh" ]] && echo "50" > "$start_thresh" 2>/dev/null || true
-                [[ -f "$end_thresh" ]] && echo "90" > "$end_thresh" 2>/dev/null || true
+                [[ -n "$start_thresh" ]] && echo "50" > "$start_thresh" 2>/dev/null || true
+                [[ -n "$end_thresh" ]] && echo "90" > "$end_thresh" 2>/dev/null || true
 
                 # Persist threshold across cold boots via systemd tmpfiles
                 mkdir -p /etc/tmpfiles.d
-                cat << 'EOF' > /etc/tmpfiles.d/battery-threshold.conf
-w /sys/class/power_supply/BAT0/charge_control_start_threshold - - - - 50
-w /sys/class/power_supply/BAT0/charge_control_end_threshold - - - - 90
+                cat << EOF > /etc/tmpfiles.d/battery-threshold.conf
+w /sys/class/power_supply/${bat_name}/charge_control_start_threshold - - - - 50
+w /sys/class/power_supply/${bat_name}/charge_control_end_threshold - - - - 90
 EOF
                 systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
                 log_ok "Battery charge threshold configured: 50% start, 90% stop (Dell BIOS NVRAM & sysfs)."
@@ -1158,13 +1176,13 @@ EOF
                 ;;
             *) log_info "Battery profile unchanged." ;;
         esac
-    elif [[ -f "$start_thresh" && -f "$end_thresh" ]]; then
+    elif [[ -n "$start_thresh" && -n "$end_thresh" ]]; then
         echo "50" > "$start_thresh" 2>/dev/null || true
         echo "90" > "$end_thresh" 2>/dev/null || true
         mkdir -p /etc/tmpfiles.d
-        cat << 'EOF' > /etc/tmpfiles.d/battery-threshold.conf
-w /sys/class/power_supply/BAT0/charge_control_start_threshold - - - - 50
-w /sys/class/power_supply/BAT0/charge_control_end_threshold - - - - 90
+        cat << EOF > /etc/tmpfiles.d/battery-threshold.conf
+w /sys/class/power_supply/${bat_name}/charge_control_start_threshold - - - - 50
+w /sys/class/power_supply/${bat_name}/charge_control_end_threshold - - - - 90
 EOF
         systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
         log_ok "Battery sysfs threshold configured to 50%-90%."
@@ -1314,10 +1332,7 @@ menu_desktop_settings() {
                 read -rp "Press [Enter] to continue..."
                 ;;
             7)
-                log_info "Configuring 10s GRUB timeout, boot menu enhancements & snapshot sync..."
-                sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
-                configure_grub_boot_enhancements
-                sync_grub_snapshots
+                configure_grub_dual_boot
                 read -rp "Press [Enter] to continue..."
                 ;;
             [aA])
@@ -1328,9 +1343,7 @@ menu_desktop_settings() {
                 maintain_btrfs_storage
                 configure_dell_hardware
                 update_dell_firmware
-                sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
-                configure_grub_boot_enhancements
-                sync_grub_snapshots
+                configure_grub_dual_boot
                 log_ok "All settings and hardware tuning routines completed."
                 read -rp "Press [Enter] to continue..."
                 ;;
