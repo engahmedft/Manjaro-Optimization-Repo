@@ -73,6 +73,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Session-wide snapshot guard (ensures only 1 restore point is created per script run)
+SESSION_SNAPSHOT_TAKEN=false
+
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
 log_info()    { echo -e "[$(timestamp)] ${BLUE}[INFO]${NC} $1"; }
 log_ok()      { echo -e "[$(timestamp)] ${GREEN}[OK]${NC} $1"; }
@@ -102,6 +105,86 @@ is_bin_installed() {
     command -v "$1" &> /dev/null || \
     [[ -x "$USER_HOME/.local/bin/$1" ]] || \
     sudo -u "$REAL_USER" bash -c "command -v '$1'" &> /dev/null
+}
+
+sync_grub_snapshots() {
+    log_info "Synchronizing Timeshift snapshots with GRUB boot menu..."
+    if [[ -x /etc/grub.d/41_snapshots-btrfs ]]; then
+        /etc/grub.d/41_snapshots-btrfs > /dev/null 2>&1 || true
+    fi
+    if command -v update-grub &>/dev/null; then
+        update-grub > /dev/null 2>&1 || true
+    elif command -v grub-mkconfig &>/dev/null; then
+        grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+    fi
+    log_ok "GRUB boot menu snapshots synchronized."
+}
+
+ensure_session_snapshot() {
+    local reason="${1:-Before System Modification}"
+    if [[ "$SESSION_SNAPSHOT_TAKEN" == "true" ]]; then
+        log_info "Timeshift snapshot already created during this session. Skipping duplicate snapshot."
+        return 0
+    fi
+
+    log_info "Creating one-time Timeshift system restore point ($reason)..."
+    if ! is_pkg_installed timeshift; then
+        pacman -S --needed --noconfirm timeshift > /dev/null 2>&1 || true
+    fi
+
+    if timeshift --create --comments "$reason" --tags O > /dev/null 2>&1; then
+        SESSION_SNAPSHOT_TAKEN=true
+        log_ok "Timeshift restore point created successfully."
+        sync_grub_snapshots
+    else
+        log_warn "Timeshift snapshot skipped (run Timeshift GUI once to configure disk if needed)."
+    fi
+}
+
+configure_grub_boot_enhancements() {
+    log_info "Configuring GRUB shutdown menu entries & automated snapshot daemon..."
+
+    # 1. Add Shutdown & Reboot entries to /etc/grub.d/40_custom
+    local custom_grub="/etc/grub.d/40_custom"
+    if [[ -f "$custom_grub" ]]; then
+        if ! grep -qiE "menuentry.*(Shutdown|Power Off)" "$custom_grub"; then
+            log_info "Adding Shutdown and Restart entries to $custom_grub..."
+            cat << 'EOF' >> "$custom_grub"
+
+menuentry "Shutdown / Power Off" --class shutdown --class poweroff {
+    echo "Shutting down system..."
+    halt
+}
+
+menuentry "Restart / Reboot" --class restart --class reboot {
+    echo "Restarting system..."
+    reboot
+}
+EOF
+            chmod +x "$custom_grub" 2>/dev/null || true
+            log_ok "GRUB Shutdown and Restart menu entries installed."
+        else
+            log_ok "GRUB Shutdown entry already present in $custom_grub."
+        fi
+    fi
+
+    # 2. Ensure inotify-tools is installed for grub-btrfsd daemon
+    if ! is_pkg_installed inotify-tools; then
+        log_info "Installing inotify-tools for real-time GRUB snapshot synchronization..."
+        pacman -S --needed --noconfirm inotify-tools > /dev/null 2>&1 || true
+    fi
+
+    # 3. Deploy systemd override for grub-btrfsd to watch Timeshift snapshots
+    mkdir -p /etc/systemd/system/grub-btrfsd.service.d
+    cat << 'EOF' > /etc/systemd/system/grub-btrfsd.service.d/timeshift-auto.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/grub-btrfsd --syslog --timeshift-auto
+EOF
+    systemctl daemon-reload > /dev/null 2>&1 || true
+    systemctl enable --now grub-btrfsd.service > /dev/null 2>&1 || true
+    systemctl restart grub-btrfsd.service > /dev/null 2>&1 || true
+    log_ok "Timeshift automated snapshot synchronization daemon (grub-btrfsd) active."
 }
 
 init_downloads() {
@@ -269,12 +352,7 @@ optimize_system() {
     log_info "=== STARTING FULL SYSTEM OPTIMIZATION ==="
 
     log_info "1/13: Checking Timeshift & creating system restore point..."
-    if ! is_pkg_installed timeshift; then
-        pacman -S --needed --noconfirm timeshift > /dev/null 2>&1 || true
-    fi
-    timeshift --create --comments "Before System Optimization" --tags O > /dev/null 2>&1 || {
-        log_warn "Timeshift snapshot skipped (run Timeshift GUI once to configure disk if needed)."
-    }
+    ensure_session_snapshot "Before System Optimization"
 
     log_info "2/13: Ensuring download accelerator and pacman formatting..."
     init_downloads
@@ -286,7 +364,8 @@ optimize_system() {
     log_info "3/13: Refreshing fastest mirrors & full system upgrade (Official + AUR)..."
     pacman-mirrors --fasttrack 5
     # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, Sunshine)
-    sudo -u "$REAL_USER" pamac update --no-confirm --aur
+    # Pass SKIP_AUTOSNAP=1 to prevent duplicate ALPM hook snapshot right after step 1
+    sudo -u "$REAL_USER" env SKIP_AUTOSNAP=1 pamac update --no-confirm --aur
 
     log_info "4/13: Checking Linux Kernel Lifecycle & Stability..."
     local running_ver
@@ -315,14 +394,14 @@ optimize_system() {
     localectl set-keymap us > /dev/null 2>&1 || true
     run_as_user gsettings set org.gnome.system.locale region 'en_US.UTF-8' 2>/dev/null || true
 
-    log_info "6/13: Configuring dual-boot GRUB (menu visible, 7s timeout, saved default) & LocalRTC..."
-    pacman -S --needed --noconfirm os-prober grub-btrfs > /dev/null 2>&1 || true
+    log_info "6/13: Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync) & LocalRTC..."
+    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools > /dev/null 2>&1 || true
 
     # Unconditionally configure GRUB for dual-boot visibility and Intel GuC
     sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
     echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
 
-    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=7/' /etc/default/grub
+    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
     sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
     sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
 
@@ -331,10 +410,11 @@ optimize_system() {
         sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1i915.enable_guc=3 /" /etc/default/grub
     fi
 
-    # Enable grub-btrfsd service for automatic snapshot updates in GRUB
-    systemctl enable --now grub-btrfsd.service 2>/dev/null || true
+    # Configure GRUB boot enhancements (Shutdown & Reboot menu entries, grub-btrfsd daemon with timeshift-auto)
+    configure_grub_boot_enhancements
 
     update-grub > /dev/null 2>&1 || true
+    sync_grub_snapshots
     log_ok "GRUB dual-boot configuration updated."
 
     if [[ $(timedatectl show --property=LocalRTC --value) != "yes" ]]; then
@@ -452,6 +532,7 @@ EOF
 # 2. APP INSTALL FUNCTIONS
 # ------------------------------------------------------------------------------
 install_podman() {
+    ensure_session_snapshot "Before Installing Podman"
     log_info "Installing Podman..."
     pacman -S --needed --noconfirm podman podman-compose podman-docker fuse-overlayfs
     if ! grep -q "^${REAL_USER}:" /etc/subuid 2>/dev/null; then
@@ -463,6 +544,7 @@ install_podman() {
 }
 
 install_kvm() {
+    ensure_session_snapshot "Before Installing KVM Virt-Manager"
     log_info "Installing KVM / QEMU Virt-Manager..."
     pacman -S --needed --noconfirm qemu-desktop virt-manager virt-viewer dnsmasq vde2 iptables-nft libguestfs
     systemctl enable --now libvirtd.service
@@ -475,6 +557,7 @@ install_kvm() {
 }
 
 install_vscode() {
+    ensure_session_snapshot "Before Installing VS Code"
     log_info "Installing VS Code..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin
@@ -484,6 +567,7 @@ install_vscode() {
 }
 
 install_antigravity_ide() {
+    ensure_session_snapshot "Before Installing Antigravity IDE"
     log_info "Installing Antigravity IDE..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm antigravity-ide || {
@@ -494,6 +578,7 @@ install_antigravity_ide() {
 }
 
 install_antigravity_standalone() {
+    ensure_session_snapshot "Before Installing Antigravity 2.0"
     log_info "Installing Google Antigravity 2.0 Standalone Desktop Platform & 'agy' CLI..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm antigravity || {
@@ -505,6 +590,7 @@ install_antigravity_standalone() {
 }
 
 install_chrome() {
+    ensure_session_snapshot "Before Installing Google Chrome"
     log_info "Installing Google Chrome..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm google-chrome
@@ -525,6 +611,7 @@ EOF
 }
 
 install_office() {
+    ensure_session_snapshot "Before Installing LibreOffice"
     log_info "Installing LibreOffice Fresh..."
     pacman -S --needed --noconfirm libreoffice-fresh
     log_ok "LibreOffice installed."
@@ -532,6 +619,7 @@ install_office() {
 }
 
 install_media() {
+    ensure_session_snapshot "Before Installing Multimedia Suite"
     log_info "Installing Essential Multimedia Suite..."
     pacman -S --needed --noconfirm vlc celluloid gimp kdenlive
     log_ok "Multimedia suite installed."
@@ -539,6 +627,7 @@ install_media() {
 }
 
 install_sunshine() {
+    ensure_session_snapshot "Before Installing Sunshine Remote Desktop"
     log_info "Installing Sunshine Remote Desktop Server (High-FPS/Low-Latency)..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm sunshine-bin || sudo -u "$REAL_USER" pamac build --no-confirm sunshine
@@ -564,7 +653,9 @@ install_sunshine() {
 }
 
 install_all_apps() {
+    echo ""
     log_info "=== STARTING GROUPED INSTALLATION OF ALL APPS ==="
+    ensure_session_snapshot "Before Installing All Applications"
 
     log_info "1/3. Installing all official repository applications in a single pass..."
     pacman -S --needed --noconfirm \
@@ -623,12 +714,14 @@ EOF
 # 3. UNINSTALL FUNCTIONS
 # ------------------------------------------------------------------------------
 uninstall_podman() {
+    ensure_session_snapshot "Before Uninstalling Podman"
     log_warn "Removing Podman..."
     safe_pacman_remove podman-docker podman-compose podman
     post_uninstall_hook
 }
 
 uninstall_kvm() {
+    ensure_session_snapshot "Before Uninstalling KVM Virt-Manager"
     log_warn "Removing KVM Virt-Manager..."
     systemctl disable --now libvirtd.service 2>/dev/null || true
     safe_pacman_remove virt-manager virt-viewer libguestfs
@@ -636,6 +729,7 @@ uninstall_kvm() {
 }
 
 uninstall_vscode() {
+    ensure_session_snapshot "Before Uninstalling VS Code"
     log_warn "Removing VS Code..."
     safe_pacman_remove visual-studio-code-bin
     rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" 2>/dev/null || true
@@ -643,6 +737,7 @@ uninstall_vscode() {
 }
 
 uninstall_antigravity_ide() {
+    ensure_session_snapshot "Before Uninstalling Antigravity IDE"
     log_warn "Removing Antigravity IDE..."
     safe_pacman_remove antigravity-ide
     rm -rf "$USER_HOME/.antigravity-ide" "$USER_HOME/.config/antigravity-ide" 2>/dev/null || true
@@ -650,6 +745,7 @@ uninstall_antigravity_ide() {
 }
 
 uninstall_antigravity_standalone() {
+    ensure_session_snapshot "Before Uninstalling Antigravity 2.0"
     log_warn "Removing Antigravity 2.0 Standalone..."
     safe_pacman_remove antigravity
     rm -rf "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" 2>/dev/null || true
@@ -657,6 +753,7 @@ uninstall_antigravity_standalone() {
 }
 
 uninstall_chrome() {
+    ensure_session_snapshot "Before Uninstalling Google Chrome"
     log_warn "Removing Google Chrome..."
     safe_pacman_remove google-chrome
     rm -rf "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
@@ -664,6 +761,7 @@ uninstall_chrome() {
 }
 
 uninstall_office() {
+    ensure_session_snapshot "Before Uninstalling LibreOffice"
     log_warn "Removing LibreOffice..."
     safe_pacman_remove libreoffice-fresh
     rm -rf "$USER_HOME/.config/libreoffice" 2>/dev/null || true
@@ -671,6 +769,7 @@ uninstall_office() {
 }
 
 uninstall_media() {
+    ensure_session_snapshot "Before Uninstalling Multimedia Suite"
     log_warn "Removing Multimedia Suite..."
     safe_pacman_remove vlc celluloid gimp kdenlive
     rm -rf "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" 2>/dev/null || true
@@ -678,6 +777,7 @@ uninstall_media() {
 }
 
 uninstall_sunshine() {
+    ensure_session_snapshot "Before Uninstalling Sunshine"
     log_warn "Removing Sunshine..."
     sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now app-dev.lizardbyte.app.Sunshine.service sunshine 2>/dev/null || true
     safe_pacman_remove sunshine-bin sunshine
@@ -687,7 +787,9 @@ uninstall_sunshine() {
 }
 
 uninstall_all_apps() {
+    echo ""
     log_info "=== STARTING GROUPED REMOVAL OF ALL APPS ==="
+    ensure_session_snapshot "Before Uninstalling All Applications"
 
     log_info "1/3. Disabling background virtualization, containers & streaming services..."
     systemctl disable --now libvirtd.service 2>/dev/null || true
@@ -740,10 +842,12 @@ manage_app_action() {
         read -rp "Please select an action (1-3): " act_choice
         case "$act_choice" in
             1)
+                ensure_session_snapshot "Before App Reinstall/Update: ${name}"
                 $install_fn
                 read -rp "Press [Enter] to continue..."
                 ;;
             2)
+                ensure_session_snapshot "Before App Uninstall: ${name}"
                 $uninstall_fn
                 read -rp "Press [Enter] to continue..."
                 ;;
@@ -759,6 +863,7 @@ manage_app_action() {
         read -rp "Please select an action (1-2): " act_choice
         case "$act_choice" in
             1)
+                ensure_session_snapshot "Before App Installation: ${name}"
                 $install_fn
                 read -rp "Press [Enter] to continue..."
                 ;;
@@ -1008,6 +1113,8 @@ configure_dell_hardware() {
     echo ""
     log_info "=== DELL HARDWARE & FIRMWARE TUNING ==="
     local batt_cfg_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/PrimaryBattChargeCfg"
+    local custom_start_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/CustomChargeStart"
+    local custom_stop_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/CustomChargeStop"
     local fastboot_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/Fastboot"
     local start_thresh="/sys/class/power_supply/BAT0/charge_control_start_threshold"
     local end_thresh="/sys/class/power_supply/BAT0/charge_control_end_threshold"
@@ -1017,7 +1124,7 @@ configure_dell_hardware() {
         cur_batt=$(cat "$batt_cfg_path/current_value" 2>/dev/null || true)
         echo -e "Current Dell Battery Charging Profile: ${CYAN}${cur_batt:-Unknown}${NC}"
         echo " 1) Primarily AC Use (PrimAcUse) - Best for preserving degraded/AC-connected battery"
-        echo " 2) Custom (50% Start, 80% Stop Threshold)"
+        echo " 2) Custom (50% Start, 90% Stop Threshold) - Dell BIOS NVRAM & Sysfs"
         echo " 3) Adaptive / Standard (100% capacity)"
         echo " 4) Keep current setting"
         read -rp "Select battery profile (1-4): " b_choice
@@ -1025,24 +1132,42 @@ configure_dell_hardware() {
         case "$b_choice" in
             1)
                 echo "PrimAcUse" > "$batt_cfg_path/current_value" 2>/dev/null || true
+                rm -f /etc/tmpfiles.d/battery-threshold.conf 2>/dev/null || true
                 log_ok "Dell Battery profile set to Primarily AC Use (PrimAcUse)."
                 ;;
             2)
                 echo "Custom" > "$batt_cfg_path/current_value" 2>/dev/null || true
+                [[ -f "$custom_start_path/current_value" ]] && echo "50" > "$custom_start_path/current_value" 2>/dev/null || true
+                [[ -f "$custom_stop_path/current_value" ]] && echo "90" > "$custom_stop_path/current_value" 2>/dev/null || true
                 [[ -f "$start_thresh" ]] && echo "50" > "$start_thresh" 2>/dev/null || true
-                [[ -f "$end_thresh" ]] && echo "80" > "$end_thresh" 2>/dev/null || true
-                log_ok "Battery charge threshold configured: 50% start, 80% stop."
+                [[ -f "$end_thresh" ]] && echo "90" > "$end_thresh" 2>/dev/null || true
+
+                # Persist threshold across cold boots via systemd tmpfiles
+                mkdir -p /etc/tmpfiles.d
+                cat << 'EOF' > /etc/tmpfiles.d/battery-threshold.conf
+w /sys/class/power_supply/BAT0/charge_control_start_threshold - - - - 50
+w /sys/class/power_supply/BAT0/charge_control_end_threshold - - - - 90
+EOF
+                systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
+                log_ok "Battery charge threshold configured: 50% start, 90% stop (Dell BIOS NVRAM & sysfs)."
                 ;;
             3)
                 echo "Adaptive" > "$batt_cfg_path/current_value" 2>/dev/null || true
+                rm -f /etc/tmpfiles.d/battery-threshold.conf 2>/dev/null || true
                 log_ok "Dell Battery profile set to Adaptive."
                 ;;
             *) log_info "Battery profile unchanged." ;;
         esac
     elif [[ -f "$start_thresh" && -f "$end_thresh" ]]; then
         echo "50" > "$start_thresh" 2>/dev/null || true
-        echo "80" > "$end_thresh" 2>/dev/null || true
-        log_ok "Battery sysfs threshold configured to 50%-80%."
+        echo "90" > "$end_thresh" 2>/dev/null || true
+        mkdir -p /etc/tmpfiles.d
+        cat << 'EOF' > /etc/tmpfiles.d/battery-threshold.conf
+w /sys/class/power_supply/BAT0/charge_control_start_threshold - - - - 50
+w /sys/class/power_supply/BAT0/charge_control_end_threshold - - - - 90
+EOF
+        systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
+        log_ok "Battery sysfs threshold configured to 50%-90%."
     else
         log_warn "Dell WMI firmware attributes not exposed on this hardware."
     fi
@@ -1156,11 +1281,12 @@ menu_desktop_settings() {
         echo -e " 4) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
         echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery Longevity & Fastboot]${NC}"
         echo -e " 6) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
+        echo -e " 7) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-6 / A / B): " choice
+        read -rp "Select an option (1-7 / A / B): " choice
 
         case "$choice" in
             1)
@@ -1187,6 +1313,13 @@ menu_desktop_settings() {
                 update_dell_firmware
                 read -rp "Press [Enter] to continue..."
                 ;;
+            7)
+                log_info "Configuring 10s GRUB timeout, boot menu enhancements & snapshot sync..."
+                sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
+                configure_grub_boot_enhancements
+                sync_grub_snapshots
+                read -rp "Press [Enter] to continue..."
+                ;;
             [aA])
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
                 configure_desktop_icons enable
@@ -1195,6 +1328,9 @@ menu_desktop_settings() {
                 maintain_btrfs_storage
                 configure_dell_hardware
                 update_dell_firmware
+                sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
+                configure_grub_boot_enhancements
+                sync_grub_snapshots
                 log_ok "All settings and hardware tuning routines completed."
                 read -rp "Press [Enter] to continue..."
                 ;;
