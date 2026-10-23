@@ -420,6 +420,12 @@ optimize_system() {
         log_ok "Reliable fallback LTS kernel series verified."
     fi
 
+    # Microcode Hygiene: Remove redundant amd-ucode on this Intel Tiger Lake system
+    if is_pkg_installed amd-ucode; then
+        log_info "Removing redundant amd-ucode package on Intel hardware..."
+        pacman -R --noconfirm amd-ucode 2>/dev/null || true
+    fi
+
     log_info "5/13: Enforcing en_US locale and formatting..."
     if ! grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen; then
         sed -i 's/^#*en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
@@ -436,14 +442,17 @@ optimize_system() {
         timedatectl set-local-rtc 1 --adjust-system-clock
     fi
 
-    log_info "7/13: Applying Btrfs NVMe 'noatime' mount optimization & labeling system partition..."
-    if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "noatime"; then
-        sed -i 's/defaults,compress=zstd/defaults,noatime,compress=zstd/g' /etc/fstab
+    log_info "7/13: Applying Btrfs NVMe 'noatime,discard=async' mount optimization & labeling system partition..."
+    if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "discard=async"; then
+        sed -i 's/compress=zstd:1/noatime,discard=async,compress=zstd:1/g' /etc/fstab
+        sed -i 's/defaults,noatime,noatime/defaults,noatime/g' /etc/fstab
+        sed -i 's/defaults,noatime,compress=zstd/defaults,noatime,discard=async,compress=zstd/g' /etc/fstab
         mount -o remount / 2>/dev/null || true
         mount -o remount /home 2>/dev/null || true
         mount -o remount /var/cache 2>/dev/null || true
         mount -o remount /var/log 2>/dev/null || true
-        log_ok "Btrfs subvolumes remounted with noatime."
+        mount -o remount /mnt/my-data 2>/dev/null || true
+        log_ok "Btrfs subvolumes remounted with noatime and discard=async."
     fi
 
     local root_src root_dev part_num disk_dev
@@ -478,7 +487,7 @@ EOF
     systemctl daemon-reload
     systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
 
-    log_info "10/13: Tuning kernel sysctl parameters for 32GB RAM, DRAM-less SSD & ZRAM..."
+    log_info "10/13: Tuning kernel sysctl parameters for 32GB RAM, DRAM-less SSD, ZRAM & Inotify Watches..."
     cat << 'EOF' > /etc/sysctl.d/99-dell-perf.conf
 vm.swappiness = 100
 vm.vfs_cache_pressure = 50
@@ -487,11 +496,14 @@ vm.dirty_bytes = 536870912
 vm.page-cluster = 0
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 1024
+fs.file-max = 2097152
 EOF
     sysctl --system > /dev/null 2>&1 || true
     log_ok "Kernel sysctl parameters applied."
 
-    log_info "11/13: Enabling Intel GuC/HuC early KMS, RTKit audio priority & thermald..."
+    log_info "11/13: Enabling Intel GuC/HuC early KMS, RTKit audio priority, thermald & biometrics..."
     cat << 'EOF' > /etc/modprobe.d/i915.conf
 options i915 enable_guc=3
 EOF
@@ -510,6 +522,12 @@ EOF
     systemctl enable --now power-profiles-daemon.service > /dev/null 2>&1 || true
     systemctl enable --now fstrim.timer > /dev/null 2>&1 || true
     systemctl enable --now paccache.timer > /dev/null 2>&1 || true
+
+    # Check and configure Goodix 27c6:538d fingerprint sensor
+    if lsusb | grep -qi "27c6:538d"; then
+        log_info "Goodix 27c6:538d sensor detected. Ensuring driver & service..."
+        configure_goodix_fingerprint noninteractive
+    fi
 
     log_info "12/13: Enabling Desktop Icons (files only) & Disabling Top-Left Hot Corner..."
     configure_desktop_icons enable
@@ -577,7 +595,16 @@ install_vscode() {
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin
     sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
-    log_ok "VS Code ready."
+
+    # Configure native Wayland and fractional scaling crispness
+    mkdir -p "$USER_HOME/.config"
+    cat << 'EOF' > "$USER_HOME/.config/code-flags.conf"
+--ozone-platform-hint=auto
+--enable-features=WaylandWindowDecorations
+EOF
+    chown "$REAL_USER:" "$USER_HOME/.config/code-flags.conf" 2>/dev/null || true
+
+    log_ok "VS Code ready with native Wayland flags."
     post_install_hook
 }
 
@@ -652,6 +679,12 @@ install_sunshine() {
     echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
     udevadm control --reload-rules && udevadm trigger
 
+    local sun_bin
+    sun_bin=$(command -v sunshine 2>/dev/null || which sunshine 2>/dev/null || true)
+    if [[ -n "$sun_bin" && -x "$sun_bin" ]]; then
+        setcap cap_sys_admin+ep "$(readlink -f "$sun_bin")" 2>/dev/null || true
+    fi
+
     # Create user service alias if upstream is app-dev.lizardbyte.app.Sunshine.service
     if [[ -f /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service ]]; then
         sudo -u "$REAL_USER" mkdir -p "$USER_HOME/.config/systemd/user"
@@ -695,6 +728,14 @@ install_all_apps() {
     sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
     [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
 
+    # Configure VS Code native Wayland flags
+    mkdir -p "$USER_HOME/.config"
+    cat << 'EOF' > "$USER_HOME/.config/code-flags.conf"
+--ozone-platform-hint=auto
+--enable-features=WaylandWindowDecorations
+EOF
+    chown "$REAL_USER:" "$USER_HOME/.config/code-flags.conf" 2>/dev/null || true
+
     # Configure Chrome Wayland & VA-API flags
     mkdir -p "$USER_HOME/.config"
     cat << 'EOF' > "$USER_HOME/.config/chrome-flags.conf"
@@ -708,6 +749,11 @@ EOF
     # Configure Sunshine
     echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
     udevadm control --reload-rules && udevadm trigger
+    local sun_bin_all
+    sun_bin_all=$(command -v sunshine 2>/dev/null || which sunshine 2>/dev/null || true)
+    if [[ -n "$sun_bin_all" && -x "$sun_bin_all" ]]; then
+        setcap cap_sys_admin+ep "$(readlink -f "$sun_bin_all")" 2>/dev/null || true
+    fi
     if [[ -f /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service ]]; then
         sudo -u "$REAL_USER" mkdir -p "$USER_HOME/.config/systemd/user"
         sudo -u "$REAL_USER" ln -sf /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service "$USER_HOME/.config/systemd/user/sunshine.service"
@@ -1277,17 +1323,134 @@ maintain_btrfs_storage() {
     fi
 }
 
+get_fingerprint_status() {
+    if ! lsusb | grep -qi "27c6:538d"; then
+        echo "not_detected"
+        return
+    fi
+    if is_pkg_installed libfprint-goodix-521d || [[ -f /usr/lib/udev/rules.d/70-libfprint-2.rules ]] || [[ -f /etc/udev/rules.d/70-libfprint-2.rules ]]; then
+        if run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -qiE "finger|enrolled"; then
+            echo "enrolled"
+        else
+            echo "installed"
+        fi
+    else
+        echo "uninstalled"
+    fi
+}
+
+configure_goodix_fingerprint() {
+    local mode="${1:-interactive}"
+    echo ""
+    log_info "=== GOODIX FINGERPRINT SENSOR (27c6:538d) SETUP ==="
+
+    if ! lsusb | grep -qi "27c6:538d"; then
+        log_warn "Goodix 27c6:538d sensor not detected on USB bus."
+        return 0
+    fi
+    log_ok "Goodix 27c6:538d sensor verified on USB bus."
+
+    if ! pacman -Qq fprintd &>/dev/null; then
+        log_info "Ensuring fprintd daemon is installed..."
+        pacman -S --needed --noconfirm fprintd
+    fi
+
+    local driver_dir="${SCRIPT_DIR}/drivers/goodix-538d"
+    local installed=false
+
+    # Tier 1: Check precompiled local package cache (.pkg.tar.zst)
+    local cached_pkg
+    cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+    if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
+        log_info "Tier 1: Installing cached driver package: $(basename "$cached_pkg")..."
+        if pacman -U --noconfirm "$cached_pkg" 2>/dev/null; then
+            log_ok "Driver installed from local package cache."
+            installed=true
+        else
+            log_warn "Cache installation encountered an issue. Falling back to Tier 2..."
+        fi
+    fi
+
+    # Tier 2: Makepkg / AUR build fallback
+    if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
+        log_info "Tier 2: Building patched driver from PKGBUILD via makepkg..."
+        pacman -S --needed --noconfirm git cmake pkg-config libgudev libgusb nss pixman openssl
+        if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -f --nodeps" 2>/dev/null; then
+            local new_pkg
+            new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+            if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
+                if pacman -U --noconfirm "$new_pkg" 2>/dev/null; then
+                    log_ok "Patched driver compiled and installed successfully."
+                    installed=true
+                fi
+            fi
+        fi
+    fi
+
+    # Tier 3: Direct source build fallback
+    if [[ "$installed" == "false" ]]; then
+        log_warn "Tier 3: Falling back to standalone driver compilation & library override..."
+        if [[ -x "$driver_dir/install-goodix-driver.sh" ]]; then
+            bash "$driver_dir/install-goodix-driver.sh" || true
+            installed=true
+        fi
+    fi
+
+    # Pin in /etc/pacman.conf to prevent official updates from breaking the driver
+    if grep -q "^IgnorePkg" /etc/pacman.conf; then
+        if ! grep -E "^IgnorePkg.*libfprint" /etc/pacman.conf; then
+            sed -i '/^IgnorePkg/ s/$/ libfprint libfprint-goodix-521d/' /etc/pacman.conf
+        fi
+    else
+        sed -i '/\[options\]/a IgnorePkg = libfprint libfprint-goodix-521d' /etc/pacman.conf
+    fi
+    log_ok "Pinned 'libfprint' in /etc/pacman.conf against official update overwrites."
+
+    # Verify PAM authentication
+    for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
+        if [[ -f "$pam_file" ]] && ! grep -q "pam_fprintd.so" "$pam_file"; then
+            sed -i '1s/^/auth sufficient pam_fprintd.so\n/' "$pam_file"
+            log_ok "Enabled pam_fprintd in $pam_file."
+        fi
+    done
+
+    # Restart fprintd daemon
+    systemctl daemon-reload
+    systemctl restart fprintd.service 2>/dev/null || true
+    log_ok "Fingerprint daemon service (fprintd) reloaded and active."
+
+    # Interactive enrollment
+    if [[ "$mode" == "interactive" ]]; then
+        echo ""
+        read -rp "Would you like to enroll your fingerprint now? (y/N): " enroll_ans
+        if [[ "$enroll_ans" =~ ^[Yy]$ ]]; then
+            echo -e "${CYAN}Place and press your finger flat on the sensor repeatedly when prompted...${NC}"
+            run_as_user fprintd-enroll || log_warn "Enrollment interrupted or deferred. Run 'fprintd-enroll' anytime."
+        else
+            log_info "Fingerprint enrollment skipped. Run 'fprintd-enroll' anytime to register fingers."
+        fi
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 6. SUBMENU: DESKTOP UI, STORAGE & HARDWARE SETTINGS
 # ------------------------------------------------------------------------------
 menu_desktop_settings() {
     while true; do
-        local di_raw di_st hc_raw hc_st
+        local di_raw di_st hc_raw hc_st fp_raw fp_st
         di_raw=$(get_desktop_icons_status)
         hc_raw=$(get_hot_corner_status)
+        fp_raw=$(get_fingerprint_status)
 
         [[ "$di_raw" == "enabled" ]] && di_st="${GREEN}[Enabled (Files Only)]${NC}" || di_st="${RED}[Disabled]${NC}"
         [[ "$hc_raw" == "enabled" ]] && hc_st="${RED}[Enabled]${NC}" || hc_st="${GREEN}[Disabled (Recommended)]${NC}"
+
+        case "$fp_raw" in
+            enrolled)     fp_st="${GREEN}[Enrolled & Active]${NC}" ;;
+            installed)    fp_st="${YELLOW}[Driver Ready (Unenrolled)]${NC}" ;;
+            uninstalled)  fp_st="${RED}[Driver Not Installed]${NC}" ;;
+            not_detected) fp_st="${RED}[Hardware Not Detected]${NC}" ;;
+        esac
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
@@ -1300,11 +1463,12 @@ menu_desktop_settings() {
         echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery Longevity & Fastboot]${NC}"
         echo -e " 6) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
         echo -e " 7) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
+        echo -e " 8) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-7 / A / B): " choice
+        read -rp "Select an option (1-8 / A / B): " choice
 
         case "$choice" in
             1)
@@ -1335,6 +1499,10 @@ menu_desktop_settings() {
                 configure_grub_dual_boot
                 read -rp "Press [Enter] to continue..."
                 ;;
+            8)
+                configure_goodix_fingerprint interactive
+                read -rp "Press [Enter] to continue..."
+                ;;
             [aA])
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
                 configure_desktop_icons enable
@@ -1344,6 +1512,7 @@ menu_desktop_settings() {
                 configure_dell_hardware
                 update_dell_firmware
                 configure_grub_dual_boot
+                configure_goodix_fingerprint noninteractive
                 log_ok "All settings and hardware tuning routines completed."
                 read -rp "Press [Enter] to continue..."
                 ;;

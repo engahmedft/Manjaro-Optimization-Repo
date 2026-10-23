@@ -1,0 +1,35 @@
+# Maintainer: Michael Teuscher <michael.teuscher+aur@pm.me>
+# Contributor: Ahmed (Dell Inspiron 7706 Goodix 27c6:538d Driver Package)
+pkgname=libfprint-goodix-521d
+_pkgdirname=libfprint
+pkgver=1.94.1
+pkgrel=10
+pkgdesc="Library for fingerprint readers - Patched for Goodix 521d and 538d (Dell Inspiron 7706)"
+arch=(x86_64)
+url="https://fprint.freedesktop.org/"
+license=(LGPL)
+depends=('libgusb>=0.3.0' nss pixman openssl)
+makedepends=(git cmake pkg-config libgudev)
+provides=(libfprint libfprint-2.so libfprint-goodix-521d libfprint-2.so=2-64 "libfprint=${pkgver}")
+conflicts=(libfprint)
+groups=(fprint)
+source=("git+https://github.com/infinytum/libfprint.git#branch=unstable")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${srcdir}/${_pkgdirname}"
+  # Fix pointer decay in 53xd driver for GCC 14/15/16
+  sed -i 's/goodix_tls_read_image(dev, &payload/goodix_tls_read_image(dev, payload/g' libfprint/drivers/goodixtls/goodix53xd.c
+}
+
+build() {
+  arch-meson "$_pkgdirname" build \
+    -Ddoc=false \
+    -Dintrospection=false \
+    -Dc_args="-Wno-incompatible-pointer-types -Wno-error"
+  ninja -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" meson install -C build
+}
