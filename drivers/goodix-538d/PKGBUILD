@@ -1,25 +1,28 @@
-# Maintainer: Michael Teuscher <michael.teuscher+aur@pm.me>
-# Contributor: Ahmed (Dell Inspiron 7706 Goodix 27c6:538d Driver Package)
-pkgname=libfprint-goodix-521d
+# Maintainer: Laércio de Sousa <lbsousajr@gmail.com>
+# Contributor: Ahmed (Dell Inspiron 7706 Goodix 27c6:538d SIGFM Driver Package)
+pkgname=libfprint-goodix-538d
 _pkgdirname=libfprint
-pkgver=1.94.1
-pkgrel=10
-pkgdesc="Library for fingerprint readers - Patched for Goodix 521d and 538d (Dell Inspiron 7706)"
+pkgver=1.94.100
+pkgrel=1
+pkgdesc="Library for fingerprint readers - Patched with SIGFM matching for Goodix 27c6:538d (Dell Inspiron 7706)"
 arch=(x86_64)
-url="https://fprint.freedesktop.org/"
-license=(LGPL)
+url="https://github.com/lbssousa/libfprint"
+license=(LGPL-2.1-or-later)
 depends=('libgusb>=0.3.0' nss pixman openssl)
 makedepends=(git cmake pkg-config libgudev)
-provides=(libfprint libfprint-2.so libfprint-goodix-521d libfprint-2.so=2-64 "libfprint=${pkgver}")
-conflicts=(libfprint)
+provides=(libfprint libfprint-2.so libfprint-goodix-521d libfprint-goodix-538d libfprint-2.so=2-64 "libfprint=${pkgver}")
+conflicts=(libfprint libfprint-goodix-521d)
 groups=(fprint)
-source=("git+https://github.com/infinytum/libfprint.git#branch=unstable")
+source=("git+https://github.com/lbssousa/libfprint.git#branch=goodix-538d-sigfm-gtls")
 sha256sums=('SKIP')
 
 prepare() {
   cd "${srcdir}/${_pkgdirname}"
-  # Fix pointer decay in 53xd driver for GCC 14/15/16
-  sed -i 's/goodix_tls_read_image(dev, &payload/goodix_tls_read_image(dev, payload/g' libfprint/drivers/goodixtls/goodix53xd.c
+  # Accept any valid 32-byte hardware PSK from 538d sensor
+  sed -i '/if (memcmp(psk, goodix_53xd_psk_0/,+5d' libfprint/drivers/goodixtls/goodix53xd.c
+  # Fix meson dict iteration in test suite
+  sed -i 's/foreach driver_test: drivers_tests/foreach driver_name, driver_test: drivers_tests/' tests/meson.build
+  sed -i 's/test(driver_test,/test(driver_name,/' tests/meson.build
 }
 
 build() {

@@ -1341,7 +1341,7 @@ get_fingerprint_status() {
         echo "not_detected"
         return
     fi
-    if is_pkg_installed libfprint-goodix-521d || [[ -f /usr/lib/udev/rules.d/70-libfprint-2.rules ]] || [[ -f /etc/udev/rules.d/70-libfprint-2.rules ]]; then
+    if is_pkg_installed libfprint-goodix-538d || is_pkg_installed libfprint-goodix-521d || [[ -f /usr/lib/udev/rules.d/70-libfprint-2.rules ]] || [[ -f /etc/udev/rules.d/70-libfprint-2.rules ]]; then
         if run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -qiE "finger|enrolled"; then
             echo "enrolled"
         else
@@ -1412,10 +1412,10 @@ configure_goodix_fingerprint() {
     # Pin in /etc/pacman.conf to prevent official updates from breaking the driver
     if grep -q "^IgnorePkg" /etc/pacman.conf; then
         if ! grep -E "^IgnorePkg.*libfprint" /etc/pacman.conf; then
-            sed -i '/^IgnorePkg/ s/$/ libfprint libfprint-goodix-521d/' /etc/pacman.conf
+            sed -i '/^IgnorePkg/ s/$/ libfprint libfprint-goodix-538d libfprint-goodix-521d/' /etc/pacman.conf
         fi
     else
-        sed -i '/\[options\]/a IgnorePkg = libfprint libfprint-goodix-521d' /etc/pacman.conf
+        sed -i '/\[options\]/a IgnorePkg = libfprint libfprint-goodix-538d libfprint-goodix-521d' /etc/pacman.conf
     fi
     log_ok "Pinned 'libfprint' in /etc/pacman.conf against official update overwrites."
 

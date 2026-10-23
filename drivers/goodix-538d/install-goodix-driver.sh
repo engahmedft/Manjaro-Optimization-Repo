@@ -92,18 +92,26 @@ if [[ "$INSTALLED" == "false" ]]; then
     rm -rf "$TMP_BUILD"
     mkdir -p "$TMP_BUILD"
     
-    if git clone --depth 1 -b unstable https://github.com/infinytum/libfprint.git "$TMP_BUILD"; then
+    if git clone --depth 1 -b goodix-538d-sigfm-gtls https://github.com/lbssousa/libfprint.git "$TMP_BUILD"; then
         cd "$TMP_BUILD"
-        sed -i 's/goodix_tls_read_image(dev, &payload/goodix_tls_read_image(dev, payload/g' libfprint/drivers/goodixtls/goodix53xd.c
+        # Accept any valid 32-byte hardware PSK from 538d sensor
+        sed -i '/if (memcmp(psk, goodix_53xd_psk_0/,+5d' libfprint/drivers/goodixtls/goodix53xd.c
+        # Fix meson dict iteration in test suite
+        sed -i 's/foreach driver_test: drivers_tests/foreach driver_name, driver_test: drivers_tests/' tests/meson.build
+        sed -i 's/test(driver_test,/test(driver_name,/' tests/meson.build
         
         # Build using system or local meson/ninja
         export PATH="/tmp/bin-tools:/tmp:$PATH"
-        meson setup build -Ddoc=false -Dintrospection=false -Dc_args="-Wno-incompatible-pointer-types -Wno-error"
+        arch-meson . build -Ddoc=false -Dintrospection=false -Dc_args="-Wno-incompatible-pointer-types -Wno-error" || \
+            meson setup build -Ddoc=false -Dintrospection=false -Dc_args="-Wno-incompatible-pointer-types -Wno-error"
         ninja -C build
         
         # Install library and udev rules
         cp -a build/libfprint/libfprint-2.so* /usr/lib/
-        if [[ -f build/libfprint/udev-rules ]]; then
+        if [[ -f build/libfprint/70-libfprint-2.rules ]]; then
+            cp build/libfprint/70-libfprint-2.rules /etc/udev/rules.d/70-libfprint-2.rules
+            udevadm control --reload-rules && udevadm trigger
+        elif [[ -f build/libfprint/udev-rules ]]; then
             cp build/libfprint/udev-rules /etc/udev/rules.d/60-libfprint-2-autosuspend.rules
             udevadm control --reload-rules && udevadm trigger
         fi
@@ -121,10 +129,10 @@ fi
 log_info "Pinning libfprint in /etc/pacman.conf to protect against system updates..."
 if grep -q "^IgnorePkg" /etc/pacman.conf; then
     if ! grep -E "^IgnorePkg.*libfprint" /etc/pacman.conf; then
-        sed -i '/^IgnorePkg/ s/$/ libfprint libfprint-goodix-521d/' /etc/pacman.conf
+        sed -i '/^IgnorePkg/ s/$/ libfprint libfprint-goodix-521d libfprint-goodix-538d/' /etc/pacman.conf
     fi
 else
-    sed -i '/\[options\]/a IgnorePkg = libfprint libfprint-goodix-521d' /etc/pacman.conf
+    sed -i '/\[options\]/a IgnorePkg = libfprint libfprint-goodix-521d libfprint-goodix-538d' /etc/pacman.conf
 fi
 log_ok "libfprint pinned in /etc/pacman.conf."
 
