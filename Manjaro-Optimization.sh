@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Manjaro Modular Optimizer, System Maintainer & Software Hub (v9.4 - Complete)
-# Target: Dell Inspiron 7706 | GNOME Wayland | Antigravity 2.0 | Safe Dual-Boot
+# Manjaro Modular Optimizer, System Maintainer & Software Hub (v9.5 - Complete)
+# Target: Dell Inspiron 7706 | GNOME Wayland | Sunshine | Full AUR & Kernel Sync
 # ==============================================================================
 
 set -o pipefail
@@ -209,13 +209,13 @@ configure_hot_corner() {
 }
 
 # ------------------------------------------------------------------------------
-# 1. SYSTEM OPTIMIZATION ROUTINE
+# 1. SYSTEM OPTIMIZATION ROUTINE (Includes AUR & Kernel Lifecycle Checks)
 # ------------------------------------------------------------------------------
 optimize_system() {
     echo ""
     log_info "=== STARTING FULL SYSTEM OPTIMIZATION ==="
 
-    log_info "1/12: Checking Timeshift & creating system restore point..."
+    log_info "1/13: Checking Timeshift & creating system restore point..."
     if ! is_pkg_installed timeshift; then
         pacman -S --needed --noconfirm timeshift > /dev/null 2>&1 || true
     fi
@@ -223,18 +223,30 @@ optimize_system() {
         log_warn "Timeshift snapshot skipped (run Timeshift GUI once to configure disk if needed)."
     }
 
-    log_info "2/12: Ensuring download accelerator and pacman formatting..."
+    log_info "2/13: Ensuring download accelerator and pacman formatting..."
     init_downloads
     sed -i 's/^#*Color/Color/' /etc/pacman.conf
     if ! grep -q "ILoveCandy" /etc/pacman.conf; then
         sed -i '/# Misc options/a ILoveCandy' /etc/pacman.conf 2>/dev/null || true
     fi
 
-    log_info "3/12: Refreshing fastest mirrors & upgrading system..."
+    log_info "3/13: Refreshing fastest mirrors & full system upgrade (Official + AUR)..."
     pacman-mirrors --fasttrack 5
-    pacman -Syu --noconfirm
+    # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, Sunshine)
+    sudo -u "$REAL_USER" pamac update --no-confirm --aur
 
-    log_info "4/12: Enforcing en_US locale and formatting..."
+    log_info "4/13: Checking Linux Kernel Lifecycle (EOL Migration)..."
+    local running_kver
+    running_kver=$(uname -r | cut -d. -f1,2 | tr -d '.') # e.g. 71 for 7.1
+    if [[ "$running_kver" -le 71 ]]; then
+        log_warn "Active kernel series (linux$running_kver) is End-Of-Life (EOL)."
+        if ! mhwd-kernel -li | grep -q "linux72"; then
+            log_info "Installing recommended modern Linux 7.2 kernel branch..."
+            mhwd-kernel -i linux72 rmc || log_warn "Kernel 7.2 installation deferred. Keep current kernel."
+        fi
+    fi
+
+    log_info "5/13: Enforcing en_US locale and formatting..."
     if ! grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen; then
         sed -i 's/^#*en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
         locale-gen > /dev/null 2>&1 || true
@@ -243,7 +255,7 @@ optimize_system() {
     localectl set-keymap us > /dev/null 2>&1 || true
     run_as_user gsettings set org.gnome.system.locale region 'en_US.UTF-8' 2>/dev/null || true
 
-    log_info "5/12: Configuring dual-boot GRUB (7s timer for Windows) & LocalRTC..."
+    log_info "6/13: Configuring dual-boot GRUB (7s timer for Windows) & LocalRTC..."
     pacman -S --needed --noconfirm os-prober > /dev/null 2>&1 || true
     if grep -q "^#*GRUB_DISABLE_OS_PROBER=true" /etc/default/grub || ! grep -q "GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
         sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
@@ -255,7 +267,7 @@ optimize_system() {
         timedatectl set-local-rtc 1 --adjust-system-clock
     fi
 
-    log_info "6/12: Applying Btrfs NVMe 'noatime' mount optimization & labeling system partition..."
+    log_info "7/13: Applying Btrfs NVMe 'noatime' mount optimization & labeling system partition..."
     if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "noatime"; then
         sed -i 's/defaults,compress=zstd/defaults,noatime,compress=zstd/g' /etc/fstab
         mount -o remount / 2>/dev/null || true
@@ -265,7 +277,6 @@ optimize_system() {
         log_ok "Btrfs subvolumes remounted with noatime."
     fi
 
-    # Set both Btrfs volume label and GPT partition name to Manjaro
     local root_src root_dev part_num disk_dev
     root_src=$(findmnt -n -o SOURCE / 2>/dev/null)
     root_dev="${root_src%%\[*}"
@@ -281,10 +292,10 @@ optimize_system() {
         log_ok "System partition verified as 'Manjaro'."
     fi
 
-    log_info "7/12: Configuring Windows partitions (protecting sensitive/recovery partitions)..."
+    log_info "8/13: Configuring Windows partitions (protecting sensitive/recovery partitions)..."
     configure_permanent_partitions
 
-    log_info "8/12: Setting up ZRAM (RAM-compressed swap)..."
+    log_info "9/13: Setting up ZRAM (RAM-compressed swap)..."
     pacman -S --needed --noconfirm zram-generator > /dev/null 2>&1 || true
     if [[ ! -f /etc/systemd/zram-generator.conf ]]; then
         cat << 'EOF' > /etc/systemd/zram-generator.conf
@@ -298,7 +309,7 @@ EOF
     systemctl daemon-reload
     systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
 
-    log_info "9/12: Tuning kernel sysctl parameters for 32GB RAM & TCP BBR..."
+    log_info "10/13: Tuning kernel sysctl parameters for 32GB RAM & TCP BBR..."
     cat << 'EOF' > /etc/sysctl.d/99-dell-perf.conf
 vm.swappiness = 100
 vm.vfs_cache_pressure = 50
@@ -309,7 +320,7 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
     sysctl --system > /dev/null 2>&1 || true
 
-    log_info "10/12: Enabling Intel GuC/HuC microcontrollers & thermald..."
+    log_info "11/13: Enabling Intel GuC/HuC microcontrollers & thermald..."
     cat << 'EOF' > /etc/modprobe.d/i915.conf
 options i915 enable_guc=3
 EOF
@@ -320,11 +331,11 @@ EOF
     systemctl enable --now fstrim.timer > /dev/null 2>&1 || true
     systemctl enable --now paccache.timer > /dev/null 2>&1 || true
 
-    log_info "11/12: Enabling Desktop Icons (files only) & Disabling Top-Left Hot Corner..."
+    log_info "12/13: Enabling Desktop Icons (files only) & Disabling Top-Left Hot Corner..."
     configure_desktop_icons enable
     configure_hot_corner disable
 
-    log_info "12/12: Performing Deep System Clutter Cleanup..."
+    log_info "13/13: Performing Deep System Clutter Cleanup..."
     rm -rf /var/tmp/pamac-build-* /var/tmp/pamac-*
     sudo -u "$REAL_USER" rm -rf "$USER_HOME/.cache/pamac" 2>/dev/null || true
     paccache -r -k 2 > /dev/null 2>&1 || true
@@ -337,7 +348,7 @@ EOF
     log_info "Executing SSD TRIM pass..."
     fstrim -va > /dev/null 2>&1 || true
 
-    log_ok "Optimization complete! Windows partitions mounted, desktop clutter removed, and hardware tuned."
+    log_ok "Optimization complete! OS, AUR, kernel, and hardware settings are updated."
     read -rp "Press [Enter] to return to the main menu..."
 }
 
@@ -419,6 +430,23 @@ install_media() {
     post_install_hook
 }
 
+install_sunshine() {
+    log_info "Installing Sunshine Remote Desktop Server (High-FPS/Low-Latency)..."
+    pamac enable-aur > /dev/null 2>&1 || true
+    sudo -u "$REAL_USER" pamac build --no-confirm sunshine-bin || sudo -u "$REAL_USER" pamac build --no-confirm sunshine
+
+    # Grant user permission to uinput for virtual mouse/keyboard emulation
+    usermod -aG input "$REAL_USER"
+    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
+    udevadm control --reload-rules && udevadm trigger
+
+    # Enable systemd user service
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now sunshine 2>/dev/null || true
+
+    log_ok "Sunshine installed and active! Access dashboard at: https://localhost:47990"
+    post_install_hook
+}
+
 install_all_apps() {
     log_info "=== STARTING GROUPED INSTALLATION OF ALL APPS ==="
 
@@ -434,15 +462,20 @@ install_all_apps() {
     fi
     sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now podman.socket 2>/dev/null || true
     systemctl enable --now libvirtd.service > /dev/null 2>&1 || true
-    usermod -aG libvirt,kvm "$REAL_USER"
+    usermod -aG libvirt,kvm,input "$REAL_USER"
     virsh net-autostart default > /dev/null 2>&1 || true
     virsh net-start default > /dev/null 2>&1 || true
     echo "options kvm_intel nested=1" > /etc/modprobe.d/kvm-intel.conf
 
     log_info "2/3. Building AUR packages with multi-stream acceleration..."
     pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome
+    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome sunshine-bin
     sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
+
+    # Configure Sunshine
+    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
+    udevadm control --reload-rules && udevadm trigger
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now sunshine 2>/dev/null || true
 
     log_info "3/3. Verifying Antigravity CLI..."
     if ! is_bin_installed agy; then
@@ -511,12 +544,21 @@ uninstall_media() {
     post_uninstall_hook
 }
 
+uninstall_sunshine() {
+    log_warn "Removing Sunshine..."
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now sunshine 2>/dev/null || true
+    safe_pacman_remove sunshine-bin sunshine
+    rm -f /etc/udev/rules.d/85-sunshine-uinput.rules
+    rm -rf "$USER_HOME/.config/sunshine" 2>/dev/null || true
+    post_uninstall_hook
+}
+
 uninstall_all_apps() {
     log_info "=== STARTING GROUPED REMOVAL OF ALL APPS ==="
 
-    log_info "1/3. Disabling background virtualization and container services..."
+    log_info "1/3. Disabling background virtualization, containers & streaming services..."
     systemctl disable --now libvirtd.service 2>/dev/null || true
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now podman.socket 2>/dev/null || true
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now podman.socket sunshine 2>/dev/null || true
 
     log_info "2/3. Removing all installed applications in a single clean transaction..."
     safe_pacman_remove \
@@ -527,7 +569,8 @@ uninstall_all_apps() {
         antigravity \
         google-chrome \
         libreoffice-fresh \
-        vlc celluloid gimp kdenlive
+        vlc celluloid gimp kdenlive \
+        sunshine-bin sunshine
 
     log_info "3/3. Wiping user configuration & cache directories..."
     rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" \
@@ -535,7 +578,8 @@ uninstall_all_apps() {
            "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" \
            "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" \
            "$USER_HOME/.config/libreoffice" \
-           "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" 2>/dev/null || true
+           "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" \
+           "$USER_HOME/.config/sunshine" /etc/udev/rules.d/85-sunshine-uinput.rules 2>/dev/null || true
 
     post_uninstall_hook
     log_ok "All selected applications uninstalled."
@@ -554,6 +598,7 @@ menu_install() {
         st_chrome=$(is_pkg_installed google-chrome && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_office=$(is_pkg_installed libreoffice-fresh && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_media=$(is_pkg_installed gimp && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_sunshine=$(is_pkg_installed sunshine-bin || is_bin_installed sunshine && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
@@ -567,11 +612,12 @@ menu_install() {
         echo -e " 6) Google Chrome Browser        $st_chrome ${CYAN}[OFFICIAL]${NC}"
         echo -e " 7) LibreOffice Fresh Suite      $st_office ${CYAN}[OFFICIAL]${NC}"
         echo -e " 8) Essential Multimedia Suite   $st_media ${CYAN}[OFFICIAL]${NC}"
+        echo -e " 9) Sunshine Remote Desktop      $st_sunshine ${CYAN}[LOW-LATENCY STREAMING]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Install ALL Applications"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application to install (1-8 / A / B): " choice
+        read -rp "Select an application to install (1-9 / A / B): " choice
 
         case "$choice" in
             1) install_podman ;;
@@ -582,6 +628,7 @@ menu_install() {
             6) install_chrome ;;
             7) install_office ;;
             8) install_media ;;
+            9) install_sunshine ;;
             [aA]) install_all_apps ;;
             [bB]) break ;;
             *) log_warn "Invalid selection." ;;
@@ -602,6 +649,7 @@ menu_uninstall() {
         st_chrome=$(is_pkg_installed google-chrome && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_office=$(is_pkg_installed libreoffice-fresh && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_media=$(is_pkg_installed gimp && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_sunshine=$(is_pkg_installed sunshine-bin || is_bin_installed sunshine && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
@@ -615,11 +663,12 @@ menu_uninstall() {
         echo -e " 6) Google Chrome Browser        $st_chrome"
         echo -e " 7) LibreOffice Fresh Suite      $st_office"
         echo -e " 8) Essential Multimedia Suite   $st_media"
+        echo -e " 9) Sunshine Remote Desktop      $st_sunshine"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Uninstall ALL Applications"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application to remove (1-8 / A / B): " choice
+        read -rp "Select an application to remove (1-9 / A / B): " choice
 
         case "$choice" in
             1) uninstall_podman ;;
@@ -630,6 +679,7 @@ menu_uninstall() {
             6) uninstall_chrome ;;
             7) uninstall_office ;;
             8) uninstall_media ;;
+            9) uninstall_sunshine ;;
             [aA])
                 read -rp "Are you sure you want to uninstall ALL applications? (y/N): " conf
                 [[ "$conf" =~ ^[Yy]$ ]] && uninstall_all_apps
@@ -840,7 +890,7 @@ while true; do
     echo -e "${BOLD}========================================================================${NC}"
     echo -e "${BOLD}                     MANJARO CONTROL CENTER                             ${NC}"
     echo -e "${BOLD}========================================================================${NC}"
-    echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Smart Downloads, GuC/HuC, SSD TRIM)"
+    echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, SSD TRIM)"
     echo -e " ${BOLD}2)${NC} Install apps"
     echo -e " ${BOLD}3)${NC} Uninstall apps"
     echo -e " ${BOLD}4)${NC} Desktop UI & Settings"
