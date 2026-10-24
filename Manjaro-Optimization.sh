@@ -1341,8 +1341,9 @@ get_fingerprint_status() {
         echo "not_detected"
         return
     fi
-    if is_pkg_installed libfprint-goodix-538d || is_pkg_installed libfprint-goodix-521d || [[ -f /usr/lib/udev/rules.d/70-libfprint-2.rules ]] || [[ -f /etc/udev/rules.d/70-libfprint-2.rules ]]; then
-        if run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -qiE "finger|enrolled"; then
+    if is_pkg_installed libfprint-goodix-538d || is_pkg_installed libfprint-goodix-521d || [[ -f /usr/lib/goodix-538d/provision-goodix-538d.py ]]; then
+        if find "/var/lib/fprint/$REAL_USER" -type f 2>/dev/null | grep -q . || \
+           run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -qE "^ - #[0-9]+:"; then
             echo "enrolled"
         else
             echo "installed"
@@ -1367,6 +1368,7 @@ configure_goodix_fingerprint() {
         log_info "Ensuring fprintd daemon is installed..."
         pacman -S --needed --noconfirm fprintd
     fi
+    systemctl stop fprintd.service 2>/dev/null || true
 
     local driver_dir="${SCRIPT_DIR}/drivers/goodix-538d"
     local installed=false
@@ -1397,7 +1399,7 @@ configure_goodix_fingerprint() {
     if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
         log_info "Tier 2: Building patched driver from PKGBUILD via makepkg..."
         pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
-        if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -f --nodeps" 2>/dev/null; then
+        if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -fc --nodeps && rm -rf src pkg libfprint" 2>/dev/null; then
             local new_pkg
             new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
             if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
@@ -1429,7 +1431,42 @@ configure_goodix_fingerprint() {
     fi
     log_ok "Pinned 'libfprint' in /etc/pacman.conf against official update overwrites."
 
+    # Provision sensor TLS-PSK & firmware via IAP bootloader if needed
+    if [[ -f "$driver_dir/provision-goodix-538d.py" && -f "$driver_dir/GF5298_GM168SEC_APP_13016.bin" ]]; then
+        install -Dm755 "$driver_dir/provision-goodix-538d.py" /usr/lib/goodix-538d/provision-goodix-538d.py
+        install -Dm644 "$driver_dir/GF5298_GM168SEC_APP_13016.bin" /usr/lib/goodix-538d/GF5298_GM168SEC_APP_13016.bin
+
+        cat > /etc/systemd/system/goodix-538d-provision.service <<'EOF'
+[Unit]
+Description=Goodix 27c6:538d Fingerprint Sensor TLS-PSK Provisioner
+Before=fprintd.service
+PartOf=fprintd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/lib/goodix-538d/provision-goodix-538d.py
+EOF
+
+        mkdir -p /etc/systemd/system/fprintd.service.d
+        cat > /etc/systemd/system/fprintd.service.d/goodix-538d-provision.conf <<'EOF'
+[Unit]
+Wants=goodix-538d-provision.service
+After=goodix-538d-provision.service
+EOF
+
+        log_info "Provisioning Goodix 27c6:538d sensor TLS-PSK & verifying firmware..."
+        systemctl stop fprintd.service 2>/dev/null || true
+        if python3 /usr/lib/goodix-538d/provision-goodix-538d.py; then
+            log_ok "Sensor TLS-PSK and firmware verified."
+        else
+            log_warn "Sensor TLS-PSK provisioning encountered an issue."
+        fi
+    fi
+
     # Verify PAM authentication
+    if [[ ! -f /etc/pam.d/polkit-1 && -f /usr/lib/pam.d/polkit-1 ]]; then
+        cp -a /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
+    fi
     for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
         if [[ -f "$pam_file" ]] && ! grep -q "pam_fprintd.so" "$pam_file"; then
             sed -i '1s/^/auth sufficient pam_fprintd.so\n/' "$pam_file"
@@ -1438,6 +1475,7 @@ configure_goodix_fingerprint() {
     done
 
     # Restart fprintd daemon
+    udevadm control --reload-rules && udevadm trigger 2>/dev/null || true
     systemctl daemon-reload
     systemctl restart fprintd.service 2>/dev/null || true
     log_ok "Fingerprint daemon service (fprintd) reloaded and active."
@@ -1445,7 +1483,13 @@ configure_goodix_fingerprint() {
     # Interactive enrollment
     if [[ "$mode" == "interactive" ]]; then
         echo ""
-        read -rp "Would you like to enroll your fingerprint now? (y/N): " enroll_ans
+        local enrolled_list
+        enrolled_list=$(run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -E "^ - #[0-9]+:" || true)
+        if [[ -n "$enrolled_list" ]]; then
+            log_ok "Currently enrolled fingerprint(s) for $REAL_USER:"
+            echo "$enrolled_list"
+        fi
+        read -rp "Would you like to enroll a fingerprint now? (y/N): " enroll_ans
         if [[ "$enroll_ans" =~ ^[Yy]$ ]]; then
             echo -e "${CYAN}Place and press your finger flat on the sensor repeatedly when prompted...${NC}"
             run_as_user fprintd-enroll || log_warn "Enrollment interrupted or deferred. Run 'fprintd-enroll' anytime."

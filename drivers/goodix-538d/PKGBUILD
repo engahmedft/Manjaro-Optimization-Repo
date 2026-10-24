@@ -3,24 +3,34 @@
 pkgname=libfprint-goodix-538d
 _pkgdirname=libfprint
 pkgver=1.94.100
-pkgrel=1
+pkgrel=2
 pkgdesc="Library for fingerprint readers - Patched with SIGFM matching for Goodix 27c6:538d (Dell Inspiron 7706)"
 arch=(x86_64)
 url="https://github.com/lbssousa/libfprint"
 license=(LGPL-2.1-or-later)
 depends=('libgusb>=0.3.0' nss pixman openssl)
-makedepends=(git cmake pkg-config libgudev)
+makedepends=(git meson ninja cmake pkg-config libgudev)
 provides=(libfprint libfprint-2.so libfprint-goodix-521d libfprint-goodix-538d libfprint-2.so=2-64 "libfprint=${pkgver}")
 conflicts=(libfprint libfprint-goodix-521d)
 replaces=(libfprint libfprint-goodix-521d)
 groups=(fprint)
-source=("git+https://github.com/lbssousa/libfprint.git#branch=goodix-538d-sigfm-gtls")
-sha256sums=('SKIP')
+source=(
+  "git+https://github.com/lbssousa/libfprint.git#branch=goodix-538d-sigfm-gtls"
+  "fix-goodix-538d-tls-psk.patch"
+  "provision-goodix-538d.py"
+  "GF5298_GM168SEC_APP_13016.bin"
+)
+sha256sums=(
+  'SKIP'
+  'SKIP'
+  'SKIP'
+  '0f28f8f52860afea86bd56d869cd7f4fe41ba943edd1d56100113e94ecfd6c0d'
+)
 
 prepare() {
   cd "${srcdir}/${_pkgdirname}"
-  # Accept any valid 32-byte hardware PSK from 538d sensor
-  sed -i '/if (memcmp(psk, goodix_53xd_psk_0/,+5d' libfprint/drivers/goodixtls/goodix53xd.c
+  # Apply TLS-PSK auto-provisioning, OpenSSL 3.x SECLEVEL=0, and USB interface cleanup fixes
+  patch -Np1 -i "${srcdir}/fix-goodix-538d-tls-psk.patch"
   # Fix meson dict iteration in test suite
   sed -i 's/foreach driver_test: drivers_tests/foreach driver_name, driver_test: drivers_tests/' tests/meson.build
   sed -i 's/test(driver_test,/test(driver_name,/' tests/meson.build
@@ -36,4 +46,6 @@ build() {
 
 package() {
   DESTDIR="$pkgdir" meson install -C build
+  install -Dm755 "${srcdir}/provision-goodix-538d.py" "${pkgdir}/usr/lib/goodix-538d/provision-goodix-538d.py"
+  install -Dm644 "${srcdir}/GF5298_GM168SEC_APP_13016.bin" "${pkgdir}/usr/lib/goodix-538d/GF5298_GM168SEC_APP_13016.bin"
 }
