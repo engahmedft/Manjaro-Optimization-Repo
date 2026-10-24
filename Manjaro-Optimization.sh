@@ -848,7 +848,7 @@ uninstall_rustdesk() {
     safe_pacman_remove rustdesk-bin rustdesk
     rm -f /etc/udev/rules.d/85-rustdesk-uinput.rules
     rm -rf /etc/systemd/system/rustdesk.service.d
-    rm -rf "$USER_HOME/.config/rustdesk" 2>/dev/null || true
+    rm -rf "$USER_HOME/.config/rustdesk" "$USER_HOME/.local/share/logs/RustDesk" /etc/rustdesk 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
     post_uninstall_hook
 }
@@ -883,6 +883,8 @@ uninstall_all_apps() {
            "$USER_HOME/.config/libreoffice" \
            "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" \
            "$USER_HOME/.config/rustdesk" \
+           "$USER_HOME/.local/share/logs/RustDesk" \
+           /etc/rustdesk \
            /etc/udev/rules.d/85-rustdesk-uinput.rules \
            /etc/systemd/system/rustdesk.service.d 2>/dev/null || true
 
