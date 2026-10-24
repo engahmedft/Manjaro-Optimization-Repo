@@ -379,6 +379,36 @@ configure_hot_corner() {
     fi
 }
 
+configure_dock_favorites() {
+    log_info "Configuring workflow-sorted GNOME Dock favorites..."
+    local sorted_favorites=(
+        "org.manjaro.pamac.manager.desktop"
+        "timeshift-gtk.desktop"
+        "org.gnome.SystemMonitor.desktop"
+        "org.gnome.Nautilus.desktop"
+        "org.gnome.TextEditor.desktop"
+        "org.gnome.Console.desktop"
+        "google-chrome.desktop"
+        "antigravity.desktop"
+        "antigravity-ide.desktop"
+        "com.microsoft.VSCode.desktop"
+        "rustdesk.desktop"
+    )
+
+    local gv_str="["
+    for idx in "${!sorted_favorites[@]}"; do
+        local app="${sorted_favorites[$idx]}"
+        if [[ $idx -gt 0 ]]; then
+            gv_str+=", "
+        fi
+        gv_str+="'${app}'"
+    done
+    gv_str+="]"
+
+    run_as_user gsettings set org.gnome.shell favorite-apps "$gv_str" 2>/dev/null || true
+    log_ok "GNOME Dock favorites updated and sorted by workflow (System -> Productivity -> Dev/AI -> Remote)."
+}
+
 # ------------------------------------------------------------------------------
 # 1. SYSTEM OPTIMIZATION ROUTINE (Includes AUR & Kernel Lifecycle Checks)
 # ------------------------------------------------------------------------------
@@ -533,9 +563,10 @@ EOF
         configure_goodix_fingerprint noninteractive
     fi
 
-    log_info "12/13: Enabling Desktop Icons (files only) & Disabling Top-Left Hot Corner..."
+    log_info "12/13: Enabling Desktop Icons, Disabling Top-Left Hot Corner & Sorting Dock Favorites..."
     configure_desktop_icons enable
     configure_hot_corner disable
+    configure_dock_favorites
 
     log_info "13/13: Performing Deep System Clutter Cleanup & SSD Health Maintenance..."
     rm -rf /var/tmp/pamac-build-* /var/tmp/pamac-*
@@ -593,12 +624,49 @@ install_kvm() {
     post_install_hook
 }
 
+install_vscode_extensions() {
+    if ! is_pkg_installed visual-studio-code-bin && ! is_bin_installed code; then
+        log_warn "VS Code is not installed. Please install VS Code first."
+        return 1
+    fi
+
+    log_info "Installing & verifying VS Code curated developer extension suite..."
+    local vscode_extensions=(
+        "hediet.vscode-drawio"
+        "SimonSiefke.svg-preview"
+        "kisstkondoros.vscode-gutter-preview"
+        "huachao.audio-player"
+        "mkloubert.vs-media-player"
+        "usernamehw.errorlens"
+        "esbenp.prettier-vscode"
+        "mhutchie.git-graph"
+        "rangav.vscode-thunder-client"
+        "PKief.material-icon-theme"
+        "cweijan.vscode-office"
+        "Google.google-antigravity"
+        "HookyQR.minify"
+        "bennycode.sort-everything"
+        "heaths.vscode-guid"
+        "GitHub.remotehub"
+        "ms-dotnettools.csdevkit"
+        "moshfeu.compare-folders"
+    )
+
+    for ext in "${vscode_extensions[@]}"; do
+        log_info "Syncing VS Code extension: ${CYAN}${ext}${NC}..."
+        sudo -u "$REAL_USER" code --install-extension "$ext" --force >/dev/null 2>&1 || true
+    done
+    log_ok "All specified VS Code extensions installed and verified."
+}
+
 install_vscode() {
     ensure_session_snapshot "Before Installing VS Code"
     log_info "Installing VS Code..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin
-    sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
+
+    # Install the curated extension suite
+    install_vscode_extensions
 
     # Configure native Wayland and fractional scaling crispness
     mkdir -p "$USER_HOME/.config"
@@ -731,7 +799,7 @@ install_all_apps() {
     log_info "2/3. Building AUR packages with multi-stream acceleration..."
     pamac enable-aur > /dev/null 2>&1 || true
     sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin
-    sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
+    install_vscode_extensions
     [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
 
     # Configure VS Code native Wayland flags
@@ -943,6 +1011,54 @@ manage_app_action() {
     fi
 }
 
+manage_vscode_action() {
+    local is_installed="$1"
+    echo ""
+    echo -e "${BOLD}========================================================================${NC}"
+    echo -e " Application: ${BOLD}VS Code (Visual Studio Code)${NC}"
+    if [[ "$is_installed" == "true" ]]; then
+        echo -e " Status:      ${GREEN}[Installed]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " 1) Reinstall / Update VS Code & Full Extension Suite"
+        echo -e " 2) Install / Sync Curated Extension Suite Only (18 Extensions)"
+        echo -e " 3) Uninstall VS Code"
+        echo -e " 4) Cancel & Return"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Please select an action (1-4): " act_choice
+        case "$act_choice" in
+            1)
+                install_vscode
+                read -rp "Press [Enter] to continue..."
+                ;;
+            2)
+                install_vscode_extensions
+                read -rp "Press [Enter] to continue..."
+                ;;
+            3)
+                uninstall_vscode
+                read -rp "Press [Enter] to continue..."
+                ;;
+            4) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    else
+        echo -e " Status:      ${RED}[Not Installed]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " 1) Install VS Code & Full Extension Suite"
+        echo -e " 2) Cancel & Return"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Please select an action (1-2): " act_choice
+        case "$act_choice" in
+            1)
+                install_vscode
+                read -rp "Press [Enter] to continue..."
+                ;;
+            2) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    fi
+}
+
 menu_extra_apps() {
     while true; do
         local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_rustdesk
@@ -975,7 +1091,7 @@ menu_extra_apps() {
         echo -e "${BOLD}========================================================================${NC}"
         echo -e " 1) Podman Engine & Compose      $st_podman ${CYAN}[OFFICIAL]${NC}"
         echo -e " 2) KVM / QEMU Virt-Manager      $st_kvm ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 3) VS Code + Antigravity Ext    $st_vscode ${CYAN}[OFFICIAL]${NC}"
+        echo -e " 3) VS Code + Extension Suite   $st_vscode ${CYAN}[OFFICIAL + 18 DEV EXTENSIONS]${NC}"
         echo -e " 4) Antigravity IDE              $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
         echo -e " 5) Antigravity 2.0 Platform     $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
         echo -e " 6) Google Chrome Browser        $st_chrome ${CYAN}[OFFICIAL]${NC}"
@@ -992,7 +1108,7 @@ menu_extra_apps() {
         case "$choice" in
             1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
             2) manage_app_action "KVM / QEMU Virt-Manager" "$is_kvm" install_kvm uninstall_kvm ;;
-            3) manage_app_action "VS Code + Antigravity Ext" "$is_vscode" install_vscode uninstall_vscode ;;
+            3) manage_vscode_action "$is_vscode" ;;
             4) manage_app_action "Antigravity IDE" "$is_ag_ide" install_antigravity_ide uninstall_antigravity_ide ;;
             5) manage_app_action "Antigravity 2.0 Platform" "$is_ag_app" install_antigravity_standalone uninstall_antigravity_standalone ;;
             6) manage_app_action "Google Chrome Browser" "$is_chrome" install_chrome uninstall_chrome ;;
@@ -1539,11 +1655,12 @@ menu_desktop_settings() {
         echo -e " 6) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
         echo -e " 7) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
         echo -e " 8) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
+        echo -e " 9) Dock Pinned Apps & Workflow Order        ${CYAN}[11 Apps: Pamac, Files, Dev/AI, RustDesk]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-8 / A / B): " choice
+        read -rp "Select an option (1-9 / A / B): " choice
 
         case "$choice" in
             1)
@@ -1578,10 +1695,15 @@ menu_desktop_settings() {
                 configure_goodix_fingerprint interactive
                 read -rp "Press [Enter] to continue..."
                 ;;
+            9)
+                configure_dock_favorites
+                read -rp "Press [Enter] to continue..."
+                ;;
             [aA])
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
                 configure_desktop_icons enable
                 configure_hot_corner disable
+                configure_dock_favorites
                 configure_permanent_partitions
                 maintain_btrfs_storage
                 configure_dell_hardware
