@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Manjaro Modular Optimizer, System Maintainer & Software Hub (v9.5 - Complete)
-# Target: Dell Inspiron 7706 | GNOME Wayland | Sunshine | Full AUR & Kernel Sync
+# Target: Dell Inspiron 7706 | GNOME Wayland | RustDesk | Full AUR & Kernel Sync
 # ==============================================================================
 
 set -o pipefail
@@ -398,7 +398,7 @@ optimize_system() {
 
     log_info "3/13: Refreshing fastest mirrors & full system upgrade (Official + AUR)..."
     pacman-mirrors --fasttrack 5
-    # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, Sunshine)
+    # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, RustDesk)
     # Pass SKIP_AUTOSNAP=1 to prevent duplicate ALPM hook snapshot right after step 1
     sudo -u "$REAL_USER" env SKIP_AUTOSNAP=1 pamac update --no-confirm --aur
 
@@ -672,35 +672,37 @@ install_media() {
     post_install_hook
 }
 
-install_sunshine() {
-    ensure_session_snapshot "Before Installing Sunshine Remote Desktop"
-    log_info "Installing Sunshine Remote Desktop Server (High-FPS/Low-Latency)..."
-    pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm sunshine-bin || sudo -u "$REAL_USER" pamac build --no-confirm sunshine
+install_rustdesk() {
+    ensure_session_snapshot "Before Installing RustDesk Remote Desktop"
+    log_info "Installing RustDesk Remote Desktop (Wayland / Intel VA-API Optimized)..."
 
-    # Grant user permission to uinput for virtual mouse/keyboard emulation
-    usermod -aG input "$REAL_USER"
-    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
+    pamac enable-aur > /dev/null 2>&1 || true
+    sudo -u "$REAL_USER" pamac build --no-confirm rustdesk-bin || sudo -u "$REAL_USER" pamac build --no-confirm rustdesk
+
+    # Grant user permission to uinput & video for Wayland input injection and VA-API hardware acceleration
+    usermod -aG input,video "$REAL_USER"
+    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-rustdesk-uinput.rules
     udevadm control --reload-rules && udevadm trigger
 
-    local sun_bin
-    sun_bin=$(command -v sunshine 2>/dev/null || which sunshine 2>/dev/null || true)
-    if [[ -n "$sun_bin" && -x "$sun_bin" ]]; then
-        setcap cap_sys_admin+ep "$(readlink -f "$sun_bin")" 2>/dev/null || true
+    # Optimize RustDesk systemd service for Intel Iris Xe VA-API hardware encoding and Wayland low latency
+    mkdir -p /etc/systemd/system/rustdesk.service.d
+    cat << 'EOF' > /etc/systemd/system/rustdesk.service.d/intel-vaapi.conf
+[Service]
+Environment="LIBVA_DRIVER_NAME=iHD"
+Environment="MESA_LOADER_DRIVER_OVERRIDE=iris"
+Environment="GST_VAAPI_ALL_DRIVERS=1"
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now rustdesk.service
+
+    local r_id
+    r_id=$(rustdesk --get-id 2>/dev/null || true)
+    if [[ -n "$r_id" ]]; then
+        log_ok "RustDesk installed and active! Your RustDesk ID is: ${CYAN}${r_id}${NC}"
+    else
+        log_ok "RustDesk service is active and listening for incoming connections."
     fi
-
-    # Create user service alias if upstream is app-dev.lizardbyte.app.Sunshine.service
-    if [[ -f /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service ]]; then
-        sudo -u "$REAL_USER" mkdir -p "$USER_HOME/.config/systemd/user"
-        sudo -u "$REAL_USER" ln -sf /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service "$USER_HOME/.config/systemd/user/sunshine.service"
-        sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user daemon-reload 2>/dev/null || true
-    fi
-
-    # Enable systemd user service (app-dev.lizardbyte.app.Sunshine.service)
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service 2>/dev/null || \
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now sunshine 2>/dev/null || true
-
-    log_ok "Sunshine installed and active! Access dashboard at: https://localhost:47990"
     post_install_hook
 }
 
@@ -721,14 +723,14 @@ install_all_apps() {
     fi
     sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now podman.socket 2>/dev/null || true
     systemctl enable --now libvirtd.service > /dev/null 2>&1 || true
-    usermod -aG libvirt,kvm,input "$REAL_USER"
+    usermod -aG libvirt,kvm,input,video "$REAL_USER"
     virsh net-autostart default > /dev/null 2>&1 || true
     virsh net-start default > /dev/null 2>&1 || true
     echo "options kvm_intel nested=1" > /etc/modprobe.d/kvm-intel.conf
 
     log_info "2/3. Building AUR packages with multi-stream acceleration..."
     pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome sunshine-bin
+    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin
     sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
     [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
 
@@ -750,21 +752,19 @@ EOF
 EOF
     chown "$REAL_USER:" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
 
-    # Configure Sunshine
-    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-sunshine-uinput.rules
+    # Configure RustDesk uinput & Intel VA-API hardware encoding
+    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-rustdesk-uinput.rules
     udevadm control --reload-rules && udevadm trigger
-    local sun_bin_all
-    sun_bin_all=$(command -v sunshine 2>/dev/null || which sunshine 2>/dev/null || true)
-    if [[ -n "$sun_bin_all" && -x "$sun_bin_all" ]]; then
-        setcap cap_sys_admin+ep "$(readlink -f "$sun_bin_all")" 2>/dev/null || true
-    fi
-    if [[ -f /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service ]]; then
-        sudo -u "$REAL_USER" mkdir -p "$USER_HOME/.config/systemd/user"
-        sudo -u "$REAL_USER" ln -sf /usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service "$USER_HOME/.config/systemd/user/sunshine.service"
-        sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user daemon-reload 2>/dev/null || true
-    fi
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service 2>/dev/null || \
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user enable --now sunshine 2>/dev/null || true
+
+    mkdir -p /etc/systemd/system/rustdesk.service.d
+    cat << 'EOF' > /etc/systemd/system/rustdesk.service.d/intel-vaapi.conf
+[Service]
+Environment="LIBVA_DRIVER_NAME=iHD"
+Environment="MESA_LOADER_DRIVER_OVERRIDE=iris"
+Environment="GST_VAAPI_ALL_DRIVERS=1"
+EOF
+    systemctl daemon-reload
+    systemctl enable --now rustdesk.service 2>/dev/null || true
 
     log_info "3/3. Verifying Antigravity CLI..."
     if ! is_bin_installed agy; then
@@ -841,13 +841,15 @@ uninstall_media() {
     post_uninstall_hook
 }
 
-uninstall_sunshine() {
-    ensure_session_snapshot "Before Uninstalling Sunshine"
-    log_warn "Removing Sunshine..."
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now app-dev.lizardbyte.app.Sunshine.service sunshine 2>/dev/null || true
-    safe_pacman_remove sunshine-bin sunshine
-    rm -f /etc/udev/rules.d/85-sunshine-uinput.rules
-    rm -rf "$USER_HOME/.config/sunshine" 2>/dev/null || true
+uninstall_rustdesk() {
+    ensure_session_snapshot "Before Uninstalling RustDesk"
+    log_warn "Removing RustDesk Remote Desktop..."
+    systemctl disable --now rustdesk.service 2>/dev/null || true
+    safe_pacman_remove rustdesk-bin rustdesk
+    rm -f /etc/udev/rules.d/85-rustdesk-uinput.rules
+    rm -rf /etc/systemd/system/rustdesk.service.d
+    rm -rf "$USER_HOME/.config/rustdesk" "$USER_HOME/.local/share/logs/RustDesk" /etc/rustdesk 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
     post_uninstall_hook
 }
 
@@ -858,7 +860,8 @@ uninstall_all_apps() {
 
     log_info "1/3. Disabling background virtualization, containers & streaming services..."
     systemctl disable --now libvirtd.service 2>/dev/null || true
-    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now podman.socket app-dev.lizardbyte.app.Sunshine.service sunshine 2>/dev/null || true
+    systemctl disable --now rustdesk.service 2>/dev/null || true
+    sudo -u "$REAL_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" systemctl --user disable --now podman.socket 2>/dev/null || true
 
     log_info "2/3. Removing all installed applications in a single clean transaction..."
     safe_pacman_remove \
@@ -870,7 +873,7 @@ uninstall_all_apps() {
         google-chrome \
         libreoffice-fresh \
         vlc celluloid gimp kdenlive \
-        sunshine-bin sunshine
+        rustdesk-bin rustdesk
 
     log_info "3/3. Wiping user configuration & cache directories..."
     rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" \
@@ -879,8 +882,13 @@ uninstall_all_apps() {
            "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" \
            "$USER_HOME/.config/libreoffice" \
            "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" \
-           "$USER_HOME/.config/sunshine" /etc/udev/rules.d/85-sunshine-uinput.rules 2>/dev/null || true
+           "$USER_HOME/.config/rustdesk" \
+           "$USER_HOME/.local/share/logs/RustDesk" \
+           /etc/rustdesk \
+           /etc/udev/rules.d/85-rustdesk-uinput.rules \
+           /etc/systemd/system/rustdesk.service.d 2>/dev/null || true
 
+    systemctl daemon-reload 2>/dev/null || true
     post_uninstall_hook
     log_ok "All selected applications uninstalled."
 }
@@ -937,9 +945,9 @@ manage_app_action() {
 
 menu_extra_apps() {
     while true; do
-        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_sunshine
+        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_rustdesk
         local is_podman=false is_kvm=false is_vscode=false is_ag_ide=false is_ag_app=false
-        local is_chrome=false is_office=false is_media=false is_sunshine=false
+        local is_chrome=false is_office=false is_media=false is_rustdesk=false
 
         is_bin_installed podman && is_podman=true
         is_pkg_installed virt-manager && is_kvm=true
@@ -949,7 +957,7 @@ menu_extra_apps() {
         is_pkg_installed google-chrome && is_chrome=true
         is_pkg_installed libreoffice-fresh && is_office=true
         (is_pkg_installed gimp || is_pkg_installed vlc) && is_media=true
-        (is_pkg_installed sunshine-bin || is_bin_installed sunshine) && is_sunshine=true
+        (is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk) && is_rustdesk=true
 
         st_podman=$([[ "$is_podman" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_kvm=$([[ "$is_kvm" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
@@ -959,7 +967,7 @@ menu_extra_apps() {
         st_chrome=$([[ "$is_chrome" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_office=$([[ "$is_office" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_media=$([[ "$is_media" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_sunshine=$([[ "$is_sunshine" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_rustdesk=$([[ "$is_rustdesk" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
@@ -973,7 +981,7 @@ menu_extra_apps() {
         echo -e " 6) Google Chrome Browser        $st_chrome ${CYAN}[OFFICIAL]${NC}"
         echo -e " 7) LibreOffice Fresh Suite      $st_office ${CYAN}[OFFICIAL]${NC}"
         echo -e " 8) Essential Multimedia Suite   $st_media ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 9) Sunshine Remote Desktop      $st_sunshine ${CYAN}[LOW-LATENCY STREAMING]${NC}"
+        echo -e " 9) RustDesk Remote Desktop      $st_rustdesk ${CYAN}[WAYLAND / INTEL VA-API]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Install ALL Applications"
         echo -e " U) Uninstall ALL Applications"
@@ -990,7 +998,7 @@ menu_extra_apps() {
             6) manage_app_action "Google Chrome Browser" "$is_chrome" install_chrome uninstall_chrome ;;
             7) manage_app_action "LibreOffice Fresh Suite" "$is_office" install_office uninstall_office ;;
             8) manage_app_action "Essential Multimedia Suite" "$is_media" install_media uninstall_media ;;
-            9) manage_app_action "Sunshine Remote Desktop" "$is_sunshine" install_sunshine uninstall_sunshine ;;
+            9) manage_app_action "RustDesk Remote Desktop" "$is_rustdesk" install_rustdesk uninstall_rustdesk ;;
             [aA])
                 read -rp "Install ALL applications now? (y/N): " a_conf
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
