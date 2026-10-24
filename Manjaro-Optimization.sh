@@ -191,6 +191,105 @@ EOF
     log_ok "Timeshift automated snapshot synchronization daemon (grub-btrfsd) active."
 }
 
+configure_grub_hidpi_theme() {
+    log_info "Configuring update-proof GRUB HiDPI theme (28pt font for 2560x1600+ displays)..."
+
+    local base_theme="/usr/share/grub/themes/manjaro"
+    local hidpi_theme="/usr/share/grub/themes/manjaro-hidpi"
+
+    if [[ -d "$base_theme" ]]; then
+        mkdir -p "$hidpi_theme"
+        cp -rn "$base_theme"/* "$hidpi_theme"/ 2>/dev/null || true
+    else
+        mkdir -p "$hidpi_theme"
+    fi
+
+    # Ensure DejaVu TTF fonts are available for rendering
+    if [[ ! -f /usr/share/fonts/TTF/DejaVuSans.ttf ]]; then
+        pacman -S --needed --noconfirm ttf-dejavu > /dev/null 2>&1 || true
+    fi
+
+    # Generate crisp HiDPI vector fonts
+    if command -v grub-mkfont &>/dev/null; then
+        grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_28.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+        grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_bold_28.pf2" /usr/share/fonts/TTF/DejaVuSans-Bold.ttf 2>/dev/null || true
+        grub-mkfont -s 20 -o "$hidpi_theme/dejavu_sans_20.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+        grub-mkfont -s 18 -o "$hidpi_theme/dejavu_sans_18.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+    fi
+
+    # Write calibrated theme geometry for high-resolution displays
+    cat << 'EOF' > "$hidpi_theme/theme.txt"
+title-text: ""
+title-font: "DejaVu Sans Regular 48"
+message-font: "DejaVu Sans Regular 20"
+message-color: "#7f8c8d"
+message-bg-color: "#4d4d4d"
+desktop-color: "#24282c"
+desktop-image: "background.png"
+terminal-font: "Terminus 18"
+terminal-left: "0"
+terminal-top: "0"
+terminal-width: "100%"
+terminal-height: "100%"
+terminal-border: "0"
+
++ image {
+    left = 30%-250
+    top = 8%-30
+    file = "logo.png"
+}
+
++ boot_menu {
+    left = 15%
+    width = 70%
+    top = 26%
+    height = 50%
+    item_height = 52
+    item_padding = 8
+    icon_width = 40
+    icon_height = 40
+    item_icon_space = 24
+    item_spacing = 8
+    item_font = "DejaVu Sans Regular 28"
+    item_color = "#cccccc"
+    selected_item_font = "DejaVu Sans Bold 28"
+    selected_item_color = "#1ABB9B"
+    selected_item_pixmap_style = "select_*.png"
+}
+
++ progress_bar {
+    id = "__timeout__"
+    left = 50%-160
+    top = 78%
+    width = 320
+    height = 26
+    show_text = true
+    font = "DejaVu Sans Regular 18"
+    text_color = "#ffffff"
+    align = "center"
+    text = "@TIMEOUT_NOTIFICATION_MIDDLE@"
+    bar_style = "progress_bar2_*.png"
+}
+
++ hbox {
+    left = 50%-300
+    top = 86%
+    width = 600
+    + label { width = 300 height = 24 align = "center" color = "#ffffff" font = "DejaVu Sans Regular 18" text = "E = Edit Boot Options" }
+    + label { width = 300 height = 24 align = "center" color = "#ffffff" font = "DejaVu Sans Regular 18" text = "C = GRUB Commandline" }
+}
+EOF
+
+    # Configure /etc/default/grub with HiDPI theme and resolution fallbacks
+    sed -i '/^GRUB_THEME=/d' /etc/default/grub
+    echo 'GRUB_THEME="/usr/share/grub/themes/manjaro-hidpi/theme.txt"' >> /etc/default/grub
+
+    sed -i '/^GRUB_GFXMODE=/d' /etc/default/grub
+    echo 'GRUB_GFXMODE="2560x1600,1920x1200,1280x800,auto"' >> /etc/default/grub
+
+    log_ok "GRUB HiDPI theme (28pt font & scaled geometry) configured."
+}
+
 configure_grub_dual_boot() {
     log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync)..."
     pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools > /dev/null 2>&1 || true
@@ -210,6 +309,9 @@ configure_grub_dual_boot() {
 
     # Configure GRUB boot enhancements (Shutdown & Reboot menu entries, grub-btrfsd daemon with timeshift-auto)
     configure_grub_boot_enhancements
+
+    # Configure HiDPI theme with 28pt font for high-resolution displays
+    configure_grub_hidpi_theme
 
     # Regenerate grub.cfg in a single pass to compile settings, shutdown entries, and snapshots submenu
     if command -v update-grub &>/dev/null; then
@@ -819,6 +921,104 @@ EOF
     post_install_hook
 }
 
+get_dotnet_latest_lts() {
+    local lts_ver=""
+    # 1. Query Microsoft official release API for active LTS channel version
+    if command -v python3 &>/dev/null; then
+        lts_ver=$(python3 -c '
+import sys, json, urllib.request
+try:
+    with urllib.request.urlopen("https://dotnetcli.azureedge.net/dotnet/release-metadata/releases-index.json", timeout=4) as response:
+        data = json.loads(response.read().decode())
+    active = [r["channel-version"] for r in data.get("releases-index", []) if r.get("release-type") == "lts" and r.get("support-phase") == "active"]
+    if active:
+        print(active[0])
+    else:
+        all_lts = [r["channel-version"] for r in data.get("releases-index", []) if r.get("release-type") == "lts"]
+        print(all_lts[0] if all_lts else "")
+except Exception:
+    pass
+' 2>/dev/null)
+    fi
+
+    # 2. Pacman repository fallback: parse highest even-numbered dotnet-sdk package (LTS)
+    if [[ -z "$lts_ver" ]]; then
+        lts_ver=$(pacman -Ss '^dotnet-sdk-[0-9]+\.0' 2>/dev/null | grep -oE 'dotnet-sdk-[0-9]+\.0' | grep -oE '[0-9]+\.0' | sort -V | awk '($1 % 2 == 0)' | tail -n1)
+    fi
+
+    # 3. Default fallback
+    [[ -z "$lts_ver" ]] && lts_ver="10.0"
+    echo "$lts_ver"
+}
+
+install_dev_runtimes() {
+    local mode="${1:-install}"
+    local is_installed=false
+    (is_bin_installed dotnet && is_pkg_installed nvm) && is_installed=true
+
+    if [[ "$mode" != "reinstall" && "$is_installed" == "true" ]]; then
+        log_ok "Modern Developer Runtimes (.NET & NVM/Node) already installed."
+        return 0
+    fi
+
+    ensure_session_snapshot "Before Installing Developer Runtimes"
+
+    # 1. Install & configure NVM
+    log_info "Installing Node Version Manager (NVM)..."
+    pacman -S --needed --noconfirm nvm > /dev/null 2>&1 || true
+
+    # Inject NVM initialization into user bashrc & zshrc safely
+    for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
+        if [[ -f "$shrc" ]] && ! grep -q "init-nvm.sh" "$shrc"; then
+            cat << 'EOF' >> "$shrc"
+
+# Node Version Manager (NVM)
+export NVM_DIR="$HOME/.nvm"
+[ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh"
+[ -s "/usr/share/nvm/install-nvm-exec" ] && \. "/usr/share/nvm/install-nvm-exec"
+EOF
+            chown "$REAL_USER:" "$shrc" 2>/dev/null || true
+        fi
+    done
+
+    # 2. Install latest Node.js LTS dynamically via NVM
+    log_info "Dynamically fetching & installing latest Node.js LTS via NVM..."
+    run_as_user bash -c '
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh"
+        nvm install --lts
+        nvm alias default "lts/*"
+        nvm use default
+        corepack enable 2>/dev/null || true
+    '
+    log_ok "Node.js LTS configured with default alias & corepack."
+
+    # 3. Dynamically resolve & install latest .NET Core LTS
+    local lts_ver
+    lts_ver=$(get_dotnet_latest_lts)
+    log_info "Resolved latest .NET Core LTS release channel: v${lts_ver}"
+
+    if pacman -Si "dotnet-sdk-${lts_ver}" &>/dev/null; then
+        log_info "Installing .NET Core SDK & ASP.NET Runtime v${lts_ver}..."
+        pacman -S --needed --noconfirm "dotnet-sdk-${lts_ver}" "aspnet-runtime-${lts_ver}" "dotnet-targeting-pack-${lts_ver}" > /dev/null 2>&1 || true
+    elif pacman -Si dotnet-sdk &>/dev/null; then
+        log_info "Installing .NET Core SDK metapackage..."
+        pacman -S --needed --noconfirm dotnet-sdk aspnet-runtime > /dev/null 2>&1 || true
+    fi
+
+    # Configure system-wide .NET environment
+    cat << 'EOF' > /etc/profile.d/dotnet.sh
+# .NET Core Environment Configuration
+export DOTNET_ROOT=/usr/share/dotnet
+export PATH="$PATH:$DOTNET_ROOT:$HOME/.dotnet/tools"
+export DOTNET_CLI_TELEMETRY_OPTOUT=1
+EOF
+    chmod 644 /etc/profile.d/dotnet.sh 2>/dev/null || true
+
+    log_ok "Modern Developer Runtimes (.NET LTS v${lts_ver} & Node.js LTS) fully installed."
+    post_install_hook
+}
+
 install_all_apps() {
     echo ""
     log_info "=== STARTING GROUPED INSTALLATION OF ALL APPS ==="
@@ -905,6 +1105,9 @@ EOF
         sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
     fi
 
+    log_info "Installing Modern Developer Runtimes (.NET LTS & Node.js LTS)..."
+    install_dev_runtimes
+
     post_install_hook
     log_ok "All applications installed and configured successfully!"
 }
@@ -987,6 +1190,37 @@ uninstall_rustdesk() {
     post_uninstall_hook
 }
 
+uninstall_dev_runtimes() {
+    ensure_session_snapshot "Before Uninstalling Developer Runtimes"
+    log_warn "Removing Developer Runtimes (.NET & NVM/Node)..."
+
+    # Remove .NET packages
+    local dotnet_pkgs
+    dotnet_pkgs=$(pacman -Qq 2>/dev/null | grep -E '^dotnet-|^aspnet-|^netstandard-' || true)
+    if [[ -n "$dotnet_pkgs" ]]; then
+        safe_pacman_remove $dotnet_pkgs
+    fi
+    rm -f /etc/profile.d/dotnet.sh 2>/dev/null || true
+    rm -rf "$USER_HOME/.dotnet" 2>/dev/null || true
+
+    # Remove NVM and Node versions
+    safe_pacman_remove nvm
+    rm -rf "$USER_HOME/.nvm" 2>/dev/null || true
+
+    # Clean shell config files
+    for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
+        if [[ -f "$shrc" ]]; then
+            sed -i '/# Node Version Manager (NVM)/d' "$shrc" 2>/dev/null || true
+            sed -i '/init-nvm.sh/d' "$shrc" 2>/dev/null || true
+            sed -i '/install-nvm-exec/d' "$shrc" 2>/dev/null || true
+            sed -i '/export NVM_DIR/d' "$shrc" 2>/dev/null || true
+        fi
+    done
+
+    log_ok "Developer Runtimes removed."
+    post_uninstall_hook
+}
+
 uninstall_all_apps() {
     echo ""
     log_info "=== STARTING GROUPED REMOVAL OF ALL APPS ==="
@@ -1008,6 +1242,8 @@ uninstall_all_apps() {
         libreoffice-fresh \
         vlc celluloid gimp kdenlive \
         rustdesk-bin rustdesk
+
+    uninstall_dev_runtimes
 
     log_info "3/3. Wiping user configuration & cache directories..."
     rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" \
@@ -1127,9 +1363,9 @@ manage_vscode_action() {
 
 menu_extra_apps() {
     while true; do
-        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_rustdesk
+        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_rustdesk st_dev_runtimes
         local is_podman=false is_kvm=false is_vscode=false is_ag_ide=false is_ag_app=false
-        local is_chrome=false is_office=false is_media=false is_rustdesk=false
+        local is_chrome=false is_office=false is_media=false is_rustdesk=false is_dev_runtimes=false
 
         is_bin_installed podman && is_podman=true
         is_pkg_installed virt-manager && is_kvm=true
@@ -1140,6 +1376,7 @@ menu_extra_apps() {
         is_pkg_installed libreoffice-fresh && is_office=true
         (is_pkg_installed gimp || is_pkg_installed vlc) && is_media=true
         (is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk) && is_rustdesk=true
+        (is_bin_installed dotnet && is_pkg_installed nvm) && is_dev_runtimes=true
 
         st_podman=$([[ "$is_podman" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_kvm=$([[ "$is_kvm" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
@@ -1150,6 +1387,7 @@ menu_extra_apps() {
         st_office=$([[ "$is_office" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_media=$([[ "$is_media" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_rustdesk=$([[ "$is_rustdesk" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_dev_runtimes=$([[ "$is_dev_runtimes" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
@@ -1164,12 +1402,13 @@ menu_extra_apps() {
         echo -e " 7) LibreOffice Fresh Suite      $st_office ${CYAN}[OFFICIAL]${NC}"
         echo -e " 8) Essential Multimedia Suite   $st_media ${CYAN}[OFFICIAL]${NC}"
         echo -e " 9) RustDesk Remote Desktop      $st_rustdesk ${CYAN}[WAYLAND / INTEL VA-API]${NC}"
+        echo -e " 10) Modern Dev Runtimes         $st_dev_runtimes ${CYAN}[DYNAMIC LTS: .NET & NODE LTS]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Install ALL Applications"
         echo -e " U) Uninstall ALL Applications"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application (1-9) or action (A / U / B): " choice
+        read -rp "Select an application (1-10) or action (A / U / B): " choice
 
         case "$choice" in
             1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
@@ -1181,6 +1420,7 @@ menu_extra_apps() {
             7) manage_app_action "LibreOffice Fresh Suite" "$is_office" install_office uninstall_office ;;
             8) manage_app_action "Essential Multimedia Suite" "$is_media" install_media uninstall_media ;;
             9) manage_app_action "RustDesk Remote Desktop" "$is_rustdesk" install_rustdesk uninstall_rustdesk ;;
+            10) manage_app_action "Modern Developer Runtimes (.NET LTS & Node.js)" "$is_dev_runtimes" install_dev_runtimes uninstall_dev_runtimes ;;
             [aA])
                 read -rp "Install ALL applications now? (y/N): " a_conf
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
