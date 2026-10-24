@@ -290,6 +290,50 @@ EOF
     log_ok "GRUB HiDPI theme (28pt font & scaled geometry) configured."
 }
 
+configure_tigerlake_sleep_fix() {
+    log_info "Configuring Intel Tiger Lake Iris Xe sleep & Modern Standby (s2idle) freeze fix..."
+
+    # 1. Update /etc/modprobe.d/i915.conf (disabling PSR, FBC, and Display C-states to prevent sleep wake hang)
+    cat << 'EOF' > /etc/modprobe.d/i915.conf
+# Intel Iris Xe (Tiger Lake) - Fix black screen freeze on wake from Modern Standby (s2idle)
+options i915 enable_guc=3 enable_psr=0 enable_fbc=0 enable_dc=0
+EOF
+    log_ok "Intel i915 modprobe configuration updated (PSR/FBC/DC deep sleep states disabled)."
+
+    # 2. Ensure all sleep mitigation parameters exist in /etc/default/grub
+    local grub_modified=false
+    for param in "i915.enable_guc=3" "i915.enable_psr=0" "i915.enable_fbc=0" "i915.enable_dc=0"; do
+        if ! grep -q "$param" /etc/default/grub; then
+            sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1${param} /" /etc/default/grub
+            grub_modified=true
+        fi
+    done
+
+    # 3. Verify early KMS in mkinitcpio.conf
+    local mkinit_modified=false
+    if ! grep -E "^MODULES=.*i915" /etc/mkinitcpio.conf >/dev/null 2>&1; then
+        sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 i915)/' /etc/mkinitcpio.conf
+        sed -i 's/MODULES=( /MODULES=(/' /etc/mkinitcpio.conf
+        mkinit_modified=true
+    fi
+
+    if [[ "$mkinit_modified" == "true" ]]; then
+        log_info "Rebuilding initramfs with early KMS..."
+        mkinitcpio -P > /dev/null 2>&1 || true
+    fi
+
+    if [[ "$grub_modified" == "true" ]]; then
+        log_info "Regenerating GRUB configuration with sleep mitigation flags..."
+        if command -v update-grub &>/dev/null; then
+            update-grub > /dev/null 2>&1 || true
+        elif command -v grub-mkconfig &>/dev/null; then
+            grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+        fi
+    fi
+
+    log_ok "Intel Tiger Lake sleep/suspend resume fix configured."
+}
+
 configure_grub_dual_boot() {
     log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync)..."
     pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools > /dev/null 2>&1 || true
@@ -302,10 +346,12 @@ configure_grub_dual_boot() {
     sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
     sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
 
-    # Ensure Intel GuC/HuC is enabled on kernel command line for Tiger Lake
-    if ! grep -q "i915.enable_guc=3" /etc/default/grub; then
-        sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1i915.enable_guc=3 /" /etc/default/grub
-    fi
+    # Ensure Intel GuC/HuC and Tiger Lake sleep/suspend freeze mitigation flags are present
+    for param in "i915.enable_guc=3" "i915.enable_psr=0" "i915.enable_fbc=0" "i915.enable_dc=0"; do
+        if ! grep -q "$param" /etc/default/grub; then
+            sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1${param} /" /etc/default/grub
+        fi
+    done
 
     # Configure GRUB boot enhancements (Shutdown & Reboot menu entries, grub-btrfsd daemon with timeshift-auto)
     configure_grub_boot_enhancements
@@ -511,6 +557,17 @@ configure_dock_favorites() {
     log_ok "GNOME Dock favorites updated and sorted by workflow (System -> Productivity -> Dev/AI -> Remote)."
 }
 
+configure_git_identity() {
+    log_info "Configuring global Git developer identity for $REAL_USER..."
+    if command -v git &>/dev/null; then
+        run_as_user git config --global user.name "Ahmed Abdulhafez"
+        run_as_user git config --global user.email "eng.ahmed.ft@gmail.com"
+        log_ok "Git global identity configured: Ahmed Abdulhafez <eng.ahmed.ft@gmail.com>"
+    else
+        log_warn "Git is not installed yet; skipping Git identity configuration."
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 1. SYSTEM OPTIMIZATION ROUTINE (Includes AUR & Kernel Lifecycle Checks)
 # ------------------------------------------------------------------------------
@@ -635,20 +692,12 @@ EOF
     sysctl --system > /dev/null 2>&1 || true
     log_ok "Kernel sysctl parameters applied."
 
-    log_info "11/13: Enabling Intel GuC/HuC early KMS, RTKit audio priority, thermald & biometrics..."
-    cat << 'EOF' > /etc/modprobe.d/i915.conf
-options i915 enable_guc=3
-EOF
+    log_info "11/13: Configuring Intel Tiger Lake sleep/suspend fix, RTKit audio priority & thermald..."
+    configure_tigerlake_sleep_fix
     sed -i 's/^#*RuntimeWatchdogSec=.*/RuntimeWatchdogSec=off/' /etc/systemd/system.conf 2>/dev/null || true
 
-    # Add i915 to mkinitcpio MODULES for early KMS if not present
-    if ! grep -E "^MODULES=.*i915" /etc/mkinitcpio.conf >/dev/null 2>&1; then
-        sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 i915)/' /etc/mkinitcpio.conf
-        sed -i 's/MODULES=( /MODULES=(/' /etc/mkinitcpio.conf
-        mkinitcpio -P > /dev/null 2>&1 || true
-    fi
-
     pacman -S --needed --noconfirm intel-media-driver libva-utils thermald rtkit pacman-contrib git base-devel > /dev/null 2>&1 || true
+    configure_git_identity
     systemctl enable --now thermald.service > /dev/null 2>&1 || true
     systemctl enable --now rtkit-daemon.service > /dev/null 2>&1 || true
     systemctl enable --now power-profiles-daemon.service > /dev/null 2>&1 || true
@@ -1014,6 +1063,9 @@ export PATH="$PATH:$DOTNET_ROOT:$HOME/.dotnet/tools"
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 EOF
     chmod 644 /etc/profile.d/dotnet.sh 2>/dev/null || true
+
+    # Configure developer Git global identity
+    configure_git_identity
 
     log_ok "Modern Developer Runtimes (.NET LTS v${lts_ver} & Node.js LTS) fully installed."
     post_install_hook
@@ -1681,6 +1733,9 @@ EOF
             log_ok "Dell Fastboot is already set to 'Minimal'."
         fi
     fi
+
+    # Configure Intel Tiger Lake Modern Standby (s2idle) sleep/resume freeze mitigation
+    configure_tigerlake_sleep_fix
 }
 
 update_dell_firmware() {
@@ -1991,7 +2046,7 @@ menu_desktop_settings() {
         echo -e " 2) Top-Left Hot Corner                      $hc_st"
         echo -e " 3) Configure Windows & Data Partitions      ${CYAN}[NTFS3 / Auto-Mount]${NC}"
         echo -e " 4) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
-        echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery Longevity & Fastboot]${NC}"
+        echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery, Sleep/Wake Fix & Fastboot]${NC}"
         echo -e " 6) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
         echo -e " 7) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
         echo -e " 8) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
