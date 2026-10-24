@@ -64,7 +64,7 @@ clean_stock_conflict() {
 }
 
 # ------------------------------------------------------------------------------
-# TIER 1: Install from precompiled local package cache (.pkg.tar.zst)
+# STEP 1: Install from precompiled local package cache (.pkg.tar.zst)
 # ------------------------------------------------------------------------------
 if [[ "$INSTALLED" == "false" ]]; then
     log_info "Checking for precompiled package cache in $SCRIPT_DIR..."
@@ -78,16 +78,16 @@ if [[ "$INSTALLED" == "false" ]]; then
             log_ok "Precompiled driver package installed successfully!"
             INSTALLED=true
         else
-            log_warn "Failed to install cached package. Proceeding to Tier 2 fallback..."
+            log_warn "Failed to install cached package. Proceeding to Step 2 fallback..."
         fi
     fi
 fi
 
 # ------------------------------------------------------------------------------
-# TIER 2: Build package from PKGBUILD via makepkg
+# STEP 2: Build package from PKGBUILD via makepkg (only if Step 1 unavailable)
 # ------------------------------------------------------------------------------
 if [[ "$INSTALLED" == "false" && -f "$SCRIPT_DIR/PKGBUILD" ]]; then
-    log_info "Tier 2: Building package from local PKGBUILD using makepkg..."
+    log_info "Step 2: Building package from local PKGBUILD using makepkg..."
     pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
     
     # Run makepkg as the regular user and clean up intermediate build directories
@@ -103,48 +103,9 @@ if [[ "$INSTALLED" == "false" && -f "$SCRIPT_DIR/PKGBUILD" ]]; then
     fi
 fi
 
-# ------------------------------------------------------------------------------
-# TIER 3: Direct source build & library replacement fallback
-# ------------------------------------------------------------------------------
 if [[ "$INSTALLED" == "false" ]]; then
-    log_warn "Tier 3: Falling back to direct source build & library installation..."
-    TMP_BUILD="/tmp/libfprint-goodix-direct"
-    rm -rf "$TMP_BUILD"
-    mkdir -p "$TMP_BUILD"
-    
-    if git clone --depth 1 -b goodix-538d-sigfm-gtls https://github.com/lbssousa/libfprint.git "$TMP_BUILD"; then
-        cd "$TMP_BUILD"
-        if [[ -f "$SCRIPT_DIR/fix-goodix-538d-tls-psk.patch" ]]; then
-            patch -Np1 -i "$SCRIPT_DIR/fix-goodix-538d-tls-psk.patch"
-        fi
-        # Fix meson dict iteration in test suite
-        sed -i 's/foreach driver_test: drivers_tests/foreach driver_name, driver_test: drivers_tests/' tests/meson.build
-        sed -i 's/test(driver_test,/test(driver_name,/' tests/meson.build
-        
-        # Build using system or local meson/ninja
-        export PATH="/tmp/bin-tools:/tmp:$PATH"
-        arch-meson . build -Ddoc=false -Dintrospection=false -Dc_args="-Wno-incompatible-pointer-types -Wno-error" || \
-            meson setup build -Ddoc=false -Dintrospection=false -Dc_args="-Wno-incompatible-pointer-types -Wno-error"
-        ninja -C build
-        
-        # Install library and udev rules
-        cp -a build/libfprint/libfprint-2.so* /usr/lib/
-        if [[ -f build/libfprint/70-libfprint-2.rules ]]; then
-            cp build/libfprint/70-libfprint-2.rules /etc/udev/rules.d/70-libfprint-2.rules
-            udevadm control --reload-rules && udevadm trigger
-        elif [[ -f build/libfprint/udev-rules ]]; then
-            cp build/libfprint/udev-rules /etc/udev/rules.d/60-libfprint-2-autosuspend.rules
-            udevadm control --reload-rules && udevadm trigger
-        fi
-        log_ok "Direct library override installed to /usr/lib/libfprint-2.so."
-        cd "$SCRIPT_DIR"
-        rm -rf "$TMP_BUILD"
-        INSTALLED=true
-    else
-        rm -rf "$TMP_BUILD"
-        log_error "Direct build failed to fetch git repository."
-        exit 1
-    fi
+    log_error "Failed to install Goodix driver package. Please ensure build dependencies or package cache are present."
+    exit 1
 fi
 
 # ------------------------------------------------------------------------------

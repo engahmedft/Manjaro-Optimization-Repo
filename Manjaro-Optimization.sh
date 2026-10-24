@@ -1590,23 +1590,23 @@ configure_goodix_fingerprint() {
     }
 
     if [[ "$installed" == "false" ]]; then
-        # Tier 1: Check precompiled local package cache (.pkg.tar.zst)
+        # Step 1: Install verified precompiled package cache (.pkg.tar.zst)
         local cached_pkg
         cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
         if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
-            log_info "Tier 1: Installing cached driver package: $(basename "$cached_pkg")..."
+            log_info "Step 1: Installing precompiled driver package: $(basename "$cached_pkg")..."
             clean_stock_libfprint_conflict
             if pacman -U --overwrite '*' --noconfirm "$cached_pkg" 2>/dev/null; then
-                log_ok "Driver installed from local package cache."
+                log_ok "Driver installed cleanly from precompiled package cache."
                 installed=true
             else
-                log_warn "Cache installation encountered an issue. Falling back to Tier 2..."
+                log_warn "Cached package installation encountered an issue. Falling back to Step 2..."
             fi
         fi
 
-        # Tier 2: Makepkg / AUR build fallback
+        # Step 2: Makepkg / AUR build fallback (only if Step 1 package missing or damaged)
         if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
-            log_info "Tier 2: Building patched driver from PKGBUILD via makepkg..."
+            log_info "Step 2: Building patched driver from PKGBUILD via makepkg..."
             pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
             if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -fc --nodeps && rm -rf src pkg libfprint" 2>/dev/null; then
                 local new_pkg
@@ -1614,20 +1614,16 @@ configure_goodix_fingerprint() {
                 if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
                     clean_stock_libfprint_conflict
                     if pacman -U --overwrite '*' --noconfirm "$new_pkg" 2>/dev/null; then
-                        log_ok "Patched driver compiled and installed successfully."
+                        log_ok "Patched driver compiled and installed successfully via pacman."
                         installed=true
                     fi
                 fi
             fi
         fi
 
-        # Tier 3: Direct source build fallback
         if [[ "$installed" == "false" ]]; then
-            log_warn "Tier 3: Falling back to standalone driver compilation & library override..."
-            if [[ -x "$driver_dir/install-goodix-driver.sh" ]]; then
-                bash "$driver_dir/install-goodix-driver.sh" --force || true
-                installed=true
-            fi
+            log_error "Failed to install Goodix driver. Please ensure package cache or build tools are present."
+            return 1
         fi
     fi
 
