@@ -49,6 +49,12 @@ systemctl stop fprintd.service 2>/dev/null || true
 
 INSTALLED=false
 
+# Check if driver package is already installed (skip rebuild unless explicitly requested)
+if pacman -Qq libfprint-goodix-538d &>/dev/null && [[ "$1" != "--reinstall" && "$1" != "--force" ]]; then
+    log_ok "Goodix 27c6:538d driver (libfprint-goodix-538d) is already installed. Skipping package build."
+    INSTALLED=true
+fi
+
 # Ensure stock conflicting libfprint is cleanly replaced without breaking fprintd
 clean_stock_conflict() {
     if pacman -Qq libfprint &>/dev/null && ! pacman -Qq libfprint-goodix-538d &>/dev/null; then
@@ -60,18 +66,20 @@ clean_stock_conflict() {
 # ------------------------------------------------------------------------------
 # TIER 1: Install from precompiled local package cache (.pkg.tar.zst)
 # ------------------------------------------------------------------------------
-log_info "Checking for precompiled package cache in $SCRIPT_DIR..."
-CACHED_PKG=$(ls -t "$SCRIPT_DIR"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+if [[ "$INSTALLED" == "false" ]]; then
+    log_info "Checking for precompiled package cache in $SCRIPT_DIR..."
+    CACHED_PKG=$(ls -t "$SCRIPT_DIR"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
 
-if [[ -n "$CACHED_PKG" && -f "$CACHED_PKG" ]]; then
-    log_info "Found cached package: $(basename "$CACHED_PKG")"
-    clean_stock_conflict
-    log_info "Installing via pacman -U..."
-    if pacman -U --noconfirm "$CACHED_PKG"; then
-        log_ok "Precompiled driver package installed successfully!"
-        INSTALLED=true
-    else
-        log_warn "Failed to install cached package. Proceeding to Tier 2 fallback..."
+    if [[ -n "$CACHED_PKG" && -f "$CACHED_PKG" ]]; then
+        log_info "Found cached package: $(basename "$CACHED_PKG")"
+        clean_stock_conflict
+        log_info "Installing via pacman -U (with --overwrite to prevent file collisions)..."
+        if pacman -U --overwrite '*' --noconfirm "$CACHED_PKG"; then
+            log_ok "Precompiled driver package installed successfully!"
+            INSTALLED=true
+        else
+            log_warn "Failed to install cached package. Proceeding to Tier 2 fallback..."
+        fi
     fi
 fi
 
@@ -87,7 +95,7 @@ if [[ "$INSTALLED" == "false" && -f "$SCRIPT_DIR/PKGBUILD" ]]; then
         NEW_PKG=$(ls -t "$SCRIPT_DIR"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
         if [[ -n "$NEW_PKG" && -f "$NEW_PKG" ]]; then
             clean_stock_conflict
-            if pacman -U --noconfirm "$NEW_PKG"; then
+            if pacman -U --overwrite '*' --noconfirm "$NEW_PKG"; then
                 log_ok "Built and installed package: $(basename "$NEW_PKG")"
                 INSTALLED=true
             fi
@@ -191,14 +199,32 @@ fi
 # ------------------------------------------------------------------------------
 # PAM & SERVICE RESTART
 # ------------------------------------------------------------------------------
-log_info "Configuring PAM authentication for fingerprint support..."
+log_info "Configuring PAM authentication for fingerprint support (fingerprint first & sufficient)..."
+configure_pam_fingerprint() {
+    local target="$1"
+    [[ ! -f "$target" ]] && return 0
+
+    # Remove existing pam_fprintd and any stale trailing fallback rules
+    sed -i '/pam_fprintd\.so/d' "$target"
+    sed -i '/# Manjaro defaults/d' "$target"
+    sed -i '/pam_unix\.so.*likeauth/d' "$target"
+    sed -i '/auth.*pam_deny\.so/d' "$target"
+
+    # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
+    if grep -q "^auth" "$target"; then
+        sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
+    else
+        sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
+    fi
+}
+
 if [[ ! -f /etc/pam.d/polkit-1 && -f /usr/lib/pam.d/polkit-1 ]]; then
     cp -a /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
 fi
-for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
-    if [[ -f "$pam_file" ]] && ! grep -q "pam_fprintd.so" "$pam_file"; then
-        sed -i '1s/^/auth sufficient pam_fprintd.so\n/' "$pam_file"
-        log_ok "Added pam_fprintd to $pam_file."
+for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/system-local-login; do
+    if [[ -f "$pam_file" ]]; then
+        configure_pam_fingerprint "$pam_file"
+        log_ok "Configured fingerprint-first authentication in $pam_file."
     fi
 done
 
@@ -212,6 +238,11 @@ systemctl restart fprintd.service 2>/dev/null || true
 # ------------------------------------------------------------------------------
 echo ""
 echo -e "${GREEN}${BOLD}Fingerprint driver setup completed successfully!${NC}"
+enrolled_list=$(sudo -u "$REAL_USER" fprintd-list "$REAL_USER" 2>/dev/null | grep -E "^ - #[0-9]+:" || true)
+if [[ -n "$enrolled_list" ]]; then
+    log_ok "Currently enrolled fingerprint(s) for $REAL_USER:"
+    echo "$enrolled_list"
+fi
 read -rp "Would you like to enroll your fingerprint now? (y/N): " enroll_ans
 if [[ "$enroll_ans" =~ ^[Yy]$ ]]; then
     echo -e "${CYAN}Place and press your finger flat against the sensor when prompted...${NC}"

@@ -600,6 +600,11 @@ EOF
 # 2. APP INSTALL FUNCTIONS
 # ------------------------------------------------------------------------------
 install_podman() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_bin_installed podman; then
+        log_ok "Podman is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Podman"
     log_info "Installing Podman..."
     pacman -S --needed --noconfirm podman podman-compose podman-docker fuse-overlayfs
@@ -612,6 +617,11 @@ install_podman() {
 }
 
 install_kvm() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed virt-manager; then
+        log_ok "KVM / QEMU Virt-Manager is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing KVM Virt-Manager"
     log_info "Installing KVM / QEMU Virt-Manager..."
     pacman -S --needed --noconfirm qemu-desktop virt-manager virt-viewer dnsmasq vde2 iptables-nft libguestfs
@@ -660,10 +670,15 @@ install_vscode_extensions() {
 }
 
 install_vscode() {
-    ensure_session_snapshot "Before Installing VS Code"
-    log_info "Installing VS Code..."
-    pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && (is_pkg_installed visual-studio-code-bin || is_bin_installed code); then
+        log_ok "VS Code is already installed. Skipping package build."
+    else
+        ensure_session_snapshot "Before Installing VS Code"
+        log_info "Installing VS Code..."
+        pamac enable-aur > /dev/null 2>&1 || true
+        sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin
+    fi
 
     # Install the curated extension suite
     install_vscode_extensions
@@ -681,6 +696,11 @@ EOF
 }
 
 install_antigravity_ide() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed antigravity-ide; then
+        log_ok "Antigravity IDE is already installed. Skipping package build."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Antigravity IDE"
     log_info "Installing Antigravity IDE..."
     pamac enable-aur > /dev/null 2>&1 || true
@@ -692,6 +712,11 @@ install_antigravity_ide() {
 }
 
 install_antigravity_standalone() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && (is_pkg_installed antigravity || is_bin_installed agy); then
+        log_ok "Antigravity 2.0 Platform & CLI is already installed. Skipping package build."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Antigravity 2.0"
     log_info "Installing Google Antigravity 2.0 Standalone Desktop Platform & 'agy' CLI..."
     pamac enable-aur > /dev/null 2>&1 || true
@@ -704,11 +729,16 @@ install_antigravity_standalone() {
 }
 
 install_chrome() {
-    ensure_session_snapshot "Before Installing Google Chrome"
-    log_info "Installing Google Chrome..."
-    pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm google-chrome
-    [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed google-chrome; then
+        log_ok "Google Chrome is already installed. Skipping package build."
+    else
+        ensure_session_snapshot "Before Installing Google Chrome"
+        log_info "Installing Google Chrome..."
+        pamac enable-aur > /dev/null 2>&1 || true
+        sudo -u "$REAL_USER" pamac build --no-confirm google-chrome
+        [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
+    fi
 
     # Automatically configure Wayland and Intel Iris Xe VA-API GPU video decoding
     mkdir -p "$USER_HOME/.config"
@@ -725,6 +755,11 @@ EOF
 }
 
 install_office() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed libreoffice-fresh; then
+        log_ok "LibreOffice Fresh is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing LibreOffice"
     log_info "Installing LibreOffice Fresh..."
     pacman -S --needed --noconfirm libreoffice-fresh
@@ -733,6 +768,11 @@ install_office() {
 }
 
 install_media() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed gimp && is_pkg_installed vlc; then
+        log_ok "Multimedia Suite is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Multimedia Suite"
     log_info "Installing Essential Multimedia Suite..."
     pacman -S --needed --noconfirm vlc celluloid gimp kdenlive
@@ -741,11 +781,16 @@ install_media() {
 }
 
 install_rustdesk() {
-    ensure_session_snapshot "Before Installing RustDesk Remote Desktop"
-    log_info "Installing RustDesk Remote Desktop (Wayland / Intel VA-API Optimized)..."
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && (is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk); then
+        log_ok "RustDesk Remote Desktop is already installed. Skipping package build."
+    else
+        ensure_session_snapshot "Before Installing RustDesk Remote Desktop"
+        log_info "Installing RustDesk Remote Desktop (Wayland / Intel VA-API Optimized)..."
 
-    pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm rustdesk-bin || sudo -u "$REAL_USER" pamac build --no-confirm rustdesk
+        pamac enable-aur > /dev/null 2>&1 || true
+        sudo -u "$REAL_USER" pamac build --no-confirm rustdesk-bin || sudo -u "$REAL_USER" pamac build --no-confirm rustdesk
+    fi
 
     # Grant user permission to uinput & video for Wayland input injection and VA-API hardware acceleration
     usermod -aG input,video "$REAL_USER"
@@ -762,7 +807,7 @@ Environment="GST_VAAPI_ALL_DRIVERS=1"
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now rustdesk.service
+    systemctl enable --now rustdesk.service 2>/dev/null || true
 
     local r_id
     r_id=$(rustdesk --get-id 2>/dev/null || true)
@@ -796,9 +841,30 @@ install_all_apps() {
     virsh net-start default > /dev/null 2>&1 || true
     echo "options kvm_intel nested=1" > /etc/modprobe.d/kvm-intel.conf
 
-    log_info "2/3. Building AUR packages with multi-stream acceleration..."
+    log_info "2/3. Checking and building required AUR packages..."
     pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin
+    local aur_pkgs=(visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin)
+    local aur_to_build=()
+    for pkg in "${aur_pkgs[@]}"; do
+        if is_pkg_installed "$pkg"; then
+            log_ok "AUR package already installed: $pkg"
+        elif [[ "$pkg" == "rustdesk-bin" ]] && is_pkg_installed rustdesk; then
+            log_ok "RustDesk already installed (rustdesk)."
+        elif [[ "$pkg" == "antigravity" ]] && is_bin_installed agy; then
+            log_ok "Antigravity CLI already installed."
+        elif [[ "$pkg" == "visual-studio-code-bin" ]] && is_bin_installed code; then
+            log_ok "VS Code already installed."
+        else
+            aur_to_build+=("$pkg")
+        fi
+    done
+
+    if [[ ${#aur_to_build[@]} -gt 0 ]]; then
+        log_info "Building uninstalled AUR packages: ${aur_to_build[*]}..."
+        sudo -u "$REAL_USER" pamac build --no-confirm "${aur_to_build[@]}"
+    else
+        log_ok "All AUR applications are already installed. Skipping package build."
+    fi
     install_vscode_extensions
     [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
 
@@ -983,7 +1049,7 @@ manage_app_action() {
         read -rp "Please select an action (1-3): " act_choice
         case "$act_choice" in
             1)
-                $install_fn
+                $install_fn reinstall
                 read -rp "Press [Enter] to continue..."
                 ;;
             2)
@@ -1002,7 +1068,7 @@ manage_app_action() {
         read -rp "Please select an action (1-2): " act_choice
         case "$act_choice" in
             1)
-                $install_fn
+                $install_fn install
                 read -rp "Press [Enter] to continue..."
                 ;;
             2) return ;;
@@ -1027,7 +1093,7 @@ manage_vscode_action() {
         read -rp "Please select an action (1-4): " act_choice
         case "$act_choice" in
             1)
-                install_vscode
+                install_vscode reinstall
                 read -rp "Press [Enter] to continue..."
                 ;;
             2)
@@ -1050,7 +1116,7 @@ manage_vscode_action() {
         read -rp "Please select an action (1-2): " act_choice
         case "$act_choice" in
             1)
-                install_vscode
+                install_vscode install
                 read -rp "Press [Enter] to continue..."
                 ;;
             2) return ;;
@@ -1497,6 +1563,24 @@ configure_goodix_fingerprint() {
     local driver_dir="${SCRIPT_DIR}/drivers/goodix-538d"
     local installed=false
 
+    # Check if driver is already installed (skip rebuild unless explicitly requested)
+    if is_pkg_installed libfprint-goodix-538d; then
+        log_ok "Goodix 27c6:538d driver (libfprint-goodix-538d) is already installed."
+        if [[ "$mode" == "interactive" ]]; then
+            echo -e " 1) Manage / Enroll Fingerprints"
+            echo -e " 2) Force Reinstall / Recompile Driver"
+            echo -e " 3) Return to Menu"
+            read -rp "Select an option (1-3): " fp_choice
+            case "$fp_choice" in
+                1) installed=true ;;
+                2) installed=false ;;
+                *) return 0 ;;
+            esac
+        else
+            installed=true
+        fi
+    fi
+
     # Ensure stock conflicting libfprint is cleanly replaced without breaking fprintd
     clean_stock_libfprint_conflict() {
         if pacman -Qq libfprint &>/dev/null && ! pacman -Qq libfprint-goodix-538d &>/dev/null; then
@@ -1505,43 +1589,45 @@ configure_goodix_fingerprint() {
         fi
     }
 
-    # Tier 1: Check precompiled local package cache (.pkg.tar.zst)
-    local cached_pkg
-    cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
-    if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
-        log_info "Tier 1: Installing cached driver package: $(basename "$cached_pkg")..."
-        clean_stock_libfprint_conflict
-        if pacman -U --noconfirm "$cached_pkg" 2>/dev/null; then
-            log_ok "Driver installed from local package cache."
-            installed=true
-        else
-            log_warn "Cache installation encountered an issue. Falling back to Tier 2..."
+    if [[ "$installed" == "false" ]]; then
+        # Tier 1: Check precompiled local package cache (.pkg.tar.zst)
+        local cached_pkg
+        cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+        if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
+            log_info "Tier 1: Installing cached driver package: $(basename "$cached_pkg")..."
+            clean_stock_libfprint_conflict
+            if pacman -U --overwrite '*' --noconfirm "$cached_pkg" 2>/dev/null; then
+                log_ok "Driver installed from local package cache."
+                installed=true
+            else
+                log_warn "Cache installation encountered an issue. Falling back to Tier 2..."
+            fi
         fi
-    fi
 
-    # Tier 2: Makepkg / AUR build fallback
-    if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
-        log_info "Tier 2: Building patched driver from PKGBUILD via makepkg..."
-        pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
-        if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -fc --nodeps && rm -rf src pkg libfprint" 2>/dev/null; then
-            local new_pkg
-            new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
-            if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
-                clean_stock_libfprint_conflict
-                if pacman -U --noconfirm "$new_pkg" 2>/dev/null; then
-                    log_ok "Patched driver compiled and installed successfully."
-                    installed=true
+        # Tier 2: Makepkg / AUR build fallback
+        if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
+            log_info "Tier 2: Building patched driver from PKGBUILD via makepkg..."
+            pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
+            if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -fc --nodeps && rm -rf src pkg libfprint" 2>/dev/null; then
+                local new_pkg
+                new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+                if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
+                    clean_stock_libfprint_conflict
+                    if pacman -U --overwrite '*' --noconfirm "$new_pkg" 2>/dev/null; then
+                        log_ok "Patched driver compiled and installed successfully."
+                        installed=true
+                    fi
                 fi
             fi
         fi
-    fi
 
-    # Tier 3: Direct source build fallback
-    if [[ "$installed" == "false" ]]; then
-        log_warn "Tier 3: Falling back to standalone driver compilation & library override..."
-        if [[ -x "$driver_dir/install-goodix-driver.sh" ]]; then
-            bash "$driver_dir/install-goodix-driver.sh" || true
-            installed=true
+        # Tier 3: Direct source build fallback
+        if [[ "$installed" == "false" ]]; then
+            log_warn "Tier 3: Falling back to standalone driver compilation & library override..."
+            if [[ -x "$driver_dir/install-goodix-driver.sh" ]]; then
+                bash "$driver_dir/install-goodix-driver.sh" --force || true
+                installed=true
+            fi
         fi
     fi
 
@@ -1587,14 +1673,32 @@ EOF
         fi
     fi
 
-    # Verify PAM authentication
+    # Configure PAM authentication (fingerprint evaluated first & sufficient on its own)
+    configure_pam_fingerprint() {
+        local target="$1"
+        [[ ! -f "$target" ]] && return 0
+
+        # Remove existing pam_fprintd and any stale trailing fallback rules
+        sed -i '/pam_fprintd\.so/d' "$target"
+        sed -i '/# Manjaro defaults/d' "$target"
+        sed -i '/pam_unix\.so.*likeauth/d' "$target"
+        sed -i '/auth.*pam_deny\.so/d' "$target"
+
+        # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
+        if grep -q "^auth" "$target"; then
+            sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
+        else
+            sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
+        fi
+    }
+
     if [[ ! -f /etc/pam.d/polkit-1 && -f /usr/lib/pam.d/polkit-1 ]]; then
         cp -a /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
     fi
-    for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
-        if [[ -f "$pam_file" ]] && ! grep -q "pam_fprintd.so" "$pam_file"; then
-            sed -i '1s/^/auth sufficient pam_fprintd.so\n/' "$pam_file"
-            log_ok "Enabled pam_fprintd in $pam_file."
+    for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/system-local-login; do
+        if [[ -f "$pam_file" ]]; then
+            configure_pam_fingerprint "$pam_file"
+            log_ok "Configured fingerprint-first authentication in $pam_file."
         fi
     done
 
