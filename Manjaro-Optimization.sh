@@ -836,7 +836,7 @@ if os.path.exists(path):
 data["workbench.iconTheme"] = "vscode-icons"
 data["editor.renderWhitespace"] = "all"
 data["editor.renderControlCharacters"] = True
-data["editor.unicodeHighlight.nonBasicASCII"] = True
+data["editor.unicodeHighlight.nonBasicASCII"] = False
 data["editor.unicodeHighlight.invisibleCharacters"] = True
 data["editor.unicodeHighlight.ambiguousCharacters"] = True
 with open(path, "w", encoding="utf-8") as f:
@@ -2070,15 +2070,15 @@ menu_desktop_settings() {
         echo -e "${BOLD}========================================================================${NC}"
         echo -e "${BOLD}               DESKTOP UI, STORAGE & HARDWARE SETTINGS                  ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e " 1) Desktop Files & Folders                  $di_st"
-        echo -e " 2) Top-Left Hot Corner                      $hc_st"
-        echo -e " 3) Configure Windows & Data Partitions      ${CYAN}[NTFS3 / Auto-Mount]${NC}"
-        echo -e " 4) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
-        echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery, Sleep/Wake Fix & Fastboot]${NC}"
-        echo -e " 6) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
-        echo -e " 7) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
-        echo -e " 8) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
-        echo -e " 9) Dock Pinned Apps & Workflow Order        ${CYAN}[11 Apps: Pamac, Files, Dev/AI, RustDesk]${NC}"
+        echo -e " 1) Top-Left Hot Corner                      $hc_st"
+        echo -e " 2) Desktop Files & Folders                  $di_st"
+        echo -e " 3) Dock Pinned Apps & Workflow Order        ${CYAN}[11 Apps: Pamac, Files, Dev/AI, RustDesk]${NC}"
+        echo -e " 4) Configure Windows & Data Partitions      ${CYAN}[NTFS3 / Auto-Mount]${NC}"
+        echo -e " 5) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
+        echo -e " 6) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
+        echo -e " 7) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
+        echo -e " 8) Dell Hardware Tuning                     ${CYAN}[Battery, Sleep/Wake Fix & Fastboot]${NC}"
+        echo -e " 9) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
@@ -2087,52 +2087,52 @@ menu_desktop_settings() {
 
         case "$choice" in
             1)
-                [[ "$di_raw" == "enabled" ]] && configure_desktop_icons disable || configure_desktop_icons enable
-                read -rp "Press [Enter] to continue..."
-                ;;
-            2)
                 [[ "$hc_raw" == "enabled" ]] && configure_hot_corner disable || configure_hot_corner enable
                 read -rp "Press [Enter] to continue..."
                 ;;
+            2)
+                [[ "$di_raw" == "enabled" ]] && configure_desktop_icons disable || configure_desktop_icons enable
+                read -rp "Press [Enter] to continue..."
+                ;;
             3)
-                configure_permanent_partitions
+                configure_dock_favorites
                 read -rp "Press [Enter] to continue..."
                 ;;
             4)
-                maintain_btrfs_storage
+                configure_permanent_partitions
                 read -rp "Press [Enter] to continue..."
                 ;;
             5)
-                configure_dell_hardware
+                maintain_btrfs_storage
                 read -rp "Press [Enter] to continue..."
                 ;;
             6)
-                update_dell_firmware
-                read -rp "Press [Enter] to continue..."
-                ;;
-            7)
                 configure_grub_dual_boot
                 read -rp "Press [Enter] to continue..."
                 ;;
-            8)
+            7)
                 configure_goodix_fingerprint interactive
                 read -rp "Press [Enter] to continue..."
                 ;;
+            8)
+                configure_dell_hardware
+                read -rp "Press [Enter] to continue..."
+                ;;
             9)
-                configure_dock_favorites
+                update_dell_firmware
                 read -rp "Press [Enter] to continue..."
                 ;;
             [aA])
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
-                configure_desktop_icons enable
                 configure_hot_corner disable
+                configure_desktop_icons enable
                 configure_dock_favorites
                 configure_permanent_partitions
                 maintain_btrfs_storage
-                configure_dell_hardware
-                update_dell_firmware
                 configure_grub_dual_boot
                 configure_goodix_fingerprint noninteractive
+                configure_dell_hardware
+                update_dell_firmware
                 log_ok "All settings and hardware tuning routines completed."
                 read -rp "Press [Enter] to continue..."
                 ;;
