@@ -132,7 +132,7 @@ ensure_session_snapshot() {
 
     log_info "Creating one-time Timeshift system restore point ($reason)..."
     if ! is_pkg_installed timeshift; then
-        pacman -S --needed --noconfirm timeshift > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm timeshift || true
     fi
 
     if timeshift --create --comments "$reason" --tags O > /dev/null 2>&1; then
@@ -175,7 +175,7 @@ EOF
     # 2. Ensure grub-btrfs and inotify-tools are installed for grub-btrfsd daemon
     if ! is_pkg_installed grub-btrfs || ! is_pkg_installed inotify-tools; then
         log_info "Installing grub-btrfs and inotify-tools for real-time GRUB snapshot synchronization..."
-        pacman -S --needed --noconfirm grub-btrfs inotify-tools > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm grub-btrfs inotify-tools || true
     fi
 
     # 3. Deploy systemd override for grub-btrfsd to watch Timeshift snapshots
@@ -191,9 +191,152 @@ EOF
     log_ok "Timeshift automated snapshot synchronization daemon (grub-btrfsd) active."
 }
 
+configure_grub_hidpi_theme() {
+    log_info "Configuring update-proof GRUB HiDPI theme (28pt font for 2560x1600+ displays)..."
+
+    local base_theme="/usr/share/grub/themes/manjaro"
+    local hidpi_theme="/usr/share/grub/themes/manjaro-hidpi"
+
+    if [[ -d "$base_theme" ]]; then
+        mkdir -p "$hidpi_theme"
+        cp -rn "$base_theme"/* "$hidpi_theme"/ 2>/dev/null || true
+    else
+        mkdir -p "$hidpi_theme"
+    fi
+
+    # Ensure DejaVu TTF fonts are available for rendering
+    if [[ ! -f /usr/share/fonts/TTF/DejaVuSans.ttf ]]; then
+        pacman -S --needed --noconfirm ttf-dejavu || true
+    fi
+
+    # Generate crisp HiDPI vector fonts
+    if command -v grub-mkfont &>/dev/null; then
+        grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_28.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+        grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_bold_28.pf2" /usr/share/fonts/TTF/DejaVuSans-Bold.ttf 2>/dev/null || true
+        grub-mkfont -s 20 -o "$hidpi_theme/dejavu_sans_20.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+        grub-mkfont -s 18 -o "$hidpi_theme/dejavu_sans_18.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+    fi
+
+    # Write calibrated theme geometry for high-resolution displays
+    cat << 'EOF' > "$hidpi_theme/theme.txt"
+title-text: ""
+title-font: "DejaVu Sans Regular 48"
+message-font: "DejaVu Sans Regular 20"
+message-color: "#7f8c8d"
+message-bg-color: "#4d4d4d"
+desktop-color: "#24282c"
+desktop-image: "background.png"
+terminal-font: "Terminus 18"
+terminal-left: "0"
+terminal-top: "0"
+terminal-width: "100%"
+terminal-height: "100%"
+terminal-border: "0"
+
++ image {
+    left = 30%-250
+    top = 8%-30
+    file = "logo.png"
+}
+
++ boot_menu {
+    left = 15%
+    width = 70%
+    top = 26%
+    height = 50%
+    item_height = 52
+    item_padding = 8
+    icon_width = 40
+    icon_height = 40
+    item_icon_space = 24
+    item_spacing = 8
+    item_font = "DejaVu Sans Regular 28"
+    item_color = "#cccccc"
+    selected_item_font = "DejaVu Sans Bold 28"
+    selected_item_color = "#1ABB9B"
+    selected_item_pixmap_style = "select_*.png"
+}
+
++ progress_bar {
+    id = "__timeout__"
+    left = 50%-160
+    top = 78%
+    width = 320
+    height = 26
+    show_text = true
+    font = "DejaVu Sans Regular 18"
+    text_color = "#ffffff"
+    align = "center"
+    text = "@TIMEOUT_NOTIFICATION_MIDDLE@"
+    bar_style = "progress_bar2_*.png"
+}
+
++ hbox {
+    left = 50%-300
+    top = 86%
+    width = 600
+    + label { width = 300 height = 24 align = "center" color = "#ffffff" font = "DejaVu Sans Regular 18" text = "E = Edit Boot Options" }
+    + label { width = 300 height = 24 align = "center" color = "#ffffff" font = "DejaVu Sans Regular 18" text = "C = GRUB Commandline" }
+}
+EOF
+
+    # Configure /etc/default/grub with HiDPI theme and resolution fallbacks
+    sed -i '/^GRUB_THEME=/d' /etc/default/grub
+    echo 'GRUB_THEME="/usr/share/grub/themes/manjaro-hidpi/theme.txt"' >> /etc/default/grub
+
+    sed -i '/^GRUB_GFXMODE=/d' /etc/default/grub
+    echo 'GRUB_GFXMODE="2560x1600,1920x1200,1280x800,auto"' >> /etc/default/grub
+
+    log_ok "GRUB HiDPI theme (28pt font & scaled geometry) configured."
+}
+
+configure_tigerlake_sleep_fix() {
+    log_info "Configuring Intel Tiger Lake Iris Xe sleep & Modern Standby (s2idle) freeze fix..."
+
+    # 1. Update /etc/modprobe.d/i915.conf (disabling PSR, FBC, and Display C-states to prevent sleep wake hang)
+    cat << 'EOF' > /etc/modprobe.d/i915.conf
+# Intel Iris Xe (Tiger Lake) - Fix black screen freeze on wake from Modern Standby (s2idle)
+options i915 enable_guc=3 enable_psr=0 enable_fbc=0 enable_dc=0
+EOF
+    log_ok "Intel i915 modprobe configuration updated (PSR/FBC/DC deep sleep states disabled)."
+
+    # 2. Ensure all sleep mitigation parameters exist in /etc/default/grub
+    local grub_modified=false
+    for param in "i915.enable_guc=3" "i915.enable_psr=0" "i915.enable_fbc=0" "i915.enable_dc=0"; do
+        if ! grep -q "$param" /etc/default/grub; then
+            sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1${param} /" /etc/default/grub
+            grub_modified=true
+        fi
+    done
+
+    # 3. Verify early KMS in mkinitcpio.conf
+    local mkinit_modified=false
+    if ! grep -E "^MODULES=.*i915" /etc/mkinitcpio.conf >/dev/null 2>&1; then
+        sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 i915)/' /etc/mkinitcpio.conf
+        sed -i 's/MODULES=( /MODULES=(/' /etc/mkinitcpio.conf
+        mkinit_modified=true
+    fi
+
+    if [[ "$mkinit_modified" == "true" ]]; then
+        log_info "Rebuilding initramfs with early KMS..."
+        mkinitcpio -P > /dev/null 2>&1 || true
+    fi
+
+    if [[ "$grub_modified" == "true" ]]; then
+        log_info "Regenerating GRUB configuration with sleep mitigation flags..."
+        if command -v update-grub &>/dev/null; then
+            update-grub > /dev/null 2>&1 || true
+        elif command -v grub-mkconfig &>/dev/null; then
+            grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+        fi
+    fi
+
+    log_ok "Intel Tiger Lake sleep/suspend resume fix configured."
+}
+
 configure_grub_dual_boot() {
     log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync)..."
-    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools > /dev/null 2>&1 || true
+    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools || true
 
     # Unconditionally configure GRUB for dual-boot visibility
     sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
@@ -203,13 +346,18 @@ configure_grub_dual_boot() {
     sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
     sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
 
-    # Ensure Intel GuC/HuC is enabled on kernel command line for Tiger Lake
-    if ! grep -q "i915.enable_guc=3" /etc/default/grub; then
-        sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1i915.enable_guc=3 /" /etc/default/grub
-    fi
+    # Ensure Intel GuC/HuC and Tiger Lake sleep/suspend freeze mitigation flags are present
+    for param in "i915.enable_guc=3" "i915.enable_psr=0" "i915.enable_fbc=0" "i915.enable_dc=0"; do
+        if ! grep -q "$param" /etc/default/grub; then
+            sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1${param} /" /etc/default/grub
+        fi
+    done
 
     # Configure GRUB boot enhancements (Shutdown & Reboot menu entries, grub-btrfsd daemon with timeshift-auto)
     configure_grub_boot_enhancements
+
+    # Configure HiDPI theme with 28pt font for high-resolution displays
+    configure_grub_hidpi_theme
 
     # Regenerate grub.cfg in a single pass to compile settings, shutdown entries, and snapshots submenu
     if command -v update-grub &>/dev/null; then
@@ -222,7 +370,7 @@ configure_grub_dual_boot() {
 
 init_downloads() {
     if ! command -v aria2c &> /dev/null; then
-        pacman -S --needed --noconfirm aria2 > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm aria2 || true
     fi
 
     local aria_rule="'https::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'"
@@ -333,8 +481,8 @@ configure_desktop_icons() {
     if [[ "$action" == "enable" ]]; then
         log_info "Enabling Desktop Files (Disabling volume/drive icons on desktop)..."
         if ! is_pkg_installed "gnome-shell-extension-gtk4-desktop-icons-ng" && ! is_pkg_installed "gnome-shell-extension-desktop-icons-ng"; then
-            pacman -S --needed --noconfirm gnome-shell-extension-gtk4-desktop-icons-ng > /dev/null 2>&1 || \
-            pacman -S --needed --noconfirm gnome-shell-extension-desktop-icons-ng > /dev/null 2>&1 || true
+            pacman -S --needed --noconfirm gnome-shell-extension-gtk4-desktop-icons-ng || \
+            pacman -S --needed --noconfirm gnome-shell-extension-desktop-icons-ng || true
         fi
 
         run_as_user gsettings set org.gnome.shell disable-user-extensions false 2>/dev/null || true
@@ -376,6 +524,47 @@ configure_hot_corner() {
         log_info "Enabling Top-Left Hot Corner..."
         run_as_user gsettings set org.gnome.desktop.interface enable-hot-corners true 2>/dev/null || true
         log_ok "Top-Left Hot Corner enabled."
+    fi
+}
+
+configure_dock_favorites() {
+    log_info "Configuring workflow-sorted GNOME Dock favorites..."
+    local sorted_favorites=(
+        "org.manjaro.pamac.manager.desktop"
+        "timeshift-gtk.desktop"
+        "org.gnome.SystemMonitor.desktop"
+        "org.gnome.Nautilus.desktop"
+        "org.gnome.TextEditor.desktop"
+        "org.gnome.Console.desktop"
+        "google-chrome.desktop"
+        "antigravity.desktop"
+        "antigravity-ide.desktop"
+        "com.microsoft.VSCode.desktop"
+        "rustdesk.desktop"
+    )
+
+    local gv_str="["
+    for idx in "${!sorted_favorites[@]}"; do
+        local app="${sorted_favorites[$idx]}"
+        if [[ $idx -gt 0 ]]; then
+            gv_str+=", "
+        fi
+        gv_str+="'${app}'"
+    done
+    gv_str+="]"
+
+    run_as_user gsettings set org.gnome.shell favorite-apps "$gv_str" 2>/dev/null || true
+    log_ok "GNOME Dock favorites updated and sorted by workflow (System -> Productivity -> Dev/AI -> Remote)."
+}
+
+configure_git_identity() {
+    log_info "Configuring global Git developer identity for $REAL_USER..."
+    if command -v git &>/dev/null; then
+        run_as_user git config --global user.name "Ahmed Abdulhafez"
+        run_as_user git config --global user.email "eng.ahmed.ft@gmail.com"
+        log_ok "Git global identity configured: Ahmed Abdulhafez <eng.ahmed.ft@gmail.com>"
+    else
+        log_warn "Git is not installed yet; skipping Git identity configuration."
     fi
 }
 
@@ -474,7 +663,7 @@ optimize_system() {
     configure_permanent_partitions
 
     log_info "9/13: Setting up ZRAM (RAM-compressed swap)..."
-    pacman -S --needed --noconfirm zram-generator > /dev/null 2>&1 || true
+    pacman -S --needed --noconfirm zram-generator || true
     if [[ ! -f /etc/systemd/zram-generator.conf ]]; then
         cat << 'EOF' > /etc/systemd/zram-generator.conf
 [zram0]
@@ -503,20 +692,12 @@ EOF
     sysctl --system > /dev/null 2>&1 || true
     log_ok "Kernel sysctl parameters applied."
 
-    log_info "11/13: Enabling Intel GuC/HuC early KMS, RTKit audio priority, thermald & biometrics..."
-    cat << 'EOF' > /etc/modprobe.d/i915.conf
-options i915 enable_guc=3
-EOF
+    log_info "11/13: Configuring Intel Tiger Lake sleep/suspend fix, RTKit audio priority & thermald..."
+    configure_tigerlake_sleep_fix
     sed -i 's/^#*RuntimeWatchdogSec=.*/RuntimeWatchdogSec=off/' /etc/systemd/system.conf 2>/dev/null || true
 
-    # Add i915 to mkinitcpio MODULES for early KMS if not present
-    if ! grep -E "^MODULES=.*i915" /etc/mkinitcpio.conf >/dev/null 2>&1; then
-        sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 i915)/' /etc/mkinitcpio.conf
-        sed -i 's/MODULES=( /MODULES=(/' /etc/mkinitcpio.conf
-        mkinitcpio -P > /dev/null 2>&1 || true
-    fi
-
-    pacman -S --needed --noconfirm intel-media-driver libva-utils thermald rtkit pacman-contrib git base-devel > /dev/null 2>&1 || true
+    pacman -S --needed --noconfirm intel-media-driver libva-utils thermald rtkit pacman-contrib git base-devel || true
+    configure_git_identity
     systemctl enable --now thermald.service > /dev/null 2>&1 || true
     systemctl enable --now rtkit-daemon.service > /dev/null 2>&1 || true
     systemctl enable --now power-profiles-daemon.service > /dev/null 2>&1 || true
@@ -533,9 +714,10 @@ EOF
         configure_goodix_fingerprint noninteractive
     fi
 
-    log_info "12/13: Enabling Desktop Icons (files only) & Disabling Top-Left Hot Corner..."
+    log_info "12/13: Enabling Desktop Icons, Disabling Top-Left Hot Corner & Sorting Dock Favorites..."
     configure_desktop_icons enable
     configure_hot_corner disable
+    configure_dock_favorites
 
     log_info "13/13: Performing Deep System Clutter Cleanup & SSD Health Maintenance..."
     rm -rf /var/tmp/pamac-build-* /var/tmp/pamac-*
@@ -569,6 +751,11 @@ EOF
 # 2. APP INSTALL FUNCTIONS
 # ------------------------------------------------------------------------------
 install_podman() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_bin_installed podman; then
+        log_ok "Podman is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Podman"
     log_info "Installing Podman..."
     pacman -S --needed --noconfirm podman podman-compose podman-docker fuse-overlayfs
@@ -581,6 +768,11 @@ install_podman() {
 }
 
 install_kvm() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed virt-manager; then
+        log_ok "KVM / QEMU Virt-Manager is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing KVM Virt-Manager"
     log_info "Installing KVM / QEMU Virt-Manager..."
     pacman -S --needed --noconfirm qemu-desktop virt-manager virt-viewer dnsmasq vde2 iptables-nft libguestfs
@@ -593,12 +785,82 @@ install_kvm() {
     post_install_hook
 }
 
+install_vscode_extensions() {
+    if ! is_pkg_installed visual-studio-code-bin && ! is_bin_installed code; then
+        log_warn "VS Code is not installed. Please install VS Code first."
+        return 1
+    fi
+
+    log_info "Installing & verifying VS Code curated developer extension suite..."
+    local vscode_extensions=(
+        "hediet.vscode-drawio"
+        "SimonSiefke.svg-preview"
+        "kisstkondoros.vscode-gutter-preview"
+        "huachao.audio-player"
+        "mkloubert.vs-media-player"
+        "usernamehw.errorlens"
+        "esbenp.prettier-vscode"
+        "mhutchie.git-graph"
+        "rangav.vscode-thunder-client"
+        "vscode-icons-team.vscode-icons"
+        "cweijan.vscode-office"
+        "Google.google-antigravity"
+        "HookyQR.minify"
+        "bennycode.sort-everything"
+        "heaths.vscode-guid"
+        "GitHub.remotehub"
+        "ms-dotnettools.csdevkit"
+        "moshfeu.compare-folders"
+        "nhoizey.gremlins"
+    )
+
+    for ext in "${vscode_extensions[@]}"; do
+        log_info "Syncing VS Code extension: ${CYAN}${ext}${NC}..."
+        sudo -u "$REAL_USER" code --install-extension "$ext" --force || true
+    done
+
+    # Configure vscode-icons and hidden/whitespace character detection in VS Code settings.json
+    local vscode_user_dir="$USER_HOME/.config/Code/User"
+    local vscode_settings="$vscode_user_dir/settings.json"
+    mkdir -p "$vscode_user_dir"
+    python3 -c '
+import json, os, sys
+path = sys.argv[1]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+data["workbench.iconTheme"] = "vscode-icons"
+data["editor.renderWhitespace"] = "all"
+data["editor.renderControlCharacters"] = True
+data["editor.unicodeHighlight.nonBasicASCII"] = True
+data["editor.unicodeHighlight.invisibleCharacters"] = True
+data["editor.unicodeHighlight.ambiguousCharacters"] = True
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+' "$vscode_settings" 2>/dev/null || true
+    chown -R "$REAL_USER:" "$USER_HOME/.config/Code" 2>/dev/null || true
+    log_ok "VS Code user settings configured (vscode-icons & hidden/unicode character visualization)."
+
+    log_ok "All specified VS Code extensions installed and verified."
+}
+
 install_vscode() {
-    ensure_session_snapshot "Before Installing VS Code"
-    log_info "Installing VS Code..."
-    pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin
-    sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && (is_pkg_installed visual-studio-code-bin || is_bin_installed code); then
+        log_ok "VS Code is already installed. Skipping package build."
+    else
+        ensure_session_snapshot "Before Installing VS Code"
+        log_info "Installing VS Code..."
+        pamac enable-aur > /dev/null 2>&1 || true
+        sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin
+    fi
+
+    # Install the curated extension suite
+    install_vscode_extensions
 
     # Configure native Wayland and fractional scaling crispness
     mkdir -p "$USER_HOME/.config"
@@ -613,6 +875,11 @@ EOF
 }
 
 install_antigravity_ide() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed antigravity-ide; then
+        log_ok "Antigravity IDE is already installed. Skipping package build."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Antigravity IDE"
     log_info "Installing Antigravity IDE..."
     pamac enable-aur > /dev/null 2>&1 || true
@@ -624,6 +891,11 @@ install_antigravity_ide() {
 }
 
 install_antigravity_standalone() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && (is_pkg_installed antigravity || is_bin_installed agy); then
+        log_ok "Antigravity 2.0 Platform & CLI is already installed. Skipping package build."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Antigravity 2.0"
     log_info "Installing Google Antigravity 2.0 Standalone Desktop Platform & 'agy' CLI..."
     pamac enable-aur > /dev/null 2>&1 || true
@@ -636,11 +908,16 @@ install_antigravity_standalone() {
 }
 
 install_chrome() {
-    ensure_session_snapshot "Before Installing Google Chrome"
-    log_info "Installing Google Chrome..."
-    pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm google-chrome
-    [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed google-chrome; then
+        log_ok "Google Chrome is already installed. Skipping package build."
+    else
+        ensure_session_snapshot "Before Installing Google Chrome"
+        log_info "Installing Google Chrome..."
+        pamac enable-aur > /dev/null 2>&1 || true
+        sudo -u "$REAL_USER" pamac build --no-confirm google-chrome
+        [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
+    fi
 
     # Automatically configure Wayland and Intel Iris Xe VA-API GPU video decoding
     mkdir -p "$USER_HOME/.config"
@@ -657,6 +934,11 @@ EOF
 }
 
 install_office() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed libreoffice-fresh; then
+        log_ok "LibreOffice Fresh is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing LibreOffice"
     log_info "Installing LibreOffice Fresh..."
     pacman -S --needed --noconfirm libreoffice-fresh
@@ -665,6 +947,11 @@ install_office() {
 }
 
 install_media() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed gimp && is_pkg_installed vlc; then
+        log_ok "Multimedia Suite is already installed. Skipping package installation."
+        return 0
+    fi
     ensure_session_snapshot "Before Installing Multimedia Suite"
     log_info "Installing Essential Multimedia Suite..."
     pacman -S --needed --noconfirm vlc celluloid gimp kdenlive
@@ -673,11 +960,16 @@ install_media() {
 }
 
 install_rustdesk() {
-    ensure_session_snapshot "Before Installing RustDesk Remote Desktop"
-    log_info "Installing RustDesk Remote Desktop (Wayland / Intel VA-API Optimized)..."
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && (is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk); then
+        log_ok "RustDesk Remote Desktop is already installed. Skipping package build."
+    else
+        ensure_session_snapshot "Before Installing RustDesk Remote Desktop"
+        log_info "Installing RustDesk Remote Desktop (Wayland / Intel VA-API Optimized)..."
 
-    pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm rustdesk-bin || sudo -u "$REAL_USER" pamac build --no-confirm rustdesk
+        pamac enable-aur > /dev/null 2>&1 || true
+        sudo -u "$REAL_USER" pamac build --no-confirm rustdesk-bin || sudo -u "$REAL_USER" pamac build --no-confirm rustdesk
+    fi
 
     # Grant user permission to uinput & video for Wayland input injection and VA-API hardware acceleration
     usermod -aG input,video "$REAL_USER"
@@ -694,7 +986,7 @@ Environment="GST_VAAPI_ALL_DRIVERS=1"
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now rustdesk.service
+    systemctl enable --now rustdesk.service 2>/dev/null || true
 
     local r_id
     r_id=$(rustdesk --get-id 2>/dev/null || true)
@@ -703,6 +995,107 @@ EOF
     else
         log_ok "RustDesk service is active and listening for incoming connections."
     fi
+    post_install_hook
+}
+
+get_dotnet_latest_lts() {
+    local lts_ver=""
+    # 1. Query Microsoft official release API for active LTS channel version
+    if command -v python3 &>/dev/null; then
+        lts_ver=$(python3 -c '
+import sys, json, urllib.request
+try:
+    with urllib.request.urlopen("https://dotnetcli.azureedge.net/dotnet/release-metadata/releases-index.json", timeout=4) as response:
+        data = json.loads(response.read().decode())
+    active = [r["channel-version"] for r in data.get("releases-index", []) if r.get("release-type") == "lts" and r.get("support-phase") == "active"]
+    if active:
+        print(active[0])
+    else:
+        all_lts = [r["channel-version"] for r in data.get("releases-index", []) if r.get("release-type") == "lts"]
+        print(all_lts[0] if all_lts else "")
+except Exception:
+    pass
+' 2>/dev/null)
+    fi
+
+    # 2. Pacman repository fallback: parse highest even-numbered dotnet-sdk package (LTS)
+    if [[ -z "$lts_ver" ]]; then
+        lts_ver=$(pacman -Ss '^dotnet-sdk-[0-9]+\.0' 2>/dev/null | grep -oE 'dotnet-sdk-[0-9]+\.0' | grep -oE '[0-9]+\.0' | sort -V | awk '($1 % 2 == 0)' | tail -n1)
+    fi
+
+    # 3. Default fallback
+    [[ -z "$lts_ver" ]] && lts_ver="10.0"
+    echo "$lts_ver"
+}
+
+install_dev_runtimes() {
+    local mode="${1:-install}"
+    local is_installed=false
+    (is_bin_installed dotnet && is_pkg_installed nvm) && is_installed=true
+
+    if [[ "$mode" != "reinstall" && "$is_installed" == "true" ]]; then
+        log_ok "Modern Developer Runtimes (.NET & NVM/Node) already installed."
+        return 0
+    fi
+
+    ensure_session_snapshot "Before Installing Developer Runtimes"
+
+    # 1. Install & configure NVM
+    log_info "Installing Node Version Manager (NVM)..."
+    pacman -S --needed --noconfirm nvm || true
+
+    # Inject NVM initialization into user bashrc & zshrc safely
+    for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
+        if [[ -f "$shrc" ]] && ! grep -q "init-nvm.sh" "$shrc"; then
+            cat << 'EOF' >> "$shrc"
+
+# Node Version Manager (NVM)
+export NVM_DIR="$HOME/.nvm"
+[ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh"
+[ -s "/usr/share/nvm/install-nvm-exec" ] && \. "/usr/share/nvm/install-nvm-exec"
+EOF
+            chown "$REAL_USER:" "$shrc" 2>/dev/null || true
+        fi
+    done
+
+    # 2. Install latest Node.js LTS dynamically via NVM
+    log_info "Dynamically fetching & installing latest Node.js LTS via NVM..."
+    run_as_user bash -c '
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh"
+        nvm install --lts
+        nvm alias default "lts/*"
+        nvm use default
+        corepack enable 2>/dev/null || true
+    '
+    log_ok "Node.js LTS configured with default alias & corepack."
+
+    # 3. Dynamically resolve & install latest .NET Core LTS
+    local lts_ver
+    lts_ver=$(get_dotnet_latest_lts)
+    log_info "Resolved latest .NET Core LTS release channel: v${lts_ver}"
+
+    if pacman -Si "dotnet-sdk-${lts_ver}" &>/dev/null; then
+        log_info "Installing .NET Core SDK & ASP.NET Runtime v${lts_ver}..."
+        pacman -S --needed --noconfirm "dotnet-sdk-${lts_ver}" "aspnet-runtime-${lts_ver}" "dotnet-targeting-pack-${lts_ver}" || true
+    elif pacman -Si dotnet-sdk &>/dev/null; then
+        log_info "Installing .NET Core SDK metapackage..."
+        pacman -S --needed --noconfirm dotnet-sdk aspnet-runtime || true
+    fi
+
+    # Configure system-wide .NET environment
+    cat << 'EOF' > /etc/profile.d/dotnet.sh
+# .NET Core Environment Configuration
+export DOTNET_ROOT=/usr/share/dotnet
+export PATH="$PATH:$DOTNET_ROOT:$HOME/.dotnet/tools"
+export DOTNET_CLI_TELEMETRY_OPTOUT=1
+EOF
+    chmod 644 /etc/profile.d/dotnet.sh 2>/dev/null || true
+
+    # Configure developer Git global identity
+    configure_git_identity
+
+    log_ok "Modern Developer Runtimes (.NET LTS v${lts_ver} & Node.js LTS) fully installed."
     post_install_hook
 }
 
@@ -728,10 +1121,31 @@ install_all_apps() {
     virsh net-start default > /dev/null 2>&1 || true
     echo "options kvm_intel nested=1" > /etc/modprobe.d/kvm-intel.conf
 
-    log_info "2/3. Building AUR packages with multi-stream acceleration..."
+    log_info "2/3. Checking and building required AUR packages..."
     pamac enable-aur > /dev/null 2>&1 || true
-    sudo -u "$REAL_USER" pamac build --no-confirm visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin
-    sudo -u "$REAL_USER" code --install-extension Google.antigravity > /dev/null 2>&1 || true
+    local aur_pkgs=(visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin)
+    local aur_to_build=()
+    for pkg in "${aur_pkgs[@]}"; do
+        if is_pkg_installed "$pkg"; then
+            log_ok "AUR package already installed: $pkg"
+        elif [[ "$pkg" == "rustdesk-bin" ]] && is_pkg_installed rustdesk; then
+            log_ok "RustDesk already installed (rustdesk)."
+        elif [[ "$pkg" == "antigravity" ]] && is_bin_installed agy; then
+            log_ok "Antigravity CLI already installed."
+        elif [[ "$pkg" == "visual-studio-code-bin" ]] && is_bin_installed code; then
+            log_ok "VS Code already installed."
+        else
+            aur_to_build+=("$pkg")
+        fi
+    done
+
+    if [[ ${#aur_to_build[@]} -gt 0 ]]; then
+        log_info "Building uninstalled AUR packages: ${aur_to_build[*]}..."
+        sudo -u "$REAL_USER" pamac build --no-confirm "${aur_to_build[@]}"
+    else
+        log_ok "All AUR applications are already installed. Skipping package build."
+    fi
+    install_vscode_extensions
     [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
 
     # Configure VS Code native Wayland flags
@@ -770,6 +1184,9 @@ EOF
     if ! is_bin_installed agy; then
         sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
     fi
+
+    log_info "Installing Modern Developer Runtimes (.NET LTS & Node.js LTS)..."
+    install_dev_runtimes
 
     post_install_hook
     log_ok "All applications installed and configured successfully!"
@@ -853,6 +1270,37 @@ uninstall_rustdesk() {
     post_uninstall_hook
 }
 
+uninstall_dev_runtimes() {
+    ensure_session_snapshot "Before Uninstalling Developer Runtimes"
+    log_warn "Removing Developer Runtimes (.NET & NVM/Node)..."
+
+    # Remove .NET packages
+    local dotnet_pkgs
+    dotnet_pkgs=$(pacman -Qq 2>/dev/null | grep -E '^dotnet-|^aspnet-|^netstandard-' || true)
+    if [[ -n "$dotnet_pkgs" ]]; then
+        safe_pacman_remove $dotnet_pkgs
+    fi
+    rm -f /etc/profile.d/dotnet.sh 2>/dev/null || true
+    rm -rf "$USER_HOME/.dotnet" 2>/dev/null || true
+
+    # Remove NVM and Node versions
+    safe_pacman_remove nvm
+    rm -rf "$USER_HOME/.nvm" 2>/dev/null || true
+
+    # Clean shell config files
+    for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
+        if [[ -f "$shrc" ]]; then
+            sed -i '/# Node Version Manager (NVM)/d' "$shrc" 2>/dev/null || true
+            sed -i '/init-nvm.sh/d' "$shrc" 2>/dev/null || true
+            sed -i '/install-nvm-exec/d' "$shrc" 2>/dev/null || true
+            sed -i '/export NVM_DIR/d' "$shrc" 2>/dev/null || true
+        fi
+    done
+
+    log_ok "Developer Runtimes removed."
+    post_uninstall_hook
+}
+
 uninstall_all_apps() {
     echo ""
     log_info "=== STARTING GROUPED REMOVAL OF ALL APPS ==="
@@ -874,6 +1322,8 @@ uninstall_all_apps() {
         libreoffice-fresh \
         vlc celluloid gimp kdenlive \
         rustdesk-bin rustdesk
+
+    uninstall_dev_runtimes
 
     log_info "3/3. Wiping user configuration & cache directories..."
     rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" \
@@ -915,7 +1365,7 @@ manage_app_action() {
         read -rp "Please select an action (1-3): " act_choice
         case "$act_choice" in
             1)
-                $install_fn
+                $install_fn reinstall
                 read -rp "Press [Enter] to continue..."
                 ;;
             2)
@@ -934,7 +1384,55 @@ manage_app_action() {
         read -rp "Please select an action (1-2): " act_choice
         case "$act_choice" in
             1)
-                $install_fn
+                $install_fn install
+                read -rp "Press [Enter] to continue..."
+                ;;
+            2) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    fi
+}
+
+manage_vscode_action() {
+    local is_installed="$1"
+    echo ""
+    echo -e "${BOLD}========================================================================${NC}"
+    echo -e " Application: ${BOLD}VS Code (Visual Studio Code)${NC}"
+    if [[ "$is_installed" == "true" ]]; then
+        echo -e " Status:      ${GREEN}[Installed]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " 1) Reinstall / Update VS Code & Full Extension Suite"
+        echo -e " 2) Install / Sync Curated Extension Suite Only (18 Extensions)"
+        echo -e " 3) Uninstall VS Code"
+        echo -e " 4) Cancel & Return"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Please select an action (1-4): " act_choice
+        case "$act_choice" in
+            1)
+                install_vscode reinstall
+                read -rp "Press [Enter] to continue..."
+                ;;
+            2)
+                install_vscode_extensions
+                read -rp "Press [Enter] to continue..."
+                ;;
+            3)
+                uninstall_vscode
+                read -rp "Press [Enter] to continue..."
+                ;;
+            4) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    else
+        echo -e " Status:      ${RED}[Not Installed]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " 1) Install VS Code & Full Extension Suite"
+        echo -e " 2) Cancel & Return"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Please select an action (1-2): " act_choice
+        case "$act_choice" in
+            1)
+                install_vscode install
                 read -rp "Press [Enter] to continue..."
                 ;;
             2) return ;;
@@ -945,9 +1443,9 @@ manage_app_action() {
 
 menu_extra_apps() {
     while true; do
-        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_rustdesk
+        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_rustdesk st_dev_runtimes
         local is_podman=false is_kvm=false is_vscode=false is_ag_ide=false is_ag_app=false
-        local is_chrome=false is_office=false is_media=false is_rustdesk=false
+        local is_chrome=false is_office=false is_media=false is_rustdesk=false is_dev_runtimes=false
 
         is_bin_installed podman && is_podman=true
         is_pkg_installed virt-manager && is_kvm=true
@@ -958,6 +1456,7 @@ menu_extra_apps() {
         is_pkg_installed libreoffice-fresh && is_office=true
         (is_pkg_installed gimp || is_pkg_installed vlc) && is_media=true
         (is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk) && is_rustdesk=true
+        (is_bin_installed dotnet && is_pkg_installed nvm) && is_dev_runtimes=true
 
         st_podman=$([[ "$is_podman" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_kvm=$([[ "$is_kvm" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
@@ -968,6 +1467,7 @@ menu_extra_apps() {
         st_office=$([[ "$is_office" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_media=$([[ "$is_media" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_rustdesk=$([[ "$is_rustdesk" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_dev_runtimes=$([[ "$is_dev_runtimes" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
@@ -975,30 +1475,32 @@ menu_extra_apps() {
         echo -e "${BOLD}========================================================================${NC}"
         echo -e " 1) Podman Engine & Compose      $st_podman ${CYAN}[OFFICIAL]${NC}"
         echo -e " 2) KVM / QEMU Virt-Manager      $st_kvm ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 3) VS Code + Antigravity Ext    $st_vscode ${CYAN}[OFFICIAL]${NC}"
+        echo -e " 3) VS Code + Extension Suite   $st_vscode ${CYAN}[OFFICIAL + 18 DEV EXTENSIONS]${NC}"
         echo -e " 4) Antigravity IDE              $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
         echo -e " 5) Antigravity 2.0 Platform     $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
         echo -e " 6) Google Chrome Browser        $st_chrome ${CYAN}[OFFICIAL]${NC}"
         echo -e " 7) LibreOffice Fresh Suite      $st_office ${CYAN}[OFFICIAL]${NC}"
         echo -e " 8) Essential Multimedia Suite   $st_media ${CYAN}[OFFICIAL]${NC}"
         echo -e " 9) RustDesk Remote Desktop      $st_rustdesk ${CYAN}[WAYLAND / INTEL VA-API]${NC}"
+        echo -e " 10) Modern Dev Runtimes         $st_dev_runtimes ${CYAN}[DYNAMIC LTS: .NET & NODE LTS]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Install ALL Applications"
         echo -e " U) Uninstall ALL Applications"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application (1-9) or action (A / U / B): " choice
+        read -rp "Select an application (1-10) or action (A / U / B): " choice
 
         case "$choice" in
             1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
             2) manage_app_action "KVM / QEMU Virt-Manager" "$is_kvm" install_kvm uninstall_kvm ;;
-            3) manage_app_action "VS Code + Antigravity Ext" "$is_vscode" install_vscode uninstall_vscode ;;
+            3) manage_vscode_action "$is_vscode" ;;
             4) manage_app_action "Antigravity IDE" "$is_ag_ide" install_antigravity_ide uninstall_antigravity_ide ;;
             5) manage_app_action "Antigravity 2.0 Platform" "$is_ag_app" install_antigravity_standalone uninstall_antigravity_standalone ;;
             6) manage_app_action "Google Chrome Browser" "$is_chrome" install_chrome uninstall_chrome ;;
             7) manage_app_action "LibreOffice Fresh Suite" "$is_office" install_office uninstall_office ;;
             8) manage_app_action "Essential Multimedia Suite" "$is_media" install_media uninstall_media ;;
             9) manage_app_action "RustDesk Remote Desktop" "$is_rustdesk" install_rustdesk uninstall_rustdesk ;;
+            10) manage_app_action "Modern Developer Runtimes (.NET LTS & Node.js)" "$is_dev_runtimes" install_dev_runtimes uninstall_dev_runtimes ;;
             [aA])
                 read -rp "Install ALL applications now? (y/N): " a_conf
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
@@ -1259,6 +1761,9 @@ EOF
             log_ok "Dell Fastboot is already set to 'Minimal'."
         fi
     fi
+
+    # Configure Intel Tiger Lake Modern Standby (s2idle) sleep/resume freeze mitigation
+    configure_tigerlake_sleep_fix
 }
 
 update_dell_firmware() {
@@ -1381,6 +1886,24 @@ configure_goodix_fingerprint() {
     local driver_dir="${SCRIPT_DIR}/drivers/goodix-538d"
     local installed=false
 
+    # Check if driver is already installed (skip rebuild unless explicitly requested)
+    if is_pkg_installed libfprint-goodix-538d; then
+        log_ok "Goodix 27c6:538d driver (libfprint-goodix-538d) is already installed."
+        if [[ "$mode" == "interactive" ]]; then
+            echo -e " 1) Manage / Enroll Fingerprints"
+            echo -e " 2) Force Reinstall / Recompile Driver"
+            echo -e " 3) Return to Menu"
+            read -rp "Select an option (1-3): " fp_choice
+            case "$fp_choice" in
+                1) installed=true ;;
+                2) installed=false ;;
+                *) return 0 ;;
+            esac
+        else
+            installed=true
+        fi
+    fi
+
     # Ensure stock conflicting libfprint is cleanly replaced without breaking fprintd
     clean_stock_libfprint_conflict() {
         if pacman -Qq libfprint &>/dev/null && ! pacman -Qq libfprint-goodix-538d &>/dev/null; then
@@ -1389,43 +1912,41 @@ configure_goodix_fingerprint() {
         fi
     }
 
-    # Tier 1: Check precompiled local package cache (.pkg.tar.zst)
-    local cached_pkg
-    cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
-    if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
-        log_info "Tier 1: Installing cached driver package: $(basename "$cached_pkg")..."
-        clean_stock_libfprint_conflict
-        if pacman -U --noconfirm "$cached_pkg" 2>/dev/null; then
-            log_ok "Driver installed from local package cache."
-            installed=true
-        else
-            log_warn "Cache installation encountered an issue. Falling back to Tier 2..."
+    if [[ "$installed" == "false" ]]; then
+        # Step 1: Install verified precompiled package cache (.pkg.tar.zst)
+        local cached_pkg
+        cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+        if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
+            log_info "Step 1: Installing precompiled driver package: $(basename "$cached_pkg")..."
+            clean_stock_libfprint_conflict
+            if pacman -U --overwrite '*' --noconfirm "$cached_pkg" 2>/dev/null; then
+                log_ok "Driver installed cleanly from precompiled package cache."
+                installed=true
+            else
+                log_warn "Cached package installation encountered an issue. Falling back to Step 2..."
+            fi
         fi
-    fi
 
-    # Tier 2: Makepkg / AUR build fallback
-    if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
-        log_info "Tier 2: Building patched driver from PKGBUILD via makepkg..."
-        pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
-        if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -fc --nodeps && rm -rf src pkg libfprint" 2>/dev/null; then
-            local new_pkg
-            new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
-            if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
-                clean_stock_libfprint_conflict
-                if pacman -U --noconfirm "$new_pkg" 2>/dev/null; then
-                    log_ok "Patched driver compiled and installed successfully."
-                    installed=true
+        # Step 2: Makepkg / AUR build fallback (only if Step 1 package missing or damaged)
+        if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
+            log_info "Step 2: Building patched driver from PKGBUILD via makepkg..."
+            pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
+            if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -fc --nodeps && rm -rf src pkg libfprint" 2>/dev/null; then
+                local new_pkg
+                new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+                if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
+                    clean_stock_libfprint_conflict
+                    if pacman -U --overwrite '*' --noconfirm "$new_pkg" 2>/dev/null; then
+                        log_ok "Patched driver compiled and installed successfully via pacman."
+                        installed=true
+                    fi
                 fi
             fi
         fi
-    fi
 
-    # Tier 3: Direct source build fallback
-    if [[ "$installed" == "false" ]]; then
-        log_warn "Tier 3: Falling back to standalone driver compilation & library override..."
-        if [[ -x "$driver_dir/install-goodix-driver.sh" ]]; then
-            bash "$driver_dir/install-goodix-driver.sh" || true
-            installed=true
+        if [[ "$installed" == "false" ]]; then
+            log_error "Failed to install Goodix driver. Please ensure package cache or build tools are present."
+            return 1
         fi
     fi
 
@@ -1471,14 +1992,32 @@ EOF
         fi
     fi
 
-    # Verify PAM authentication
+    # Configure PAM authentication (fingerprint evaluated first & sufficient on its own)
+    configure_pam_fingerprint() {
+        local target="$1"
+        [[ ! -f "$target" ]] && return 0
+
+        # Remove existing pam_fprintd and any stale trailing fallback rules
+        sed -i '/pam_fprintd\.so/d' "$target"
+        sed -i '/# Manjaro defaults/d' "$target"
+        sed -i '/pam_unix\.so.*likeauth/d' "$target"
+        sed -i '/auth.*pam_deny\.so/d' "$target"
+
+        # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
+        if grep -q "^auth" "$target"; then
+            sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
+        else
+            sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
+        fi
+    }
+
     if [[ ! -f /etc/pam.d/polkit-1 && -f /usr/lib/pam.d/polkit-1 ]]; then
         cp -a /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
     fi
-    for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
-        if [[ -f "$pam_file" ]] && ! grep -q "pam_fprintd.so" "$pam_file"; then
-            sed -i '1s/^/auth sufficient pam_fprintd.so\n/' "$pam_file"
-            log_ok "Enabled pam_fprintd in $pam_file."
+    for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/system-local-login; do
+        if [[ -f "$pam_file" ]]; then
+            configure_pam_fingerprint "$pam_file"
+            log_ok "Configured fingerprint-first authentication in $pam_file."
         fi
     done
 
@@ -1535,15 +2074,16 @@ menu_desktop_settings() {
         echo -e " 2) Top-Left Hot Corner                      $hc_st"
         echo -e " 3) Configure Windows & Data Partitions      ${CYAN}[NTFS3 / Auto-Mount]${NC}"
         echo -e " 4) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
-        echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery Longevity & Fastboot]${NC}"
+        echo -e " 5) Dell Hardware Tuning                     ${CYAN}[Battery, Sleep/Wake Fix & Fastboot]${NC}"
         echo -e " 6) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
         echo -e " 7) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
         echo -e " 8) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
+        echo -e " 9) Dock Pinned Apps & Workflow Order        ${CYAN}[11 Apps: Pamac, Files, Dev/AI, RustDesk]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-8 / A / B): " choice
+        read -rp "Select an option (1-9 / A / B): " choice
 
         case "$choice" in
             1)
@@ -1578,10 +2118,15 @@ menu_desktop_settings() {
                 configure_goodix_fingerprint interactive
                 read -rp "Press [Enter] to continue..."
                 ;;
+            9)
+                configure_dock_favorites
+                read -rp "Press [Enter] to continue..."
+                ;;
             [aA])
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
                 configure_desktop_icons enable
                 configure_hot_corner disable
+                configure_dock_favorites
                 configure_permanent_partitions
                 maintain_btrfs_storage
                 configure_dell_hardware
