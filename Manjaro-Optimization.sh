@@ -132,7 +132,7 @@ ensure_session_snapshot() {
 
     log_info "Creating one-time Timeshift system restore point ($reason)..."
     if ! is_pkg_installed timeshift; then
-        pacman -S --needed --noconfirm timeshift > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm timeshift || true
     fi
 
     if timeshift --create --comments "$reason" --tags O > /dev/null 2>&1; then
@@ -175,7 +175,7 @@ EOF
     # 2. Ensure grub-btrfs and inotify-tools are installed for grub-btrfsd daemon
     if ! is_pkg_installed grub-btrfs || ! is_pkg_installed inotify-tools; then
         log_info "Installing grub-btrfs and inotify-tools for real-time GRUB snapshot synchronization..."
-        pacman -S --needed --noconfirm grub-btrfs inotify-tools > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm grub-btrfs inotify-tools || true
     fi
 
     # 3. Deploy systemd override for grub-btrfsd to watch Timeshift snapshots
@@ -206,7 +206,7 @@ configure_grub_hidpi_theme() {
 
     # Ensure DejaVu TTF fonts are available for rendering
     if [[ ! -f /usr/share/fonts/TTF/DejaVuSans.ttf ]]; then
-        pacman -S --needed --noconfirm ttf-dejavu > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm ttf-dejavu || true
     fi
 
     # Generate crisp HiDPI vector fonts
@@ -336,7 +336,7 @@ EOF
 
 configure_grub_dual_boot() {
     log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync)..."
-    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools > /dev/null 2>&1 || true
+    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools || true
 
     # Unconditionally configure GRUB for dual-boot visibility
     sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
@@ -370,7 +370,7 @@ configure_grub_dual_boot() {
 
 init_downloads() {
     if ! command -v aria2c &> /dev/null; then
-        pacman -S --needed --noconfirm aria2 > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm aria2 || true
     fi
 
     local aria_rule="'https::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'"
@@ -481,8 +481,8 @@ configure_desktop_icons() {
     if [[ "$action" == "enable" ]]; then
         log_info "Enabling Desktop Files (Disabling volume/drive icons on desktop)..."
         if ! is_pkg_installed "gnome-shell-extension-gtk4-desktop-icons-ng" && ! is_pkg_installed "gnome-shell-extension-desktop-icons-ng"; then
-            pacman -S --needed --noconfirm gnome-shell-extension-gtk4-desktop-icons-ng > /dev/null 2>&1 || \
-            pacman -S --needed --noconfirm gnome-shell-extension-desktop-icons-ng > /dev/null 2>&1 || true
+            pacman -S --needed --noconfirm gnome-shell-extension-gtk4-desktop-icons-ng || \
+            pacman -S --needed --noconfirm gnome-shell-extension-desktop-icons-ng || true
         fi
 
         run_as_user gsettings set org.gnome.shell disable-user-extensions false 2>/dev/null || true
@@ -663,7 +663,7 @@ optimize_system() {
     configure_permanent_partitions
 
     log_info "9/13: Setting up ZRAM (RAM-compressed swap)..."
-    pacman -S --needed --noconfirm zram-generator > /dev/null 2>&1 || true
+    pacman -S --needed --noconfirm zram-generator || true
     if [[ ! -f /etc/systemd/zram-generator.conf ]]; then
         cat << 'EOF' > /etc/systemd/zram-generator.conf
 [zram0]
@@ -696,7 +696,7 @@ EOF
     configure_tigerlake_sleep_fix
     sed -i 's/^#*RuntimeWatchdogSec=.*/RuntimeWatchdogSec=off/' /etc/systemd/system.conf 2>/dev/null || true
 
-    pacman -S --needed --noconfirm intel-media-driver libva-utils thermald rtkit pacman-contrib git base-devel > /dev/null 2>&1 || true
+    pacman -S --needed --noconfirm intel-media-driver libva-utils thermald rtkit pacman-contrib git base-devel || true
     configure_git_identity
     systemctl enable --now thermald.service > /dev/null 2>&1 || true
     systemctl enable --now rtkit-daemon.service > /dev/null 2>&1 || true
@@ -802,7 +802,7 @@ install_vscode_extensions() {
         "esbenp.prettier-vscode"
         "mhutchie.git-graph"
         "rangav.vscode-thunder-client"
-        "PKief.material-icon-theme"
+        "vscode-icons-team.vscode-icons"
         "cweijan.vscode-office"
         "Google.google-antigravity"
         "HookyQR.minify"
@@ -811,12 +811,40 @@ install_vscode_extensions() {
         "GitHub.remotehub"
         "ms-dotnettools.csdevkit"
         "moshfeu.compare-folders"
+        "nhoizey.gremlins"
     )
 
     for ext in "${vscode_extensions[@]}"; do
         log_info "Syncing VS Code extension: ${CYAN}${ext}${NC}..."
-        sudo -u "$REAL_USER" code --install-extension "$ext" --force >/dev/null 2>&1 || true
+        sudo -u "$REAL_USER" code --install-extension "$ext" --force || true
     done
+
+    # Configure vscode-icons and hidden/whitespace character detection in VS Code settings.json
+    local vscode_user_dir="$USER_HOME/.config/Code/User"
+    local vscode_settings="$vscode_user_dir/settings.json"
+    mkdir -p "$vscode_user_dir"
+    python3 -c '
+import json, os, sys
+path = sys.argv[1]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+data["workbench.iconTheme"] = "vscode-icons"
+data["editor.renderWhitespace"] = "all"
+data["editor.renderControlCharacters"] = True
+data["editor.unicodeHighlight.nonBasicASCII"] = True
+data["editor.unicodeHighlight.invisibleCharacters"] = True
+data["editor.unicodeHighlight.ambiguousCharacters"] = True
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+' "$vscode_settings" 2>/dev/null || true
+    chown -R "$REAL_USER:" "$USER_HOME/.config/Code" 2>/dev/null || true
+    log_ok "VS Code user settings configured (vscode-icons & hidden/unicode character visualization)."
+
     log_ok "All specified VS Code extensions installed and verified."
 }
 
@@ -1014,7 +1042,7 @@ install_dev_runtimes() {
 
     # 1. Install & configure NVM
     log_info "Installing Node Version Manager (NVM)..."
-    pacman -S --needed --noconfirm nvm > /dev/null 2>&1 || true
+    pacman -S --needed --noconfirm nvm || true
 
     # Inject NVM initialization into user bashrc & zshrc safely
     for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
@@ -1049,10 +1077,10 @@ EOF
 
     if pacman -Si "dotnet-sdk-${lts_ver}" &>/dev/null; then
         log_info "Installing .NET Core SDK & ASP.NET Runtime v${lts_ver}..."
-        pacman -S --needed --noconfirm "dotnet-sdk-${lts_ver}" "aspnet-runtime-${lts_ver}" "dotnet-targeting-pack-${lts_ver}" > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm "dotnet-sdk-${lts_ver}" "aspnet-runtime-${lts_ver}" "dotnet-targeting-pack-${lts_ver}" || true
     elif pacman -Si dotnet-sdk &>/dev/null; then
         log_info "Installing .NET Core SDK metapackage..."
-        pacman -S --needed --noconfirm dotnet-sdk aspnet-runtime > /dev/null 2>&1 || true
+        pacman -S --needed --noconfirm dotnet-sdk aspnet-runtime || true
     fi
 
     # Configure system-wide .NET environment
