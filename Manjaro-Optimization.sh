@@ -1855,15 +1855,207 @@ get_fingerprint_status() {
         return
     fi
     if is_pkg_installed libfprint-goodix-538d || is_pkg_installed libfprint-goodix-521d || [[ -f /usr/lib/goodix-538d/provision-goodix-538d.py ]]; then
-        if find "/var/lib/fprint/$REAL_USER" -type f 2>/dev/null | grep -q . || \
-           run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -qE "^ - #[0-9]+:"; then
-            echo "enrolled"
+        local count
+        count=$(run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -cE "^ - #[0-9]+:" || echo 0)
+        if [[ $count -gt 0 ]]; then
+            echo "enrolled:$count"
+        elif find "/var/lib/fprint/$REAL_USER" -type f 2>/dev/null | grep -q .; then
+            echo "enrolled:1"
         else
             echo "installed"
         fi
     else
         echo "uninstalled"
     fi
+}
+
+get_enrolled_fingers() {
+    run_as_user fprintd-list "$REAL_USER" 2>/dev/null | awk -F': ' '/ - #[0-9]+:/ {print $2}'
+}
+
+enroll_single_finger() {
+    local finger="$1"
+    local friendly_name="$2"
+    echo ""
+    log_info "Preparing to enroll ${CYAN}${friendly_name}${NC} (${finger})..."
+
+    # Check if this finger is already enrolled
+    if get_enrolled_fingers | grep -qx "$finger"; then
+        read -rp "'$finger' is already enrolled. Re-enroll and overwrite? (y/N): " re_ans
+        if [[ ! "$re_ans" =~ ^[Yy]$ ]]; then
+            log_info "Enrollment cancelled."
+            return 0
+        fi
+    fi
+
+    echo -e "${CYAN}Please swipe or press your finger flat on the sensor repeatedly until complete...${NC}"
+    if run_as_user fprintd-enroll -f "$finger" "$REAL_USER"; then
+        log_ok "Fingerprint for ${CYAN}${friendly_name}${NC} (${finger}) enrolled successfully!"
+    else
+        log_warn "Fingerprint enrollment for '$finger' was interrupted or failed."
+    fi
+    read -rp "Press [Enter] to continue..."
+}
+
+select_and_enroll_custom_finger() {
+    echo ""
+    echo -e "${BOLD}--- Select Finger to Enroll ---${NC}"
+    echo -e " 1) Right Middle Finger  (right-middle-finger)"
+    echo -e " 2) Right Ring Finger    (right-ring-finger)"
+    echo -e " 3) Right Little Finger  (right-little-finger)"
+    echo -e " 4) Left Middle Finger   (left-middle-finger)"
+    echo -e " 5) Left Ring Finger     (left-ring-finger)"
+    echo -e " 6) Left Little Finger   (left-little-finger)"
+    echo -e " B) Back"
+    read -rp "Select finger (1-6 / B): " c_choice
+    case "$c_choice" in
+        1) enroll_single_finger "right-middle-finger" "Right Middle Finger" ;;
+        2) enroll_single_finger "right-ring-finger"   "Right Ring Finger" ;;
+        3) enroll_single_finger "right-little-finger" "Right Little Finger" ;;
+        4) enroll_single_finger "left-middle-finger"  "Left Middle Finger" ;;
+        5) enroll_single_finger "left-ring-finger"    "Left Ring Finger" ;;
+        6) enroll_single_finger "left-little-finger"  "Left Little Finger" ;;
+        *) return 0 ;;
+    esac
+}
+
+test_fingerprint_verification() {
+    echo ""
+    local enrolled_list=()
+    mapfile -t enrolled_list < <(get_enrolled_fingers)
+    if [[ ${#enrolled_list[@]} -eq 0 ]]; then
+        log_warn "No fingerprints enrolled yet to verify. Please enroll a finger first."
+        read -rp "Press [Enter] to continue..."
+        return 0
+    fi
+
+    log_info "Testing fingerprint sensor verification (fprintd-verify)..."
+    echo -e "${CYAN}Touch any enrolled finger to the sensor now to test authentication...${NC}"
+    if run_as_user fprintd-verify; then
+        log_ok "Verification SUCCESSFUL! Fingerprint recognized."
+    else
+        log_warn "Verification FAILED or timed out."
+    fi
+    read -rp "Press [Enter] to continue..."
+}
+
+delete_single_finger() {
+    echo ""
+    local enrolled_list=()
+    mapfile -t enrolled_list < <(get_enrolled_fingers)
+    if [[ ${#enrolled_list[@]} -eq 0 ]]; then
+        log_warn "No fingerprints are currently enrolled."
+        read -rp "Press [Enter] to continue..."
+        return 0
+    fi
+
+    echo -e "${BOLD}--- Select Fingerprint to Delete ---${NC}"
+    local i=1
+    for f in "${enrolled_list[@]}"; do
+        echo -e " ${i}) $f"
+        ((i++))
+    done
+    echo -e " B) Cancel"
+    read -rp "Enter number to delete (1-$((i-1)) / B): " del_choice
+    if [[ "$del_choice" =~ ^[0-9]+$ ]] && (( del_choice >= 1 && del_choice < i )); then
+        local chosen_finger="${enrolled_list[$((del_choice-1))]}"
+        read -rp "Are you sure you want to delete '$chosen_finger'? (y/N): " conf_del
+        if [[ "$conf_del" =~ ^[Yy]$ ]]; then
+            if run_as_user fprintd-delete "$REAL_USER" -f "$chosen_finger"; then
+                log_ok "Deleted '$chosen_finger' successfully."
+            else
+                log_warn "Failed to delete '$chosen_finger'."
+            fi
+        fi
+    fi
+    read -rp "Press [Enter] to continue..."
+}
+
+clear_all_fingerprints() {
+    echo ""
+    read -rp "Are you sure you want to delete ALL enrolled fingerprints for $REAL_USER? (y/N): " conf_all
+    if [[ "$conf_all" =~ ^[Yy]$ ]]; then
+        if run_as_user fprintd-delete "$REAL_USER"; then
+            log_ok "All fingerprints deleted successfully."
+        else
+            log_warn "Failed to delete fingerprints."
+        fi
+    else
+        log_info "Operation cancelled."
+    fi
+    read -rp "Press [Enter] to continue..."
+}
+
+manage_fingerprints_menu() {
+    while true; do
+        echo ""
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e "${BOLD}                  GOODIX FINGERPRINT SENSOR MANAGER                     ${NC}"
+        echo -e "${BOLD}========================================================================${NC}"
+
+        local enrolled_list=()
+        mapfile -t enrolled_list < <(get_enrolled_fingers)
+
+        echo -e "Enrolled Fingerprints for user ${CYAN}${REAL_USER}${NC}:"
+        if [[ ${#enrolled_list[@]} -eq 0 ]]; then
+            echo -e "  ${YELLOW}(No fingerprints enrolled yet)${NC}"
+        else
+            for f in "${enrolled_list[@]}"; do
+                echo -e "  ${GREEN}✓${NC} $f"
+            done
+        fi
+
+        is_enrolled() {
+            local target="$1"
+            for ef in "${enrolled_list[@]}"; do
+                [[ "$ef" == "$target" ]] && return 0
+            done
+            return 1
+        }
+
+        local ri_badge rt_badge li_badge lt_badge
+        is_enrolled "right-index-finger" && ri_badge="${GREEN}[Enrolled]${NC}" || ri_badge="${CYAN}[Available]${NC}"
+        is_enrolled "right-thumb"        && rt_badge="${GREEN}[Enrolled]${NC}" || rt_badge="${CYAN}[Available]${NC}"
+        is_enrolled "left-index-finger"  && li_badge="${GREEN}[Enrolled]${NC}" || li_badge="${CYAN}[Available]${NC}"
+        is_enrolled "left-thumb"         && lt_badge="${GREEN}[Enrolled]${NC}" || lt_badge="${CYAN}[Available]${NC}"
+
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " 1) Enroll Right Index Finger        $ri_badge"
+        echo -e " 2) Enroll Right Thumb               $rt_badge"
+        echo -e " 3) Enroll Left Index Finger         $li_badge"
+        echo -e " 4) Enroll Left Thumb                $lt_badge"
+        echo -e " 5) Enroll Another Finger...         ${CYAN}[Middle, Ring, Pinky]${NC}"
+        echo -e " 6) Verify / Test Fingerprint        ${CYAN}[fprintd-verify]${NC}"
+        echo -e " 7) Delete a Specific Fingerprint"
+        echo -e " 8) Clear ALL Enrolled Fingerprints"
+        if command -v gnome-control-center &>/dev/null; then
+            echo -e " 9) Open GNOME Settings GUI         ${CYAN}[Users -> Fingerprint Login]${NC}"
+        fi
+        echo -e " B) Back to Hardware Menu"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Select an option: " fp_act
+
+        case "$fp_act" in
+            1) enroll_single_finger "right-index-finger" "Right Index Finger" ;;
+            2) enroll_single_finger "right-thumb"        "Right Thumb" ;;
+            3) enroll_single_finger "left-index-finger"  "Left Index Finger" ;;
+            4) enroll_single_finger "left-thumb"         "Left Thumb" ;;
+            5) select_and_enroll_custom_finger ;;
+            6) test_fingerprint_verification ;;
+            7) delete_single_finger ;;
+            8) clear_all_fingerprints ;;
+            9)
+                if command -v gnome-control-center &>/dev/null; then
+                    log_info "Opening GNOME Settings (Users)..."
+                    run_as_user gnome-control-center user-accounts &>/dev/null &
+                else
+                    log_warn "GNOME Control Center is not available."
+                fi
+                ;;
+            [bB]) break ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
 }
 
 configure_goodix_fingerprint() {
@@ -1895,7 +2087,10 @@ configure_goodix_fingerprint() {
             echo -e " 3) Return to Menu"
             read -rp "Select an option (1-3): " fp_choice
             case "$fp_choice" in
-                1) installed=true ;;
+                1)
+                    manage_fingerprints_menu
+                    return 0
+                    ;;
                 2) installed=false ;;
                 *) return 0 ;;
             esac
@@ -2027,22 +2222,9 @@ EOF
     systemctl restart fprintd.service 2>/dev/null || true
     log_ok "Fingerprint daemon service (fprintd) reloaded and active."
 
-    # Interactive enrollment
+    # Interactive enrollment & multi-fingerprint management
     if [[ "$mode" == "interactive" ]]; then
-        echo ""
-        local enrolled_list
-        enrolled_list=$(run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -E "^ - #[0-9]+:" || true)
-        if [[ -n "$enrolled_list" ]]; then
-            log_ok "Currently enrolled fingerprint(s) for $REAL_USER:"
-            echo "$enrolled_list"
-        fi
-        read -rp "Would you like to enroll a fingerprint now? (y/N): " enroll_ans
-        if [[ "$enroll_ans" =~ ^[Yy]$ ]]; then
-            echo -e "${CYAN}Place and press your finger flat on the sensor repeatedly when prompted...${NC}"
-            run_as_user fprintd-enroll || log_warn "Enrollment interrupted or deferred. Run 'fprintd-enroll' anytime."
-        else
-            log_info "Fingerprint enrollment skipped. Run 'fprintd-enroll' anytime to register fingers."
-        fi
+        manage_fingerprints_menu
     fi
 }
 
@@ -2060,6 +2242,14 @@ menu_desktop_settings() {
         [[ "$hc_raw" == "enabled" ]] && hc_st="${RED}[Enabled]${NC}" || hc_st="${GREEN}[Disabled (Recommended)]${NC}"
 
         case "$fp_raw" in
+            enrolled:*)
+                local count="${fp_raw#enrolled:}"
+                if [[ "$count" -eq 1 ]]; then
+                    fp_st="${GREEN}[Enrolled & Active (1 Finger)]${NC}"
+                else
+                    fp_st="${GREEN}[Enrolled & Active (${count} Fingers)]${NC}"
+                fi
+                ;;
             enrolled)     fp_st="${GREEN}[Enrolled & Active]${NC}" ;;
             installed)    fp_st="${YELLOW}[Driver Ready (Unenrolled)]${NC}" ;;
             uninstalled)  fp_st="${RED}[Driver Not Installed]${NC}" ;;
