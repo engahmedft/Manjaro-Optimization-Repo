@@ -174,6 +174,14 @@ ensure_session_snapshot() {
         return 0
     fi
 
+    # Ensure Timeshift native hooks, boot safeguard & snapshot repairs are deployed
+    local ts_install="${SCRIPT_DIR}/timeshift-sync/install.sh"
+    if [[ -f "$ts_install" ]]; then
+        log_info "Ensuring Timeshift restore hooks, boot safeguard & snapshot repairs are deployed..."
+        bash "$ts_install" > /dev/null 2>&1 || true
+        log_ok "Timeshift synchronization suite deployed and verified."
+    fi
+
     log_info "Creating one-time Timeshift system restore point ($reason)..."
     if ! is_pkg_installed timeshift; then
         pacman -S --needed --noconfirm timeshift || true
