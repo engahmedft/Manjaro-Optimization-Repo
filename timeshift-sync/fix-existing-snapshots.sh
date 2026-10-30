@@ -175,7 +175,7 @@ main() {
         btrfs property set "$snap_root" ro true
 
         log_ok "  Snapshot ${BOLD}$snap_name${NC} successfully repaired & synchronized."
-        ((fixed_count++))
+        (( ++fixed_count ))
 
     done < <(find "$snap_dir" -mindepth 1 -maxdepth 1 -type d | sort)
 

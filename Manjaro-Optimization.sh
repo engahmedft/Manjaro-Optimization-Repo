@@ -55,8 +55,8 @@ if [[ -f "$LOG_FILE" ]]; then
 fi
 
 touch "$LOG_FILE" 2>/dev/null || true
-if [[ -n "$SUDO_USER" ]]; then
-    chown "$SUDO_USER:" "$LOG_FILE" 2>/dev/null || true
+if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
+    chown "$REAL_USER:" "$LOG_FILE" 2>/dev/null || true
 fi
 
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -1077,8 +1077,17 @@ install_vscode_extensions() {
         "github.github-vscode-theme"
     )
 
+    local installed_exts=""
+    if is_bin_installed code; then
+        installed_exts=$(sudo -u "$REAL_USER" code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+    fi
+
     for ext in "${vscode_extensions[@]}"; do
-        log_info "Syncing VS Code extension: ${CYAN}${ext}${NC}..."
+        if echo "$installed_exts" | grep -qx "${ext,,}"; then
+            log_ok "VS Code extension already installed: ${CYAN}${ext}${NC}"
+            continue
+        fi
+        log_info "Installing VS Code extension: ${CYAN}${ext}${NC}..."
         local ok=false
         for attempt in 1 2; do
             if sudo -u "$REAL_USER" code --install-extension "$ext" --force 2>&1 | grep -vE "Warning: '(ozone-platform-hint|enable-features)'" ; then
