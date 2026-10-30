@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 00-timeshift-boot-sync.sh - Native Timeshift GUI/CLI Post-Restore Hook
+# 00-timeshift-boot-sync - Native Timeshift GUI/CLI Post-Restore Hook
 # ==============================================================================
 # Executed automatically by Timeshift (GUI and CLI) when any restore finishes.
 # Intercepts the restore, chroots into the target root, and synchronizes GRUB,
@@ -60,9 +60,52 @@ if [[ ! -d "$chroot_dir/boot" ]]; then
     exit 0
 fi
 
+# Ensure working modern kernels (6.12 / 7.2) exist in restored root, and clean obsolete broken 7.1
+echo "[INFO] Verifying kernel targets in restored system..."
+for kver in "6.12" "7.2"; do
+    if [[ -f "/boot/vmlinuz-${kver}-x86_64" && ! -f "$chroot_dir/boot/vmlinuz-${kver}-x86_64" ]]; then
+        echo "[INFO] Copying working kernel ${kver} into restored root..."
+        cp -p "/boot/vmlinuz-${kver}-x86_64" "$chroot_dir/boot/"
+        cp -p "/boot/initramfs-${kver}-x86_64.img" "$chroot_dir/boot/" 2>/dev/null || true
+        cp -p "/boot/linux${kver//./}-x86_64.kver" "$chroot_dir/boot/" 2>/dev/null || true
+    fi
+    for mod_dir in /usr/lib/modules/${kver}*; do
+        if [[ -d "$mod_dir" ]]; then
+            mname=$(basename "$mod_dir")
+            if [[ ! -d "$chroot_dir/usr/lib/modules/$mname" ]]; then
+                echo "[INFO] Copying modules for ${mname} into restored root..."
+                mkdir -p "$chroot_dir/usr/lib/modules"
+                cp -a "$mod_dir" "$chroot_dir/usr/lib/modules/"
+            fi
+        fi
+    done
+done
+
+# Clean obsolete broken 7.1 kernel that crashes Dell Inspiron 7706 touchpad
+if [[ -f "$chroot_dir/boot/vmlinuz-7.1-x86_64" ]]; then
+    echo "[INFO] Removing obsolete kernel 7.1 from restored root to avoid hardware freeze..."
+    rm -f "$chroot_dir/boot/vmlinuz-7.1-x86_64"*
+    rm -f "$chroot_dir/boot/initramfs-7.1-x86_64"*
+    rm -f "$chroot_dir/boot/linux71-x86_64.kver"*
+fi
+
+# Deploy first-boot safeguard service into restored root so it's guaranteed present
+if [[ -f /etc/systemd/system/timeshift-boot-sync.service ]]; then
+    mkdir -p "$chroot_dir/etc/systemd/system" "$chroot_dir/usr/local/bin"
+    cp -p /etc/systemd/system/timeshift-boot-sync.service "$chroot_dir/etc/systemd/system/"
+    cp -p /usr/local/bin/timeshift-boot-sync.sh "$chroot_dir/usr/local/bin/"
+    chmod +x "$chroot_dir/usr/local/bin/timeshift-boot-sync.sh"
+    mkdir -p "$chroot_dir/etc/systemd/system/multi-user.target.wants"
+    ln -sf /etc/systemd/system/timeshift-boot-sync.service "$chroot_dir/etc/systemd/system/multi-user.target.wants/timeshift-boot-sync.service"
+fi
+
+# Fix fontconfig cache mismatch
+echo "[INFO] Clearing stale fontconfig cache..."
+rm -rf "$chroot_dir/var/cache/fontconfig"/* 2>/dev/null || true
+
 # Mount virtual filesystems for chroot
 mounted_efi=false
-if [[ -n "$efi_dev" && -b "$efi_dev" && ! -d "$chroot_dir/boot/efi/EFI" ]]; then
+if [[ -n "$efi_dev" && -b "$efi_dev" ]] && ! mountpoint -q "$chroot_dir/boot/efi"; then
     mkdir -p "$chroot_dir/boot/efi"
     mount "$efi_dev" "$chroot_dir/boot/efi" && mounted_efi=true
 fi
@@ -78,6 +121,9 @@ chroot "$chroot_dir" bash -c "grub-editenv /boot/grub/grubenv unset next_entry 2
 
 echo "[INFO] Rebuilding initramfs..."
 chroot "$chroot_dir" mkinitcpio -P || true
+
+echo "[INFO] Regenerating font cache in chroot..."
+chroot "$chroot_dir" fc-cache -r 2>/dev/null || true
 
 echo "[INFO] Regenerating grub.cfg..."
 if chroot "$chroot_dir" command -v update-grub &>/dev/null; then

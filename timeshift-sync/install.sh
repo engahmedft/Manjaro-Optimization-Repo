@@ -46,12 +46,13 @@ cp "$SCRIPT_DIR/check-grub-menu.sh" /usr/local/bin/timeshift-check-grub
 chmod +x /usr/local/bin/timeshift-check-grub
 log_ok "Global CLI commands installed (timeshift-restore-sync, timeshift-fix-snapshots, timeshift-check-grub)."
 
-# 2. Install Native Timeshift GUI/CLI Restore Hook
+# 2. Install Native Timeshift GUI/CLI Restore Hook (Must NOT have .sh extension for run-parts)
 log_info "2/6: Installing native Timeshift post-restore hook..."
 mkdir -p /etc/timeshift/restore-hooks.d
-cp "$SCRIPT_DIR/timeshift-restore-hook.sh" /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync.sh
-chmod +x /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync.sh
-log_ok "Native hook active at /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync.sh."
+rm -f /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync.sh
+cp "$SCRIPT_DIR/timeshift-restore-hook.sh" /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync
+chmod +x /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync
+log_ok "Native hook active at /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync (validated for run-parts)."
 
 # 3. Install First-Boot Systemd Service
 log_info "3/6: Installing first-boot safeguard systemd service..."

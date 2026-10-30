@@ -2,9 +2,10 @@
 # ==============================================================================
 # fix-existing-snapshots.sh - Repair & Synchronize Existing Timeshift Snapshots
 # ==============================================================================
-# Injects missing LTS fallback kernels and modules into older snapshots
-# (such as "After-Install"), purges stale grubenv entries, and ensures old
-# restore points will never cause kernel panics or bootloader dropouts.
+# Injects modern working kernels (6.12 LTS & 7.2) and modules into older snapshots
+# (such as "After-Install"), removes obsolete broken kernels (7.1), purges
+# stale grubenv entries, installs the boot safeguard service into snapshots,
+# and ensures old restore points will never cause kernel panics or boot failures.
 # ==============================================================================
 
 set -euo pipefail
@@ -71,27 +72,6 @@ main() {
         exit 1
     fi
 
-    # Identify LTS kernel source from current system
-    local lts_vmlinuz="/boot/vmlinuz-6.12-x86_64"
-    local lts_initrd="/boot/initramfs-6.12-x86_64.img"
-    local lts_kver="/boot/linux612-x86_64.kver"
-    local lts_modules_dir=""
-
-    for d in /usr/lib/modules/6.12*; do
-        if [[ -d "$d" ]]; then
-            lts_modules_dir="$d"
-            break
-        fi
-    done
-
-    local has_lts_source=false
-    if [[ -f "$lts_vmlinuz" && -f "$lts_initrd" && -n "$lts_modules_dir" ]]; then
-        has_lts_source=true
-        log_ok "Found host LTS Kernel 6.12 as universal fallback provider."
-    else
-        log_warn "Host LTS Kernel 6.12 not found. Will only purge stale grubenv in snapshots."
-    fi
-
     local fixed_count=0
 
     while IFS= read -r s; do
@@ -115,61 +95,65 @@ main() {
         # Check existing kernels in snapshot
         local snap_kernels
         snap_kernels=$(ls "$snap_root/boot"/vmlinuz-* 2>/dev/null | xargs -n1 basename | sed 's/vmlinuz-//' | tr '\n' ' ' || true)
-        log_info "  Installed kernels in snapshot: ${snap_kernels:-none}"
-
-        # Determine if repair is actually required before altering Btrfs properties
-        local needs_grubenv_clean=false
-        local needs_lts_injection=false
-        local needs_ucode=false
-
-        if [[ -f "$snap_root/boot/grub/grubenv" ]] && grub-editenv "$snap_root/boot/grub/grubenv" list 2>/dev/null | grep -qE "saved_entry=|next_entry="; then
-            needs_grubenv_clean=true
-        fi
-
-        if [[ "$has_lts_source" == "true" && ! -f "$snap_root/boot/vmlinuz-6.12-x86_64" ]]; then
-            needs_lts_injection=true
-        fi
-
-        if [[ -f /boot/intel-ucode.img && ! -f "$snap_root/boot/intel-ucode.img" ]]; then
-            needs_ucode=true
-        fi
-
-        if [[ "$needs_grubenv_clean" == "false" && "$needs_lts_injection" == "false" && "$needs_ucode" == "false" ]]; then
-            log_ok "  Snapshot ${BOLD}$snap_name${NC} already healthy & synchronized. (Skipping)"
-            continue
-        fi
+        log_info "  Current kernels in snapshot: ${snap_kernels:-none}"
 
         # Temporarily make snapshot read-write for repair
         btrfs property set "$snap_root" ro false
 
         # 1. Clear stale grubenv in snapshot
-        if [[ "$needs_grubenv_clean" == "true" ]]; then
+        if [[ -f "$snap_root/boot/grub/grubenv" ]]; then
             grub-editenv "$snap_root/boot/grub/grubenv" unset saved_entry 2>/dev/null || true
             grub-editenv "$snap_root/boot/grub/grubenv" unset next_entry 2>/dev/null || true
         fi
 
-        # 2. Inject LTS kernel if snapshot lacks modern/stable kernel
-        if [[ "$needs_lts_injection" == "true" ]]; then
-            log_info "  Injecting LTS Kernel 6.12 into $snap_name to ensure safe booting..."
-            mkdir -p "$snap_root/boot"
-            cp -p "$lts_vmlinuz" "$snap_root/boot/"
-            cp -p "$lts_initrd" "$snap_root/boot/"
-            [[ -f "$lts_kver" ]] && cp -p "$lts_kver" "$snap_root/boot/"
-
-            local mod_target_base="$snap_root/usr/lib/modules"
-            local mod_name
-            mod_name=$(basename "$lts_modules_dir")
-            if [[ ! -d "$mod_target_base/$mod_name" ]]; then
-                log_info "  Copying kernel modules ($mod_name) into snapshot..."
-                mkdir -p "$mod_target_base"
-                cp -a "$lts_modules_dir" "$mod_target_base/"
-            fi
+        # 2. Remove obsolete broken 7.1 kernel that crashes touchpad/IRQ 27 on Dell Inspiron 7706
+        if [[ -f "$snap_root/boot/vmlinuz-7.1-x86_64" ]]; then
+            log_info "  Purging obsolete broken kernel 7.1 from snapshot..."
+            rm -f "$snap_root/boot/vmlinuz-7.1-x86_64"*
+            rm -f "$snap_root/boot/initramfs-7.1-x86_64"*
+            rm -f "$snap_root/boot/linux71-x86_64.kver"*
         fi
 
-        # 3. Ensure intel-ucode is present in snapshot
-        if [[ "$needs_ucode" == "true" ]]; then
+        # 3. Inject modern working kernels (6.12 LTS & 7.2) into snapshot
+        for kver in "6.12" "7.2"; do
+            if [[ -f "/boot/vmlinuz-${kver}-x86_64" && ! -f "$snap_root/boot/vmlinuz-${kver}-x86_64" ]]; then
+                log_info "  Injecting Kernel ${kver} into $snap_name..."
+                mkdir -p "$snap_root/boot"
+                cp -p "/boot/vmlinuz-${kver}-x86_64" "$snap_root/boot/"
+                cp -p "/boot/initramfs-${kver}-x86_64.img" "$snap_root/boot/" 2>/dev/null || true
+                cp -p "/boot/linux${kver//./}-x86_64.kver" "$snap_root/boot/" 2>/dev/null || true
+            fi
+
+            for mod_dir in /usr/lib/modules/${kver}*; do
+                if [[ -d "$mod_dir" ]]; then
+                    local mod_name
+                    mod_name=$(basename "$mod_dir")
+                    local mod_target_base="$snap_root/usr/lib/modules"
+                    if [[ ! -d "$mod_target_base/$mod_name" ]]; then
+                        log_info "  Injecting kernel modules ($mod_name) into snapshot..."
+                        mkdir -p "$mod_target_base"
+                        cp -a "$mod_dir" "$mod_target_base/"
+                    fi
+                fi
+            done
+        done
+
+        # 4. Ensure microcode is present in snapshot
+        if [[ -f /boot/intel-ucode.img && ! -f "$snap_root/boot/intel-ucode.img" ]]; then
             cp -p /boot/intel-ucode.img "$snap_root/boot/"
         fi
+
+        # 5. Inject first-boot safeguard service so it's guaranteed present upon restoring
+        if [[ -f /etc/systemd/system/timeshift-boot-sync.service ]]; then
+            mkdir -p "$snap_root/etc/systemd/system/multi-user.target.wants" "$snap_root/usr/local/bin"
+            cp -p /usr/local/bin/timeshift-boot-sync.sh "$snap_root/usr/local/bin/" 2>/dev/null || true
+            chmod +x "$snap_root/usr/local/bin/timeshift-boot-sync.sh" 2>/dev/null || true
+            cp -p /etc/systemd/system/timeshift-boot-sync.service "$snap_root/etc/systemd/system/" 2>/dev/null || true
+            ln -sf /etc/systemd/system/timeshift-boot-sync.service "$snap_root/etc/systemd/system/multi-user.target.wants/timeshift-boot-sync.service"
+        fi
+
+        # 6. Clear stale fontconfig cache to avoid GNOME Shell startup issues
+        rm -rf "$snap_root/var/cache/fontconfig"/* 2>/dev/null || true
 
         # Re-lock snapshot as read-only
         btrfs property set "$snap_root" ro true
@@ -182,16 +166,18 @@ main() {
     echo "----------------------------------------------------------------"
     log_ok "Total snapshots processed and verified: $fixed_count"
 
-    # Also synchronize current live system GRUB menu with snapshots
+    # Synchronize current live system GRUB menu with snapshots
     log_info "Synchronizing live GRUB bootloader snapshot menu..."
     if [[ -x /etc/grub.d/41_snapshots-btrfs ]]; then
         /etc/grub.d/41_snapshots-btrfs >/dev/null 2>&1 || true
     fi
     if command -v update-grub &>/dev/null; then
         update-grub >/dev/null 2>&1 || true
+    elif command -v grub-mkconfig &>/dev/null; then
+        grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || true
     fi
 
-    log_ok "All existing Timeshift restore points are now safe to restore without kernel mismatch!"
+    log_ok "All existing Timeshift restore points are now safe to restore!"
 }
 
 main "$@"

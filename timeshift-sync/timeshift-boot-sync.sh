@@ -52,6 +52,9 @@ fi
 
 if [[ "$restore_detected" == "true" ]]; then
     echo "[INFO] Performing post-restore GRUB & snapshots alignment..."
+    rm -rf /var/cache/fontconfig/* 2>/dev/null || true
+    fc-cache -r 2>/dev/null || true
+
     if command -v update-grub &>/dev/null; then
         update-grub >/dev/null 2>&1 || true
     elif command -v grub-mkconfig &>/dev/null; then
