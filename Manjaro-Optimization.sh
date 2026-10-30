@@ -577,24 +577,11 @@ get_eye_comfort_status() {
     fi
 }
 
-configure_eye_comfort_display() {
-    local action="${1:-enable}"
-    if [[ "$action" == "enable" ]]; then
-        log_info "Enabling Eye Comfort Display, Anti-Glare Charcoal & Crisp HiDPI Font Rendering..."
-        pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
-
-        # GNOME Desktop typography & anti-glare rendering
-        run_as_user gsettings set org.gnome.desktop.interface font-antialiasing 'grayscale' 2>/dev/null || true
-        run_as_user gsettings set org.gnome.desktop.interface font-hinting 'none' 2>/dev/null || true
-        run_as_user gsettings set org.gnome.desktop.interface font-name 'Inter 11' 2>/dev/null || true
-        run_as_user gsettings set org.gnome.desktop.interface document-font-name 'Inter 11' 2>/dev/null || true
-        run_as_user gsettings set org.gnome.desktop.interface monospace-font-name 'JetBrains Mono 11' 2>/dev/null || true
-
-        # Ensure Antigravity 2 uses anti-glare charcoal palette
-        local gemini_cfg_dir="$USER_HOME/.gemini/config"
-        local gemini_cfg="$gemini_cfg_dir/config.json"
-        mkdir -p "$gemini_cfg_dir"
-        python3 -c '
+configure_antigravity2_theme() {
+    local gemini_cfg_dir="$USER_HOME/.gemini/config"
+    local gemini_cfg="$gemini_cfg_dir/config.json"
+    mkdir -p "$gemini_cfg_dir"
+    python3 -c '
 import json, os, sys
 path = sys.argv[1]
 data = {}
@@ -615,7 +602,24 @@ data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
 with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
 ' "$gemini_cfg" 2>/dev/null || true
-        chown -R "$REAL_USER:" "$USER_HOME/.gemini" 2>/dev/null || true
+    chown -R "$REAL_USER:" "$USER_HOME/.gemini" 2>/dev/null || true
+}
+
+configure_eye_comfort_display() {
+    local action="${1:-enable}"
+    if [[ "$action" == "enable" ]]; then
+        log_info "Enabling Eye Comfort Display, Anti-Glare Charcoal & Crisp HiDPI Font Rendering..."
+        pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
+
+        # GNOME Desktop typography & anti-glare rendering
+        run_as_user gsettings set org.gnome.desktop.interface font-antialiasing 'grayscale' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface font-hinting 'none' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface font-name 'Inter 11' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface document-font-name 'Inter 11' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface monospace-font-name 'JetBrains Mono 11' 2>/dev/null || true
+
+        # Ensure Antigravity 2 uses anti-glare charcoal palette
+        configure_antigravity2_theme
 
         log_ok "Eye Comfort display & typography settings applied (Inter, JetBrains Mono & Grayscale HiDPI)."
     else
@@ -624,6 +628,7 @@ with open(path, "w", encoding="utf-8") as f:
         run_as_user gsettings set org.gnome.desktop.interface font-hinting 'slight' 2>/dev/null || true
         run_as_user gsettings set org.gnome.desktop.interface font-name 'Noto Sans 11' 2>/dev/null || true
         run_as_user gsettings set org.gnome.desktop.interface document-font-name 'Sans 11' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface monospace-font-name 'Monospace 11' 2>/dev/null || true
         log_ok "Default display and font rendering restored."
     fi
 }
@@ -1094,31 +1099,7 @@ install_antigravity_standalone() {
     }
 
     # Initialize Antigravity 2 anti-glare charcoal theme
-    local gemini_cfg_dir="$USER_HOME/.gemini/config"
-    local gemini_cfg="$gemini_cfg_dir/config.json"
-    mkdir -p "$gemini_cfg_dir"
-    python3 -c '
-import json, os, sys
-path = sys.argv[1]
-data = {}
-if os.path.exists(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-if "userSettings" not in data:
-    data["userSettings"] = {}
-data["userSettings"]["customThemeSeedsDark"] = {
-    "background": "#1c2128",
-    "foregroundOverride": "#e6edf3",
-    "primary": "#58a6ff"
-}
-data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-' "$gemini_cfg" 2>/dev/null || true
-    chown -R "$REAL_USER:" "$USER_HOME/.gemini" 2>/dev/null || true
+    configure_antigravity2_theme
 
     log_ok "Antigravity 2.0 Platform & CLI ready."
     post_install_hook
