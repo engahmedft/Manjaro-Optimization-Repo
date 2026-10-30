@@ -15,18 +15,27 @@ if [[ "$EUID" -ne 0 ]]; then
     exit 1
 fi
 
-REAL_USER="${SUDO_USER:-$USER}"
+if [[ -n "$SUDO_USER" && "$SUDO_USER" != "root" ]]; then
+    REAL_USER="$SUDO_USER"
+elif [[ -n "$PKEXEC_UID" && "$PKEXEC_UID" -ne 0 ]]; then
+    REAL_USER=$(id -un "$PKEXEC_UID" 2>/dev/null || echo "ahmed")
+elif [[ -n "$USER" && "$USER" != "root" ]]; then
+    REAL_USER="$USER"
+else
+    REAL_USER=$(logname 2>/dev/null || id -un 1000 2>/dev/null || echo "ahmed")
+fi
 USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 USER_UID=$(id -u "$REAL_USER")
 
 run_as_user() {
     if [[ "$EUID" -eq 0 ]] && [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
         sudo -u "$REAL_USER" env \
+            HOME="$USER_HOME" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
             XDG_RUNTIME_DIR="/run/user/$USER_UID" \
             DISPLAY="${DISPLAY:-:0}" \
             WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-            "$@"
+            bash -c "cd '$USER_HOME' 2>/dev/null || true; exec \"\$@\"" -- "$@"
     else
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
         XDG_RUNTIME_DIR="/run/user/$USER_UID" \
@@ -76,8 +85,13 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Session-wide snapshot guard (ensures only 1 restore point is created per script run)
+# Session-wide snapshot and idempotency guards (ensures shared routines run only once in batch mode)
 SESSION_SNAPSHOT_TAKEN=false
+SESSION_PARTITIONS_SYNCED=false
+SESSION_GRUB_SYNCED=false
+SESSION_SLEEP_FIX_APPLIED=false
+SESSION_BTRFS_MAINTAINED=false
+SESSION_GOODIX_CONFIGURED=false
 
 timestamp() { printf '%(%Y-%m-%d %H:%M:%S)T' -1; }
 log_info()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;34m[INFO]\033[0m %b\n' -1 "$1"; }
@@ -321,6 +335,11 @@ EOF
 }
 
 configure_tigerlake_sleep_fix() {
+    local force="${1:-false}"
+    if [[ "$SESSION_SLEEP_FIX_APPLIED" == "true" && "$force" != "force" ]]; then
+        log_info "Intel Tiger Lake sleep/suspend fix already verified in this session."
+        return 0
+    fi
     log_info "Configuring Intel Tiger Lake Iris Xe sleep & Modern Standby (s2idle) freeze fix..."
 
     # 1. Update /etc/modprobe.d/i915.conf (disabling PSR, FBC, and Display C-states to prevent sleep wake hang)
@@ -361,12 +380,22 @@ EOF
         fi
     fi
 
+    SESSION_SLEEP_FIX_APPLIED=true
     log_ok "Intel Tiger Lake sleep/suspend resume fix configured."
 }
 
 configure_grub_dual_boot() {
-    log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync)..."
+    local force="${1:-false}"
+    if [[ "$SESSION_GRUB_SYNCED" == "true" && "$force" != "force" ]]; then
+        log_info "Dual-boot GRUB & snapshot configuration already synchronized in this session."
+        return 0
+    fi
+    log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync & LocalRTC)..."
     pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools || true
+
+    if [[ $(timedatectl show --property=LocalRTC --value 2>/dev/null) != "yes" ]]; then
+        timedatectl set-local-rtc 1 --adjust-system-clock 2>/dev/null || true
+    fi
 
     # Unconditionally configure GRUB for dual-boot visibility
     sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
@@ -377,11 +406,7 @@ configure_grub_dual_boot() {
     sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
 
     # Ensure Intel GuC/HuC and Tiger Lake sleep/suspend freeze mitigation flags are present
-    for param in "i915.enable_guc=3" "i915.enable_psr=0" "i915.enable_fbc=0" "i915.enable_dc=0"; do
-        if ! grep -q "$param" /etc/default/grub; then
-            sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1${param} /" /etc/default/grub
-        fi
-    done
+    configure_tigerlake_sleep_fix
 
     # Configure GRUB boot enhancements (Shutdown & Reboot menu entries, grub-btrfsd daemon with timeshift-auto)
     configure_grub_boot_enhancements
@@ -395,6 +420,7 @@ configure_grub_dual_boot() {
     elif command -v grub-mkconfig &>/dev/null; then
         grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
     fi
+    SESSION_GRUB_SYNCED=true
     log_ok "GRUB dual-boot configuration updated."
 }
 
@@ -453,6 +479,7 @@ safe_pacman_remove() {
 }
 
 post_install_hook() {
+    [[ "${SKIP_POST_HOOK:-0}" == "1" ]] && return 0
     log_info "Running post-install setup (syncing PATH across shells & environment)..."
     for rc in "$USER_HOME/.zshrc" "$USER_HOME/.bashrc"; do
         if [[ -f "$rc" ]] && ! grep -q '\.local/bin' "$rc"; then
@@ -484,7 +511,7 @@ post_uninstall_hook() {
     flatpak uninstall --unused -y > /dev/null 2>&1 || true
     
     local orphans
-    orphans=$(pacman -Qtdq 2>/dev/null || true)
+    orphans=$(pacman -Qtdq 2>/dev/null | grep -vE "^(linux-meta|linux[0-9]+)" || true)
     if [[ -n "$orphans" ]]; then
         pacman -Rns --noconfirm $orphans > /dev/null 2>&1 || true
     fi
@@ -678,27 +705,28 @@ configure_git_identity() {
 # 1. SYSTEM OPTIMIZATION ROUTINE (Includes AUR & Kernel Lifecycle Checks)
 # ------------------------------------------------------------------------------
 optimize_system() {
+    local mode="${1:-interactive}"
     echo ""
-    log_info "=== STARTING FULL SYSTEM OPTIMIZATION ==="
+    log_info "=== STARTING CORE SYSTEM OPTIMIZATION ==="
 
-    log_info "1/13: Checking Timeshift & creating system restore point..."
+    log_info "1/9: Checking Timeshift & creating system restore point..."
     ensure_session_snapshot "Before System Optimization"
 
-    log_info "2/13: Ensuring download accelerator and pacman formatting..."
+    log_info "2/9: Ensuring download accelerator and pacman formatting..."
     init_downloads
     sed -i 's/^#*Color/Color/' /etc/pacman.conf
     if ! grep -q "ILoveCandy" /etc/pacman.conf; then
         sed -i '/# Misc options/a ILoveCandy' /etc/pacman.conf 2>/dev/null || true
     fi
 
-    log_info "3/13: Refreshing fastest mirrors & full system upgrade (Official + AUR)..."
+    log_info "3/9: Refreshing fastest mirrors & full system upgrade (Official + AUR)..."
     pacman-mirrors --fasttrack 5
     # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, RustDesk)
     # Pass SKIP_AUTOSNAP=1 to prevent duplicate ALPM hook snapshot right after step 1
     sudo -u "$REAL_USER" env SKIP_AUTOSNAP=1 pamac update --no-confirm --aur
     refresh_pkg_cache
 
-    log_info "4/13: Checking Linux Kernel Lifecycle & Stability..."
+    log_info "4/9: Checking Linux Kernel Lifecycle & Stability..."
     local running_ver
     running_ver=$(uname -r)
     local k_major k_minor
@@ -715,13 +743,20 @@ optimize_system() {
         log_ok "Reliable fallback LTS kernel series verified."
     fi
 
+    # Ensure active rolling kernel meta package (linux-meta) is tracking latest stable
+    if pacman -Si linux-meta &>/dev/null && ! is_pkg_installed linux-meta; then
+        log_info "Installing current stable kernel meta package (linux-meta)..."
+        pacman -S --needed --noconfirm linux-meta || true
+    fi
+    pacman -D --asexplicit linux-meta linux72 linux612 2>/dev/null || true
+
     # Microcode Hygiene: Remove redundant amd-ucode on this Intel Tiger Lake system
     if is_pkg_installed amd-ucode; then
         log_info "Removing redundant amd-ucode package on Intel hardware..."
         pacman -R --noconfirm amd-ucode 2>/dev/null || true
     fi
 
-    log_info "5/13: Enforcing en_US locale and formatting..."
+    log_info "5/9: Enforcing en_US locale, keymap & LocalRTC clock sync..."
     if ! grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen; then
         sed -i 's/^#*en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
         locale-gen > /dev/null 2>&1 || true
@@ -729,46 +764,11 @@ optimize_system() {
     localectl set-locale LANG=en_US.UTF-8 LC_TIME=en_US.UTF-8 LC_NUMERIC=en_US.UTF-8 LC_MONETARY=en_US.UTF-8 LC_MEASUREMENT=en_US.UTF-8 > /dev/null 2>&1 || true
     localectl set-keymap us > /dev/null 2>&1 || true
     run_as_user gsettings set org.gnome.system.locale region 'en_US.UTF-8' 2>/dev/null || true
-
-    log_info "6/13: Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync) & LocalRTC..."
-    configure_grub_dual_boot
-
-    if [[ $(timedatectl show --property=LocalRTC --value) != "yes" ]]; then
-        timedatectl set-local-rtc 1 --adjust-system-clock
+    if [[ $(timedatectl show --property=LocalRTC --value 2>/dev/null) != "yes" ]]; then
+        timedatectl set-local-rtc 1 --adjust-system-clock 2>/dev/null || true
     fi
 
-    log_info "7/13: Applying Btrfs NVMe 'noatime,discard=async' mount optimization & labeling system partition..."
-    if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "discard=async"; then
-        sed -i 's/compress=zstd:1/noatime,discard=async,compress=zstd:1/g' /etc/fstab
-        sed -i 's/defaults,noatime,noatime/defaults,noatime/g' /etc/fstab
-        sed -i 's/defaults,noatime,compress=zstd/defaults,noatime,discard=async,compress=zstd/g' /etc/fstab
-        mount -o remount / 2>/dev/null || true
-        mount -o remount /home 2>/dev/null || true
-        mount -o remount /var/cache 2>/dev/null || true
-        mount -o remount /var/log 2>/dev/null || true
-        mount -o remount /mnt/my-data 2>/dev/null || true
-        log_ok "Btrfs subvolumes remounted with noatime and discard=async."
-    fi
-
-    local root_src root_dev part_num disk_dev
-    root_src=$(findmnt -n -o SOURCE / 2>/dev/null)
-    root_dev="${root_src%%\[*}"
-    if [[ -n "$root_dev" && -b "$root_dev" ]]; then
-        btrfs filesystem label / "Manjaro" 2>/dev/null || btrfs filesystem label "$root_dev" "Manjaro" 2>/dev/null || true
-        part_num=$(echo "$root_dev" | grep -o '[0-9]*$')
-        disk_dev=$(echo "$root_dev" | sed -E 's/p?[0-9]+$//')
-        if [[ -n "$part_num" && -n "$disk_dev" && -b "$disk_dev" ]]; then
-            parted "$disk_dev" name "$part_num" "Manjaro" 2>/dev/null || true
-        fi
-        udevadm trigger -s block -p DEVNAME="$root_dev" -c change 2>/dev/null || true
-        udevadm settle 2>/dev/null || true
-        log_ok "System partition verified as 'Manjaro'."
-    fi
-
-    log_info "8/13: Configuring Windows partitions (protecting sensitive/recovery partitions)..."
-    configure_permanent_partitions
-
-    log_info "9/13: Setting up ZRAM (RAM-compressed swap)..."
+    log_info "6/9: Setting up ZRAM (RAM-compressed swap)..."
     pacman -S --needed --noconfirm zram-generator || true
     if [[ ! -f /etc/systemd/zram-generator.conf ]]; then
         cat << 'EOF' > /etc/systemd/zram-generator.conf
@@ -782,7 +782,7 @@ EOF
     systemctl daemon-reload
     systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
 
-    log_info "10/13: Tuning kernel sysctl parameters for 32GB RAM, DRAM-less SSD, ZRAM & Inotify Watches..."
+    log_info "7/9: Tuning kernel sysctl parameters for 32GB RAM, DRAM-less SSD, ZRAM & Inotify Watches..."
     cat << 'EOF' > /etc/sysctl.d/99-dell-perf.conf
 vm.swappiness = 100
 vm.vfs_cache_pressure = 50
@@ -798,8 +798,7 @@ EOF
     sysctl --system > /dev/null 2>&1 || true
     log_ok "Kernel sysctl parameters applied."
 
-    log_info "11/13: Configuring Intel Tiger Lake sleep/suspend fix, RTKit audio priority & thermald..."
-    configure_tigerlake_sleep_fix
+    log_info "8/9: Configuring core system daemons, NVMe read-ahead & developer base..."
     sed -i 's/^#*RuntimeWatchdogSec=.*/RuntimeWatchdogSec=off/' /etc/systemd/system.conf 2>/dev/null || true
 
     pacman -S --needed --noconfirm intel-media-driver libva-utils thermald rtkit pacman-contrib git base-devel || true
@@ -814,44 +813,21 @@ EOF
     echo 'ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/read_ahead_kb}="256"' > /etc/udev/rules.d/60-nvme-readahead.rules
     udevadm control --reload-rules && udevadm trigger --subsystem-match=block 2>/dev/null || true
 
-    # Check and configure Goodix 27c6:538d fingerprint sensor
-    if lsusb | grep -qi "27c6:538d"; then
-        log_info "Goodix 27c6:538d sensor detected. Ensuring driver & service..."
-        configure_goodix_fingerprint noninteractive
-    fi
-
-    log_info "12/13: Configuring Eye Comfort & Font Sharpness, Desktop Icons, Disabling Hot Corner & Sorting Dock Favorites..."
-    configure_eye_comfort_display enable
-    configure_desktop_icons enable
-    configure_hot_corner disable
-    configure_dock_favorites
-
-    log_info "13/13: Performing Deep System Clutter Cleanup & SSD Health Maintenance..."
+    log_info "9/9: Performing Deep System Clutter Cleanup (Cache, Logs & Orphans)..."
     rm -rf /var/tmp/pamac-build-* /var/tmp/pamac-*
     sudo -u "$REAL_USER" rm -rf "$USER_HOME/.cache/pamac" 2>/dev/null || true
     paccache -r -k 2 > /dev/null 2>&1 || true
     journalctl --vacuum-size=100M --vacuum-time=2weeks > /dev/null 2>&1 || true
-    
+
     local orphans
-    orphans=$(pacman -Qtdq 2>/dev/null || true)
+    orphans=$(pacman -Qtdq 2>/dev/null | grep -vE "^(linux-meta|linux[0-9]+)" || true)
     [[ -n "$orphans" ]] && pacman -Rns --noconfirm $orphans > /dev/null 2>&1 || true
+    refresh_pkg_cache
 
-    log_info "Executing SSD TRIM pass..."
-    local trim_output trim_status=0
-    trim_output=$(fstrim -va 2>&1) || trim_status=$?
-    if [[ $trim_status -eq 0 ]]; then
-        log_ok "SSD TRIM pass completed successfully."
-    else
-        log_warn "SSD TRIM encountered an issue:\n$trim_output"
-        if echo "$trim_output" | grep -qi "FITRIM ioctl failed"; then
-            log_warn "Btrfs free space cache discrepancy detected on data partition."
-            log_info "Refreshing Btrfs free space tree on /mnt/my-data..."
-            btrfs balance start -dusage=0 /mnt/my-data 2>/dev/null || true
-        fi
+    log_ok "Core system optimization complete! (OS, AUR, kernel, ZRAM, sysctl & cleanup updated)."
+    if [[ "$mode" != "noninteractive" ]]; then
+        read -rp "Press [Enter] to return to the main menu..."
     fi
-
-    log_ok "Optimization complete! OS, AUR, kernel, and hardware settings are updated."
-    read -rp "Press [Enter] to return to the main menu..."
 }
 
 # ------------------------------------------------------------------------------
@@ -1035,6 +1011,42 @@ configure_editor_json(sys.argv[2])
     log_ok "All specified VS Code extensions installed and verified."
 }
 
+configure_vscode_flags() {
+    mkdir -p "$USER_HOME/.config"
+    cat << 'EOF' > "$USER_HOME/.config/code-flags.conf"
+--ozone-platform-hint=auto
+--enable-features=WaylandWindowDecorations
+EOF
+    chown "$REAL_USER:" "$USER_HOME/.config/code-flags.conf" 2>/dev/null || true
+}
+
+configure_chrome_flags() {
+    mkdir -p "$USER_HOME/.config"
+    cat << 'EOF' > "$USER_HOME/.config/chrome-flags.conf"
+--ozone-platform-hint=auto
+--enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoEncoder
+--ignore-gpu-blocklist
+--enable-zero-copy
+EOF
+    chown "$REAL_USER:" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
+}
+
+configure_rustdesk_service() {
+    usermod -aG input,video "$REAL_USER" 2>/dev/null || true
+    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-rustdesk-uinput.rules
+    udevadm control --reload-rules && udevadm trigger 2>/dev/null || true
+
+    mkdir -p /etc/systemd/system/rustdesk.service.d
+    cat << 'EOF' > /etc/systemd/system/rustdesk.service.d/intel-vaapi.conf
+[Service]
+Environment="LIBVA_DRIVER_NAME=iHD"
+Environment="MESA_LOADER_DRIVER_OVERRIDE=iris"
+Environment="GST_VAAPI_ALL_DRIVERS=1"
+EOF
+    systemctl daemon-reload
+    systemctl enable --now rustdesk.service 2>/dev/null || true
+}
+
 install_vscode() {
     local mode="${1:-install}"
     if [[ "$mode" != "reinstall" ]] && (is_pkg_installed visual-studio-code-bin || is_bin_installed code); then
@@ -1050,12 +1062,7 @@ install_vscode() {
     install_vscode_extensions
 
     # Configure native Wayland and fractional scaling crispness
-    mkdir -p "$USER_HOME/.config"
-    cat << 'EOF' > "$USER_HOME/.config/code-flags.conf"
---ozone-platform-hint=auto
---enable-features=WaylandWindowDecorations
-EOF
-    chown "$REAL_USER:" "$USER_HOME/.config/code-flags.conf" 2>/dev/null || true
+    configure_vscode_flags
 
     log_ok "VS Code ready with native Wayland flags."
     post_install_hook
@@ -1118,14 +1125,7 @@ install_chrome() {
     fi
 
     # Automatically configure Wayland and Intel Iris Xe VA-API GPU video decoding
-    mkdir -p "$USER_HOME/.config"
-    cat << 'EOF' > "$USER_HOME/.config/chrome-flags.conf"
---ozone-platform-hint=auto
---enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoEncoder
---ignore-gpu-blocklist
---enable-zero-copy
-EOF
-    chown "$REAL_USER:" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
+    configure_chrome_flags
 
     log_ok "Google Chrome installed with native Wayland & VA-API acceleration flags."
     post_install_hook
@@ -1221,22 +1221,8 @@ install_rustdesk() {
         sudo -u "$REAL_USER" pamac build --no-confirm rustdesk-bin || sudo -u "$REAL_USER" pamac build --no-confirm rustdesk
     fi
 
-    # Grant user permission to uinput & video for Wayland input injection and VA-API hardware acceleration
-    usermod -aG input,video "$REAL_USER"
-    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-rustdesk-uinput.rules
-    udevadm control --reload-rules && udevadm trigger
-
-    # Optimize RustDesk systemd service for Intel Iris Xe VA-API hardware encoding and Wayland low latency
-    mkdir -p /etc/systemd/system/rustdesk.service.d
-    cat << 'EOF' > /etc/systemd/system/rustdesk.service.d/intel-vaapi.conf
-[Service]
-Environment="LIBVA_DRIVER_NAME=iHD"
-Environment="MESA_LOADER_DRIVER_OVERRIDE=iris"
-Environment="GST_VAAPI_ALL_DRIVERS=1"
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now rustdesk.service 2>/dev/null || true
+    # Grant user permission to uinput & video and configure Intel VA-API service
+    configure_rustdesk_service
 
     local r_id
     r_id=$(rustdesk --get-id 2>/dev/null || true)
@@ -1419,9 +1405,9 @@ install_dev_runtimes() {
     local mode="${1:-install}"
     ensure_session_snapshot "Before Installing Developer Suite"
     log_info "Installing Modern Developer Suite (.NET LTS, Node LTS & Google Clasp)..."
-    install_dotnet "$mode"
-    install_nvm_node "$mode"
-    install_clasp "$mode"
+    SKIP_POST_HOOK=1 install_dotnet "$mode"
+    SKIP_POST_HOOK=1 install_nvm_node "$mode"
+    SKIP_POST_HOOK=1 install_clasp "$mode"
     configure_git_identity
     log_ok "Modern Developer Suite (.NET LTS, Node LTS & Google Clasp) fully installed."
     post_install_hook
@@ -1474,39 +1460,10 @@ install_all_apps() {
         log_ok "All AUR applications are already installed. Skipping package build."
     fi
     install_vscode_extensions
+    configure_vscode_flags
     [[ -x /usr/bin/google-chrome-stable ]] && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome 2>/dev/null || true
-
-    # Configure VS Code native Wayland flags
-    mkdir -p "$USER_HOME/.config"
-    cat << 'EOF' > "$USER_HOME/.config/code-flags.conf"
---ozone-platform-hint=auto
---enable-features=WaylandWindowDecorations
-EOF
-    chown "$REAL_USER:" "$USER_HOME/.config/code-flags.conf" 2>/dev/null || true
-
-    # Configure Chrome Wayland & VA-API flags
-    mkdir -p "$USER_HOME/.config"
-    cat << 'EOF' > "$USER_HOME/.config/chrome-flags.conf"
---ozone-platform-hint=auto
---enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoEncoder
---ignore-gpu-blocklist
---enable-zero-copy
-EOF
-    chown "$REAL_USER:" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
-
-    # Configure RustDesk uinput & Intel VA-API hardware encoding
-    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-rustdesk-uinput.rules
-    udevadm control --reload-rules && udevadm trigger
-
-    mkdir -p /etc/systemd/system/rustdesk.service.d
-    cat << 'EOF' > /etc/systemd/system/rustdesk.service.d/intel-vaapi.conf
-[Service]
-Environment="LIBVA_DRIVER_NAME=iHD"
-Environment="MESA_LOADER_DRIVER_OVERRIDE=iris"
-Environment="GST_VAAPI_ALL_DRIVERS=1"
-EOF
-    systemctl daemon-reload
-    systemctl enable --now rustdesk.service 2>/dev/null || true
+    configure_chrome_flags
+    configure_rustdesk_service
 
     log_info "3/4. Verifying Antigravity CLI..."
     if ! is_bin_installed agy; then
@@ -2161,12 +2118,45 @@ menu_extra_apps() {
 # 5. STORAGE & PERMANENT WINDOWS DATA PARTITION MANAGEMENT (ACTIVE SCRUBBING)
 # ------------------------------------------------------------------------------
 configure_permanent_partitions() {
+    local force="${1:-false}"
+    if [[ "$SESSION_PARTITIONS_SYNCED" == "true" && "$force" != "force" ]]; then
+        log_info "Data partitions & Btrfs mount flags already synchronized in this session."
+        return 0
+    fi
     echo ""
-    log_info "=== CONFIGURING DATA PARTITIONS & PURGING RECOVERY/OEM MOUNTS ==="
+    log_info "=== CONFIGURING DATA PARTITIONS, BTRFS MOUNT FLAGS & PURGING RECOVERY MOUNTS ==="
 
     local fstab_bak="/etc/fstab.bak.$(date +%Y%m%d_%H%M%S)"
     cp -p /etc/fstab "$fstab_bak"
     log_ok "Created safety backup of /etc/fstab at: $fstab_bak"
+
+    # Apply Btrfs NVMe 'noatime,discard=async' mount optimization & label system partition
+    if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "discard=async"; then
+        sed -i 's/compress=zstd:1/noatime,discard=async,compress=zstd:1/g' /etc/fstab
+        sed -i 's/defaults,noatime,noatime/defaults,noatime/g' /etc/fstab
+        sed -i 's/defaults,noatime,compress=zstd/defaults,noatime,discard=async,compress=zstd/g' /etc/fstab
+        mount -o remount / 2>/dev/null || true
+        mount -o remount /home 2>/dev/null || true
+        mount -o remount /var/cache 2>/dev/null || true
+        mount -o remount /var/log 2>/dev/null || true
+        mount -o remount /mnt/my-data 2>/dev/null || true
+        log_ok "Btrfs subvolumes remounted with noatime and discard=async."
+    fi
+
+    local root_src root_dev part_num disk_dev
+    root_src=$(findmnt -n -o SOURCE / 2>/dev/null)
+    root_dev="${root_src%%\[*}"
+    if [[ -n "$root_dev" && -b "$root_dev" ]]; then
+        btrfs filesystem label / "Manjaro" 2>/dev/null || btrfs filesystem label "$root_dev" "Manjaro" 2>/dev/null || true
+        part_num=$(echo "$root_dev" | grep -o '[0-9]*$')
+        disk_dev=$(echo "$root_dev" | sed -E 's/p?[0-9]+$//')
+        if [[ -n "$part_num" && -n "$disk_dev" && -b "$disk_dev" ]]; then
+            parted "$disk_dev" name "$part_num" "Manjaro" 2>/dev/null || true
+        fi
+        udevadm trigger -s block -p DEVNAME="$root_dev" -c change 2>/dev/null || true
+        udevadm settle 2>/dev/null || true
+        log_ok "System partition verified as 'Manjaro'."
+    fi
 
     mkdir -p /mnt /media 2>/dev/null || true
 
@@ -2314,10 +2304,12 @@ configure_permanent_partitions() {
     done < <(lsblk -Pno NAME,TYPE,FSTYPE,LABEL,UUID,RM,PARTTYPE,PARTLABEL)
 
     systemctl daemon-reload 2>/dev/null || true
+    SESSION_PARTITIONS_SYNCED=true
     log_ok "Partition sync complete: $configured_count valid data partition(s) active, $purged_count recovery/OEM partition(s) purged."
 }
 
 configure_dell_hardware() {
+    local mode="${1:-interactive}"
     echo ""
     log_info "=== DELL HARDWARE & FIRMWARE TUNING ==="
     local batt_cfg_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/PrimaryBattChargeCfg"
@@ -2333,15 +2325,30 @@ configure_dell_hardware() {
         bat_name=$(basename "$(dirname "$start_thresh")")
     fi
 
+    persist_battery_threshold() {
+        local b_name="$1"
+        mkdir -p /etc/tmpfiles.d
+        cat << EOF > /etc/tmpfiles.d/battery-threshold.conf
+w /sys/class/power_supply/${b_name}/charge_control_start_threshold - - - - 50
+w /sys/class/power_supply/${b_name}/charge_control_end_threshold - - - - 90
+EOF
+        systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
+    }
+
     if [[ -d "$batt_cfg_path" ]]; then
         local cur_batt
         cur_batt=$(cat "$batt_cfg_path/current_value" 2>/dev/null || true)
         echo -e "Current Dell Battery Charging Profile: ${CYAN}${cur_batt:-Unknown}${NC}"
-        echo " 1) Primarily AC Use (PrimAcUse) - Best for preserving degraded/AC-connected battery"
-        echo " 2) Custom (50% Start, 90% Stop Threshold) - Dell BIOS NVRAM & Sysfs"
-        echo " 3) Adaptive / Standard (100% capacity)"
-        echo " 4) Keep current setting"
-        read -rp "Select battery profile (1-4): " b_choice
+        local b_choice="2"
+        if [[ "$mode" != "noninteractive" ]]; then
+            echo " 1) Primarily AC Use (PrimAcUse) - Best for preserving degraded/AC-connected battery"
+            echo " 2) Custom (50% Start, 90% Stop Threshold) - Dell BIOS NVRAM & Sysfs"
+            echo " 3) Adaptive / Standard (100% capacity)"
+            echo " 4) Keep current setting"
+            read -rp "Select battery profile (1-4): " b_choice
+        else
+            log_info "Applying default Custom battery longevity profile (50% Start, 90% Stop)..."
+        fi
 
         case "$b_choice" in
             1)
@@ -2357,12 +2364,7 @@ configure_dell_hardware() {
                 [[ -n "$end_thresh" ]] && echo "90" > "$end_thresh" 2>/dev/null || true
 
                 # Persist threshold across cold boots via systemd tmpfiles
-                mkdir -p /etc/tmpfiles.d
-                cat << EOF > /etc/tmpfiles.d/battery-threshold.conf
-w /sys/class/power_supply/${bat_name}/charge_control_start_threshold - - - - 50
-w /sys/class/power_supply/${bat_name}/charge_control_end_threshold - - - - 90
-EOF
-                systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
+                persist_battery_threshold "$bat_name"
                 log_ok "Battery charge threshold configured: 50% start, 90% stop (Dell BIOS NVRAM & sysfs)."
                 ;;
             3)
@@ -2375,12 +2377,7 @@ EOF
     elif [[ -n "$start_thresh" && -n "$end_thresh" ]]; then
         echo "50" > "$start_thresh" 2>/dev/null || true
         echo "90" > "$end_thresh" 2>/dev/null || true
-        mkdir -p /etc/tmpfiles.d
-        cat << EOF > /etc/tmpfiles.d/battery-threshold.conf
-w /sys/class/power_supply/${bat_name}/charge_control_start_threshold - - - - 50
-w /sys/class/power_supply/${bat_name}/charge_control_end_threshold - - - - 90
-EOF
-        systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
+        persist_battery_threshold "$bat_name"
         log_ok "Battery sysfs threshold configured to 50%-90%."
     else
         log_warn "Dell WMI firmware attributes not exposed on this hardware."
@@ -2403,6 +2400,7 @@ EOF
 }
 
 update_dell_firmware() {
+    local mode="${1:-interactive}"
     echo ""
     log_info "=== DELL UEFI BIOS & HARDWARE FIRMWARE UPDATE ==="
 
@@ -2422,6 +2420,10 @@ update_dell_firmware() {
     if [[ "$on_battery" == "true" ]]; then
         log_warn "AC Adapter is currently NOT plugged in!"
         echo -e "${YELLOW}Flashing UEFI BIOS or device firmware requires external AC power to prevent power loss.${NC}"
+        if [[ "$mode" == "noninteractive" ]]; then
+            log_warn "Skipping firmware flash check in unattended mode while on battery power."
+            return 0
+        fi
         read -rp "Please plug in your AC charger, then press [Enter] to continue (or 'q' to cancel): " p_ans
         [[ "$p_ans" =~ ^[Qq]$ ]] && return
     fi
@@ -2443,7 +2445,10 @@ update_dell_firmware() {
         echo "$updates_out" | grep -E "New version|Release ID|Summary|Urgency|Vendor" || echo "$updates_out"
         echo -e "${CYAN}========================================================================${NC}"
         echo ""
-        read -rp "Do you want to stage and prepare these firmware updates now? (y/N): " fw_confirm
+        local fw_confirm="y"
+        if [[ "$mode" != "noninteractive" ]]; then
+            read -rp "Do you want to stage and prepare these firmware updates now? (y/N): " fw_confirm
+        fi
         if [[ "$fw_confirm" =~ ^[Yy]$ ]]; then
             log_info "Downloading and staging firmware capsule..."
             fwupdmgr update -y
@@ -2456,6 +2461,11 @@ update_dell_firmware() {
 }
 
 maintain_btrfs_storage() {
+    local force="${1:-false}"
+    if [[ "$SESSION_BTRFS_MAINTAINED" == "true" && "$force" != "force" ]]; then
+        log_info "Btrfs health & SSD TRIM pass already completed in this session."
+        return 0
+    fi
     echo ""
     log_info "=== BTRFS HEALTH & SSD STORAGE MAINTENANCE ==="
     for mp in "/" "/mnt/my-data"; do
@@ -2482,7 +2492,13 @@ maintain_btrfs_storage() {
         log_ok "SSD TRIM completed successfully:\n$trim_res"
     else
         log_warn "SSD TRIM encountered issues:\n$trim_res"
+        if echo "$trim_res" | grep -qi "FITRIM ioctl failed"; then
+            log_warn "Btrfs free space cache discrepancy detected on data partition."
+            log_info "Refreshing Btrfs free space tree on /mnt/my-data..."
+            btrfs balance start -dusage=0 /mnt/my-data 2>/dev/null || true
+        fi
     fi
+    SESSION_BTRFS_MAINTAINED=true
 }
 
 _GOODIX_DETECTED=""
@@ -2704,6 +2720,10 @@ manage_fingerprints_menu() {
 
 configure_goodix_fingerprint() {
     local mode="${1:-interactive}"
+    if [[ "$mode" == "noninteractive" && "$SESSION_GOODIX_CONFIGURED" == "true" ]]; then
+        log_info "Goodix fingerprint service already verified in this session."
+        return 0
+    fi
     echo ""
     log_info "=== GOODIX FINGERPRINT SENSOR (27c6:538d) SETUP ==="
 
@@ -2864,6 +2884,7 @@ EOF
     udevadm control --reload-rules && udevadm trigger 2>/dev/null || true
     systemctl daemon-reload
     systemctl restart fprintd.service 2>/dev/null || true
+    SESSION_GOODIX_CONFIGURED=true
     log_ok "Fingerprint daemon service (fprintd) reloaded and active."
 
     # Interactive enrollment & multi-fingerprint management
@@ -2973,8 +2994,8 @@ menu_desktop_settings() {
                 maintain_btrfs_storage
                 configure_grub_dual_boot
                 configure_goodix_fingerprint noninteractive
-                configure_dell_hardware
-                update_dell_firmware
+                configure_dell_hardware noninteractive
+                update_dell_firmware noninteractive
                 log_ok "All settings and hardware tuning routines completed."
                 read -rp "Press [Enter] to continue..."
                 ;;
@@ -2985,32 +3006,116 @@ menu_desktop_settings() {
 }
 
 # ------------------------------------------------------------------------------
-# 7. MAIN MENU
+# 7. UNATTENDED FULL RUN (STAGES 1 -> 2 -> 3)
 # ------------------------------------------------------------------------------
+run_all_stages() {
+    local mode="${1:-interactive}"
+    echo ""
+    log_info "========================================================================"
+    log_info "         STARTING UNATTENDED FULL RUN (STAGES 1 -> 2 -> 3)              "
+    log_info "========================================================================"
+
+    log_info ">>> [STAGE 1/3] CORE SYSTEM OPTIMIZATION (Mirrors, Repo/AUR Upgrade, Kernel, ZRAM & Sysctl)..."
+    optimize_system noninteractive
+
+    log_info ">>> [STAGE 2/3] APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS..."
+    configure_hot_corner disable
+    configure_desktop_icons enable
+    configure_eye_comfort_display enable
+    configure_dock_favorites
+    configure_permanent_partitions
+    maintain_btrfs_storage
+    configure_grub_dual_boot
+    configure_goodix_fingerprint noninteractive
+    configure_dell_hardware noninteractive
+    update_dell_firmware noninteractive
+    log_ok "Desktop, storage and hardware settings applied."
+
+    log_info ">>> [STAGE 3/3] INSTALLING ALL 15 APPLICATIONS (DEV/AI, CONTAINERS, PRODUCTIVITY, MEDIA)..."
+    install_all_apps
+    log_ok "All applications installed and verified."
+
+    echo ""
+    log_info "========================================================================"
+    log_ok "🎉 ALL 3 STAGES (OPTIMIZE, SETTINGS & EXTRA APPS) COMPLETED SUCCESSFULLY!"
+    log_info "========================================================================"
+    if [[ "$mode" != "noninteractive" ]]; then
+        read -rp "Press [Enter] to return to the main menu..."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 8. DIRECT CLI EXECUTION & INTERACTIVE MAIN MENU
+# ------------------------------------------------------------------------------
+case "${1:-}" in
+    -a|--all|all|A)
+        run_all_stages noninteractive
+        exit 0
+        ;;
+    -1|--optimize)
+        optimize_system noninteractive
+        exit 0
+        ;;
+    -2|--settings)
+        configure_hot_corner disable
+        configure_desktop_icons enable
+        configure_eye_comfort_display enable
+        configure_dock_favorites
+        configure_permanent_partitions
+        maintain_btrfs_storage
+        configure_grub_dual_boot
+        configure_goodix_fingerprint noninteractive
+        configure_dell_hardware noninteractive
+        update_dell_firmware noninteractive
+        exit 0
+        ;;
+    -3|--apps)
+        install_all_apps
+        exit 0
+        ;;
+    -h|--help)
+        echo -e "${BOLD}Manjaro Optimization & Control Center${NC}"
+        echo "Usage: sudo ./Manjaro-Optimization.sh [OPTION]"
+        echo ""
+        echo "Options:"
+        echo "  -a, --all        Run all 3 stages unattended (Optimize -> Settings -> 15 Apps)"
+        echo "  -1, --optimize   Run Stage 1: Core System Optimization & Upgrade"
+        echo "  -2, --settings   Run Stage 2: Desktop UI, Partitions & Dell Hardware"
+        echo "  -3, --apps       Run Stage 3: Install all 15 Extra Applications"
+        echo "  -h, --help       Show this help message"
+        echo ""
+        echo "Run without options to launch the interactive Control Center menu."
+        exit 0
+        ;;
+esac
+
 while true; do
     echo ""
     echo -e "${BOLD}========================================================================${NC}"
     echo -e "${BOLD}                     MANJARO CONTROL CENTER                             ${NC}"
     echo -e "${BOLD}========================================================================${NC}"
-    echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, SSD TRIM)"
+    echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, ZRAM, Sysctl)"
     echo -e " ${BOLD}2)${NC} Desktop UI, Storage & Hardware Settings"
     echo -e " ${BOLD}3)${NC} Extra Apps (Install, Reinstall & Uninstall Hub)"
     echo -e " ${BOLD}4)${NC} Quit"
     echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+    echo -e " ${BOLD}A)${NC} Run ALL (Stage 1 Optimize -> Stage 2 All Settings -> Stage 3 All 15 Apps)"
+    echo -e "${BOLD}------------------------------------------------------------------------${NC}"
     echo -e " 📋 Live log file: ${CYAN}$LOG_FILE${NC}"
     echo -e "${BOLD}========================================================================${NC}"
-    read -rp "Please enter your choice (1-4): " main_choice
+    read -rp "Please enter your choice (1-4 / A): " main_choice
 
     case "$main_choice" in
         1) optimize_system ;;
         2) menu_desktop_settings ;;
         3) menu_extra_apps ;;
+        [aA]) run_all_stages ;;
         4)
             log_ok "Exiting. Session completed successfully!"
             break
             ;;
         *)
-            log_warn "Invalid option. Please enter a number from 1 to 4."
+            log_warn "Invalid option. Please enter a number from 1 to 4, or A."
             ;;
     esac
 done
