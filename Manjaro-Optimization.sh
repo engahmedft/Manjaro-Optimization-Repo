@@ -428,7 +428,8 @@ init_downloads() {
     # Fast guard: if aria2c exists and makepkg/pacman configurations are already tuned, skip redundant writes
     if command -v aria2c &>/dev/null && \
        grep -q "aria2c" /etc/makepkg.conf 2>/dev/null && \
-       grep -q "^ParallelDownloads = 5" /etc/pacman.conf 2>/dev/null; then
+       grep -q "^ParallelDownloads = 5" /etc/pacman.conf 2>/dev/null && \
+       grep -q "^DisableDownloadTimeout" /etc/pacman.conf 2>/dev/null; then
         return 0
     fi
 
@@ -451,6 +452,9 @@ init_downloads() {
     done
 
     sed -i 's/^#*ParallelDownloads = .*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
+    if ! grep -q "^DisableDownloadTimeout" /etc/pacman.conf 2>/dev/null; then
+        sed -i '/^\[options\]/a DisableDownloadTimeout' /etc/pacman.conf 2>/dev/null || true
+    fi
 }
 init_downloads
 
@@ -763,6 +767,9 @@ optimize_system() {
     fi
     localectl set-locale LANG=en_US.UTF-8 LC_TIME=en_US.UTF-8 LC_NUMERIC=en_US.UTF-8 LC_MONETARY=en_US.UTF-8 LC_MEASUREMENT=en_US.UTF-8 > /dev/null 2>&1 || true
     localectl set-keymap us > /dev/null 2>&1 || true
+    if ! grep -q "^FONT=" /etc/vconsole.conf 2>/dev/null; then
+        echo 'FONT=eurlatgr' >> /etc/vconsole.conf
+    fi
     run_as_user gsettings set org.gnome.system.locale region 'en_US.UTF-8' 2>/dev/null || true
     if [[ $(timedatectl show --property=LocalRTC --value 2>/dev/null) != "yes" ]]; then
         timedatectl set-local-rtc 1 --adjust-system-clock 2>/dev/null || true
@@ -900,7 +907,14 @@ install_vscode_extensions() {
 
     for ext in "${vscode_extensions[@]}"; do
         log_info "Syncing VS Code extension: ${CYAN}${ext}${NC}..."
-        sudo -u "$REAL_USER" code --install-extension "$ext" --force || true
+        local ok=false
+        for attempt in 1 2; do
+            if sudo -u "$REAL_USER" code --install-extension "$ext" --force 2>&1 | grep -vE "Warning: '(ozone-platform-hint|enable-features)'" ; then
+                ok=true
+                break
+            fi
+            sleep 1
+        done
     done
 
     # Ensure JetBrains Mono and Inter fonts are installed
@@ -1104,6 +1118,9 @@ install_antigravity_standalone() {
         log_warn "AUR package build had an issue. Falling back to official installer..."
         sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
     }
+    if [[ -x "$USER_HOME/.local/bin/agy" && ! -L /usr/local/bin/agy ]]; then
+        ln -sf "$USER_HOME/.local/bin/agy" /usr/local/bin/agy 2>/dev/null || true
+    fi
 
     # Initialize Antigravity 2 anti-glare charcoal theme
     configure_antigravity2_theme
@@ -1405,10 +1422,12 @@ install_dev_runtimes() {
     local mode="${1:-install}"
     ensure_session_snapshot "Before Installing Developer Suite"
     log_info "Installing Modern Developer Suite (.NET LTS, Node LTS & Google Clasp)..."
-    SKIP_POST_HOOK=1 install_dotnet "$mode"
-    SKIP_POST_HOOK=1 install_nvm_node "$mode"
-    SKIP_POST_HOOK=1 install_clasp "$mode"
+    local SKIP_POST_HOOK=1
+    install_dotnet "$mode"
+    install_nvm_node "$mode"
+    install_clasp "$mode"
     configure_git_identity
+    unset SKIP_POST_HOOK
     log_ok "Modern Developer Suite (.NET LTS, Node LTS & Google Clasp) fully installed."
     post_install_hook
 }
@@ -1417,13 +1436,30 @@ install_all_apps() {
     echo ""
     log_info "=== STARTING GROUPED INSTALLATION OF ALL APPS (ALL CATEGORIES) ==="
     ensure_session_snapshot "Before Installing All Applications"
+    local SKIP_POST_HOOK=1
 
     log_info "1/4. Installing all official repository applications in a single pass..."
-    pacman -S --needed --noconfirm \
-        podman podman-compose podman-docker fuse-overlayfs \
-        qemu-desktop virt-manager virt-viewer dnsmasq vde2 iptables-nft libguestfs \
-        libreoffice-fresh \
+    local official_pkgs=(
+        podman podman-compose podman-docker fuse-overlayfs
+        qemu-desktop virt-manager virt-viewer dnsmasq vde2 iptables-nft libguestfs
+        libreoffice-fresh
         vlc celluloid gimp kdenlive
+    )
+    local retries=3
+    local installed_all=false
+    while [[ $retries -gt 0 ]]; do
+        if pacman -S --needed --noconfirm "${official_pkgs[@]}"; then
+            installed_all=true
+            break
+        fi
+        log_warn "Official package download interrupted. Re-ranking top mirrors and retrying ($retries attempts left)..."
+        pacman-mirrors -f 5 2>/dev/null || true
+        ((retries--))
+        sleep 2
+    done
+    if [[ "$installed_all" != "true" ]]; then
+        log_error "Some official packages could not be installed after multiple attempts."
+    fi
 
     if ! grep -q "^${REAL_USER}:" /etc/subuid 2>/dev/null; then
         usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$REAL_USER" || true
@@ -1469,10 +1505,14 @@ install_all_apps() {
     if ! is_bin_installed agy; then
         sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
     fi
+    if [[ -x "$USER_HOME/.local/bin/agy" && ! -L /usr/local/bin/agy ]]; then
+        ln -sf "$USER_HOME/.local/bin/agy" /usr/local/bin/agy 2>/dev/null || true
+    fi
 
     log_info "4/4. Installing Modern Developer Suite (.NET LTS, Node LTS & Google Clasp)..."
     install_dev_runtimes
 
+    unset SKIP_POST_HOOK
     post_install_hook
     log_ok "All applications across all 4 categories installed and configured successfully!"
 }
