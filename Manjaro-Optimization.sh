@@ -37,9 +37,12 @@ run_as_user() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/Manjaro-Optimization.log"
 
-# Rotate log file if it exceeds 5MB to keep it performant
-if [[ -f "$LOG_FILE" ]] && [[ $(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0) -gt 5000000 ]]; then
-    mv "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
+# Rotate and trim log file if it exceeds 5MB to keep it performant
+if [[ -f "$LOG_FILE" ]]; then
+    _log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    if (( _log_size > 5242880 )); then
+        tail -c 1048576 "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null && mv -f "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null || true
+    fi
 fi
 
 touch "$LOG_FILE" 2>/dev/null || true
@@ -95,14 +98,41 @@ check_pacman_lock() {
     return 0
 }
 
+declare -A _INSTALLED_PKGS_CACHE=()
+_INSTALLED_PKGS_CACHE_INITIALIZED=false
+
+refresh_pkg_cache() {
+    _INSTALLED_PKGS_CACHE=()
+    local pkg
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && _INSTALLED_PKGS_CACHE["$pkg"]=1
+    done < <(pacman -Qq 2>/dev/null)
+    _INSTALLED_PKGS_CACHE_INITIALIZED=true
+}
+
+invalidate_pkg_cache() {
+    _INSTALLED_PKGS_CACHE_INITIALIZED=false
+}
+
 is_pkg_installed() {
-    pacman -Q "$1" &>/dev/null
+    if [[ "$_INSTALLED_PKGS_CACHE_INITIALIZED" != "true" ]]; then
+        refresh_pkg_cache
+    fi
+    [[ -n "${_INSTALLED_PKGS_CACHE["$1"]:-}" ]]
 }
 
 is_bin_installed() { 
-    command -v "$1" &>/dev/null || \
     [[ -x "$USER_HOME/.local/bin/$1" ]] || \
+    command -v "$1" &>/dev/null || \
     [[ -x "/usr/bin/$1" ]] || [[ -x "/usr/local/bin/$1" ]]
+}
+
+is_node_installed() {
+    is_bin_installed node || { is_pkg_installed nvm && [[ -d "$USER_HOME/.nvm/versions/node" ]] && compgen -G "$USER_HOME/.nvm/versions/node/*" >/dev/null; }
+}
+
+is_clasp_installed() {
+    is_bin_installed clasp
 }
 
 sync_grub_snapshots() {
@@ -369,6 +399,13 @@ configure_grub_dual_boot() {
 }
 
 init_downloads() {
+    # Fast guard: if aria2c exists and makepkg/pacman configurations are already tuned, skip redundant writes
+    if command -v aria2c &>/dev/null && \
+       grep -q "aria2c" /etc/makepkg.conf 2>/dev/null && \
+       grep -q "^ParallelDownloads = 5" /etc/pacman.conf 2>/dev/null; then
+        return 0
+    fi
+
     if ! command -v aria2c &> /dev/null; then
         pacman -S --needed --noconfirm aria2 || true
     fi
@@ -409,6 +446,7 @@ safe_pacman_remove() {
                 fi
             done
         fi
+        refresh_pkg_cache
     else
         log_info "None of the specified packages are currently installed."
     fi
@@ -437,6 +475,7 @@ EOF
     # Synchronize GNOME desktop applications database immediately
     update-desktop-database /usr/share/applications 2>/dev/null || true
     update-desktop-database "$USER_HOME/.local/share/applications" 2>/dev/null || true
+    refresh_pkg_cache
     log_ok "PATH and application launcher shortcuts synchronized."
 }
 
@@ -453,13 +492,14 @@ post_uninstall_hook() {
     # Refresh desktop database to remove stale application launcher icons immediately
     update-desktop-database /usr/share/applications 2>/dev/null || true
     update-desktop-database "$USER_HOME/.local/share/applications" 2>/dev/null || true
+    refresh_pkg_cache
     log_ok "Orphaned packages, desktop icons, and unused runtimes cleared."
 }
 
 get_desktop_icons_status() {
     local enabled_exts
     enabled_exts=$(run_as_user gnome-extensions list --enabled 2>/dev/null)
-    if echo "$enabled_exts" | grep -qE "^(gtk4-ding@smedius\.gitlab\.com|ding@rastersoft\.com)$"; then
+    if [[ "$enabled_exts" =~ (gtk4-ding@smedius\.gitlab\.com|ding@rastersoft\.com) ]]; then
         echo "enabled"
     else
         echo "disabled"
@@ -590,13 +630,13 @@ optimize_system() {
     # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, RustDesk)
     # Pass SKIP_AUTOSNAP=1 to prevent duplicate ALPM hook snapshot right after step 1
     sudo -u "$REAL_USER" env SKIP_AUTOSNAP=1 pamac update --no-confirm --aur
+    refresh_pkg_cache
 
     log_info "4/13: Checking Linux Kernel Lifecycle & Stability..."
     local running_ver
     running_ver=$(uname -r)
     local k_major k_minor
-    k_major=$(echo "$running_ver" | cut -d. -f1)
-    k_minor=$(echo "$running_ver" | cut -d. -f2)
+    IFS=. read -r k_major k_minor _ <<< "$running_ver"
     log_info "Active kernel: $running_ver"
 
     # Check installed kernels and ensure an LTS safety branch (like linux612 or linux66) is available
@@ -946,16 +986,68 @@ install_office() {
     post_install_hook
 }
 
+install_vlc() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed vlc; then
+        log_ok "VLC Media Player is already installed."
+        return 0
+    fi
+    ensure_session_snapshot "Before Installing VLC Media Player"
+    log_info "Installing VLC Media Player..."
+    pacman -S --needed --noconfirm vlc
+    log_ok "VLC Media Player installed."
+    post_install_hook
+}
+
+install_celluloid() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed celluloid; then
+        log_ok "Celluloid Video Player is already installed."
+        return 0
+    fi
+    ensure_session_snapshot "Before Installing Celluloid Video Player"
+    log_info "Installing Celluloid Video Player..."
+    pacman -S --needed --noconfirm celluloid
+    log_ok "Celluloid Video Player installed."
+    post_install_hook
+}
+
+install_gimp() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed gimp; then
+        log_ok "GIMP Image Editor is already installed."
+        return 0
+    fi
+    ensure_session_snapshot "Before Installing GIMP Image Editor"
+    log_info "Installing GIMP Image Editor..."
+    pacman -S --needed --noconfirm gimp
+    log_ok "GIMP Image Editor installed."
+    post_install_hook
+}
+
+install_kdenlive() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed kdenlive; then
+        log_ok "Kdenlive Video Editor is already installed."
+        return 0
+    fi
+    ensure_session_snapshot "Before Installing Kdenlive Video Editor"
+    log_info "Installing Kdenlive Video Editor..."
+    pacman -S --needed --noconfirm kdenlive
+    log_ok "Kdenlive Video Editor installed."
+    post_install_hook
+}
+
 install_media() {
     local mode="${1:-install}"
-    if [[ "$mode" != "reinstall" ]] && is_pkg_installed gimp && is_pkg_installed vlc; then
-        log_ok "Multimedia Suite is already installed. Skipping package installation."
+    if [[ "$mode" != "reinstall" ]] && is_pkg_installed vlc && is_pkg_installed celluloid && is_pkg_installed gimp && is_pkg_installed kdenlive; then
+        log_ok "All Multimedia & Graphics applications are already installed."
         return 0
     fi
     ensure_session_snapshot "Before Installing Multimedia Suite"
-    log_info "Installing Essential Multimedia Suite..."
+    log_info "Installing Essential Multimedia Suite (VLC, Celluloid, GIMP, Kdenlive)..."
     pacman -S --needed --noconfirm vlc celluloid gimp kdenlive
-    log_ok "Multimedia suite installed."
+    log_ok "All Multimedia & Graphics applications installed."
     post_install_hook
 }
 
@@ -998,14 +1090,19 @@ EOF
     post_install_hook
 }
 
+_CACHED_DOTNET_LTS=""
 get_dotnet_latest_lts() {
+    if [[ -n "$_CACHED_DOTNET_LTS" ]]; then
+        echo "$_CACHED_DOTNET_LTS"
+        return 0
+    fi
     local lts_ver=""
     # 1. Query Microsoft official release API for active LTS channel version
     if command -v python3 &>/dev/null; then
         lts_ver=$(python3 -c '
 import sys, json, urllib.request
 try:
-    with urllib.request.urlopen("https://dotnetcli.azureedge.net/dotnet/release-metadata/releases-index.json", timeout=4) as response:
+    with urllib.request.urlopen("https://dotnetcli.azureedge.net/dotnet/release-metadata/releases-index.json", timeout=3) as response:
         data = json.loads(response.read().decode())
     active = [r["channel-version"] for r in data.get("releases-index", []) if r.get("release-type") == "lts" and r.get("support-phase") == "active"]
     if active:
@@ -1025,20 +1122,54 @@ except Exception:
 
     # 3. Default fallback
     [[ -z "$lts_ver" ]] && lts_ver="10.0"
+    _CACHED_DOTNET_LTS="$lts_ver"
     echo "$lts_ver"
 }
 
-install_dev_runtimes() {
+install_dotnet() {
     local mode="${1:-install}"
-    local is_installed=false
-    (is_bin_installed dotnet && is_pkg_installed nvm) && is_installed=true
-
-    if [[ "$mode" != "reinstall" && "$is_installed" == "true" ]]; then
-        log_ok "Modern Developer Runtimes (.NET & NVM/Node) already installed."
+    if [[ "$mode" != "reinstall" ]] && is_bin_installed dotnet; then
+        log_ok ".NET Core SDK & ASP.NET Runtime already installed."
         return 0
     fi
 
-    ensure_session_snapshot "Before Installing Developer Runtimes"
+    ensure_session_snapshot "Before Installing .NET Core SDK"
+    local lts_ver
+    lts_ver=$(get_dotnet_latest_lts)
+    log_info "Resolved latest .NET Core LTS release channel: v${lts_ver}"
+
+    if pacman -Si "dotnet-sdk-${lts_ver}" &>/dev/null; then
+        log_info "Installing .NET Core SDK & ASP.NET Runtime v${lts_ver}..."
+        pacman -S --needed --noconfirm "dotnet-sdk-${lts_ver}" "aspnet-runtime-${lts_ver}" "dotnet-targeting-pack-${lts_ver}" || true
+    elif pacman -Si dotnet-sdk &>/dev/null; then
+        log_info "Installing .NET Core SDK metapackage..."
+        pacman -S --needed --noconfirm dotnet-sdk aspnet-runtime || true
+    fi
+
+    # Configure system-wide .NET environment
+    cat << 'EOF' > /etc/profile.d/dotnet.sh
+# .NET Core Environment Configuration
+export DOTNET_ROOT=/usr/share/dotnet
+export PATH="$PATH:$DOTNET_ROOT:$HOME/.dotnet/tools"
+export DOTNET_CLI_TELEMETRY_OPTOUT=1
+EOF
+    chmod 644 /etc/profile.d/dotnet.sh 2>/dev/null || true
+
+    log_ok ".NET Core SDK & ASP.NET Runtime (v${lts_ver} LTS) fully installed."
+    post_install_hook
+}
+
+install_nvm_node() {
+    local mode="${1:-install}"
+    local is_installed=false
+    is_node_installed && is_installed=true
+
+    if [[ "$mode" != "reinstall" && "$is_installed" == "true" ]]; then
+        log_ok "Node Version Manager (NVM) & Node.js LTS already installed."
+        return 0
+    fi
+
+    ensure_session_snapshot "Before Installing NVM & Node.js"
 
     # 1. Install & configure NVM
     log_info "Installing Node Version Manager (NVM)..."
@@ -1062,49 +1193,88 @@ EOF
     log_info "Dynamically fetching & installing latest Node.js LTS via NVM..."
     run_as_user bash -c '
         export NVM_DIR="$HOME/.nvm"
-        [ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh"
+        [ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh" 2>/dev/null
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null
         nvm install --lts
         nvm alias default "lts/*"
         nvm use default
         corepack enable 2>/dev/null || true
     '
-    log_ok "Node.js LTS configured with default alias & corepack."
+    log_ok "Node Version Manager (NVM) & Node.js LTS configured with default alias & corepack."
+    post_install_hook
+}
 
-    # 3. Dynamically resolve & install latest .NET Core LTS
-    local lts_ver
-    lts_ver=$(get_dotnet_latest_lts)
-    log_info "Resolved latest .NET Core LTS release channel: v${lts_ver}"
-
-    if pacman -Si "dotnet-sdk-${lts_ver}" &>/dev/null; then
-        log_info "Installing .NET Core SDK & ASP.NET Runtime v${lts_ver}..."
-        pacman -S --needed --noconfirm "dotnet-sdk-${lts_ver}" "aspnet-runtime-${lts_ver}" "dotnet-targeting-pack-${lts_ver}" || true
-    elif pacman -Si dotnet-sdk &>/dev/null; then
-        log_info "Installing .NET Core SDK metapackage..."
-        pacman -S --needed --noconfirm dotnet-sdk aspnet-runtime || true
+install_clasp() {
+    local mode="${1:-install}"
+    if [[ "$mode" != "reinstall" ]] && is_clasp_installed; then
+        log_ok "Google Clasp CLI (@google/clasp) is already installed."
+        return 0
     fi
 
-    # Configure system-wide .NET environment
-    cat << 'EOF' > /etc/profile.d/dotnet.sh
-# .NET Core Environment Configuration
-export DOTNET_ROOT=/usr/share/dotnet
-export PATH="$PATH:$DOTNET_ROOT:$HOME/.dotnet/tools"
-export DOTNET_CLI_TELEMETRY_OPTOUT=1
+    # Dependency check: Node.js & NVM
+    if ! is_node_installed; then
+        echo ""
+        log_warn "Google Clasp requires Node.js LTS via NVM."
+        read -rp "Would you like to automatically install Node.js LTS via NVM now? (Y/n): " dep_conf
+        if [[ "$dep_conf" =~ ^[Nn]$ ]]; then
+            log_warn "Google Clasp installation cancelled: Node.js LTS is required."
+            return 1
+        fi
+        install_nvm_node install
+    fi
+
+    ensure_session_snapshot "Before Installing Google Clasp"
+    log_info "Installing Google Clasp (@google/clasp) globally via npm in Node LTS..."
+
+    run_as_user bash -c '
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh" 2>/dev/null
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null
+        nvm use default >/dev/null 2>&1 || true
+        npm install -g @google/clasp
+    '
+
+    # Create robust launcher wrapper script in $USER_HOME/.local/bin/clasp
+    mkdir -p "$USER_HOME/.local/bin"
+    cat << 'EOF' > "$USER_HOME/.local/bin/clasp"
+#!/usr/bin/env bash
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+[ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh" 2>/dev/null
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null
+nvm use default >/dev/null 2>&1 || true
+NODE_BIN_DIR="$(nvm which default 2>/dev/null | sed 's#/node$##')"
+if [[ -x "$NODE_BIN_DIR/clasp" ]]; then
+    exec "$NODE_BIN_DIR/clasp" "$@"
+fi
+echo "Error: Google Clasp CLI is not found in the active Node.js environment ($NODE_BIN_DIR)." >&2
+echo "Please run 'npm install -g @google/clasp' or reinstall via Manjaro Optimization Hub." >&2
+exit 1
 EOF
-    chmod 644 /etc/profile.d/dotnet.sh 2>/dev/null || true
+    chmod 755 "$USER_HOME/.local/bin/clasp"
+    chown "$REAL_USER:" "$USER_HOME/.local/bin/clasp" 2>/dev/null || true
 
-    # Configure developer Git global identity
+    log_ok "Google Clasp CLI (@google/clasp) installed and linked to ~/.local/bin/clasp."
+    post_install_hook
+}
+
+install_dev_runtimes() {
+    local mode="${1:-install}"
+    ensure_session_snapshot "Before Installing Developer Suite"
+    log_info "Installing Modern Developer Suite (.NET LTS, Node LTS & Google Clasp)..."
+    install_dotnet "$mode"
+    install_nvm_node "$mode"
+    install_clasp "$mode"
     configure_git_identity
-
-    log_ok "Modern Developer Runtimes (.NET LTS v${lts_ver} & Node.js LTS) fully installed."
+    log_ok "Modern Developer Suite (.NET LTS, Node LTS & Google Clasp) fully installed."
     post_install_hook
 }
 
 install_all_apps() {
     echo ""
-    log_info "=== STARTING GROUPED INSTALLATION OF ALL APPS ==="
+    log_info "=== STARTING GROUPED INSTALLATION OF ALL APPS (ALL CATEGORIES) ==="
     ensure_session_snapshot "Before Installing All Applications"
 
-    log_info "1/3. Installing all official repository applications in a single pass..."
+    log_info "1/4. Installing all official repository applications in a single pass..."
     pacman -S --needed --noconfirm \
         podman podman-compose podman-docker fuse-overlayfs \
         qemu-desktop virt-manager virt-viewer dnsmasq vde2 iptables-nft libguestfs \
@@ -1121,7 +1291,7 @@ install_all_apps() {
     virsh net-start default > /dev/null 2>&1 || true
     echo "options kvm_intel nested=1" > /etc/modprobe.d/kvm-intel.conf
 
-    log_info "2/3. Checking and building required AUR packages..."
+    log_info "2/4. Checking and building required AUR packages..."
     pamac enable-aur > /dev/null 2>&1 || true
     local aur_pkgs=(visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin)
     local aur_to_build=()
@@ -1180,16 +1350,16 @@ EOF
     systemctl daemon-reload
     systemctl enable --now rustdesk.service 2>/dev/null || true
 
-    log_info "3/3. Verifying Antigravity CLI..."
+    log_info "3/4. Verifying Antigravity CLI..."
     if ! is_bin_installed agy; then
         sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
     fi
 
-    log_info "Installing Modern Developer Runtimes (.NET LTS & Node.js LTS)..."
+    log_info "4/4. Installing Modern Developer Suite (.NET LTS, Node LTS & Google Clasp)..."
     install_dev_runtimes
 
     post_install_hook
-    log_ok "All applications installed and configured successfully!"
+    log_ok "All applications across all 4 categories installed and configured successfully!"
 }
 
 # ------------------------------------------------------------------------------
@@ -1250,11 +1420,43 @@ uninstall_office() {
     post_uninstall_hook
 }
 
+uninstall_vlc() {
+    ensure_session_snapshot "Before Uninstalling VLC"
+    log_warn "Removing VLC Media Player..."
+    safe_pacman_remove vlc
+    rm -rf "$USER_HOME/.config/vlc" 2>/dev/null || true
+    post_uninstall_hook
+}
+
+uninstall_celluloid() {
+    ensure_session_snapshot "Before Uninstalling Celluloid"
+    log_warn "Removing Celluloid Video Player..."
+    safe_pacman_remove celluloid
+    rm -rf "$USER_HOME/.config/io.github.celluloid_player.Celluloid" 2>/dev/null || true
+    post_uninstall_hook
+}
+
+uninstall_gimp() {
+    ensure_session_snapshot "Before Uninstalling GIMP"
+    log_warn "Removing GIMP Image Editor..."
+    safe_pacman_remove gimp
+    rm -rf "$USER_HOME/.config/GIMP" 2>/dev/null || true
+    post_uninstall_hook
+}
+
+uninstall_kdenlive() {
+    ensure_session_snapshot "Before Uninstalling Kdenlive"
+    log_warn "Removing Kdenlive Video Editor..."
+    safe_pacman_remove kdenlive
+    rm -rf "$USER_HOME/.config/kdenlive-appimage" "$USER_HOME/.local/share/kdenlive" 2>/dev/null || true
+    post_uninstall_hook
+}
+
 uninstall_media() {
     ensure_session_snapshot "Before Uninstalling Multimedia Suite"
-    log_warn "Removing Multimedia Suite..."
+    log_warn "Removing All Multimedia & Graphics Applications..."
     safe_pacman_remove vlc celluloid gimp kdenlive
-    rm -rf "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" 2>/dev/null || true
+    rm -rf "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" "$USER_HOME/.config/io.github.celluloid_player.Celluloid" "$USER_HOME/.local/share/kdenlive" 2>/dev/null || true
     post_uninstall_hook
 }
 
@@ -1270,11 +1472,9 @@ uninstall_rustdesk() {
     post_uninstall_hook
 }
 
-uninstall_dev_runtimes() {
-    ensure_session_snapshot "Before Uninstalling Developer Runtimes"
-    log_warn "Removing Developer Runtimes (.NET & NVM/Node)..."
-
-    # Remove .NET packages
+uninstall_dotnet() {
+    ensure_session_snapshot "Before Uninstalling .NET Core"
+    log_warn "Removing .NET Core SDK & ASP.NET Runtime..."
     local dotnet_pkgs
     dotnet_pkgs=$(pacman -Qq 2>/dev/null | grep -E '^dotnet-|^aspnet-|^netstandard-' || true)
     if [[ -n "$dotnet_pkgs" ]]; then
@@ -1282,12 +1482,47 @@ uninstall_dev_runtimes() {
     fi
     rm -f /etc/profile.d/dotnet.sh 2>/dev/null || true
     rm -rf "$USER_HOME/.dotnet" 2>/dev/null || true
+    log_ok ".NET Core SDK and runtimes removed."
+    post_uninstall_hook
+}
 
-    # Remove NVM and Node versions
+uninstall_clasp() {
+    ensure_session_snapshot "Before Uninstalling Google Clasp"
+    log_warn "Removing Google Clasp CLI (@google/clasp)..."
+
+    run_as_user bash -c '
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh" 2>/dev/null
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null
+        nvm use default >/dev/null 2>&1 || true
+        npm uninstall -g @google/clasp 2>/dev/null || true
+    ' 2>/dev/null || true
+
+    rm -f "$USER_HOME/.local/bin/clasp" 2>/dev/null || true
+    rm -f "$USER_HOME/.clasprc.json" "$USER_HOME/.clasp.json" 2>/dev/null || true
+
+    log_ok "Google Clasp CLI removed and credentials wiped."
+    post_uninstall_hook
+}
+
+uninstall_nvm_node() {
+    if is_clasp_installed; then
+        echo ""
+        log_warn "Google Clasp relies on Node.js/NVM and will also be removed."
+        read -rp "Proceed with removing Node.js/NVM and Google Clasp? (y/N): " nvm_rm_conf
+        if ! [[ "$nvm_rm_conf" =~ ^[Yy]$ ]]; then
+            log_info "Uninstallation of Node.js cancelled by user."
+            return 0
+        fi
+        uninstall_clasp
+    fi
+
+    ensure_session_snapshot "Before Uninstalling NVM & Node.js"
+    log_warn "Removing Node Version Manager (NVM) and Node runtimes..."
+
     safe_pacman_remove nvm
     rm -rf "$USER_HOME/.nvm" 2>/dev/null || true
 
-    # Clean shell config files
     for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
         if [[ -f "$shrc" ]]; then
             sed -i '/# Node Version Manager (NVM)/d' "$shrc" 2>/dev/null || true
@@ -1297,13 +1532,23 @@ uninstall_dev_runtimes() {
         fi
     done
 
-    log_ok "Developer Runtimes removed."
+    log_ok "Node Version Manager (NVM) & Node.js runtimes removed."
+    post_uninstall_hook
+}
+
+uninstall_dev_runtimes() {
+    ensure_session_snapshot "Before Uninstalling Developer Suite"
+    log_warn "Removing Developer Suite (.NET, Node & Google Clasp)..."
+    uninstall_clasp
+    uninstall_nvm_node
+    uninstall_dotnet
+    log_ok "All Developer Runtimes and Tools removed."
     post_uninstall_hook
 }
 
 uninstall_all_apps() {
     echo ""
-    log_info "=== STARTING GROUPED REMOVAL OF ALL APPS ==="
+    log_info "=== STARTING GROUPED REMOVAL OF ALL APPS (ALL CATEGORIES) ==="
     ensure_session_snapshot "Before Uninstalling All Applications"
 
     log_info "1/3. Disabling background virtualization, containers & streaming services..."
@@ -1331,7 +1576,7 @@ uninstall_all_apps() {
            "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" \
            "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" \
            "$USER_HOME/.config/libreoffice" \
-           "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" \
+           "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" "$USER_HOME/.config/io.github.celluloid_player.Celluloid" "$USER_HOME/.local/share/kdenlive" \
            "$USER_HOME/.config/rustdesk" \
            "$USER_HOME/.local/share/logs/RustDesk" \
            /etc/rustdesk \
@@ -1441,75 +1686,308 @@ manage_vscode_action() {
     fi
 }
 
-menu_extra_apps() {
+format_category_badge() {
+    local installed="$1"
+    local total="$2"
+    if (( installed == total )); then
+        echo -e "${GREEN}[All Installed (${installed}/${total})]${NC}"
+    elif (( installed == 0 )); then
+        echo -e "${RED}[None Installed (0/${total})]${NC}"
+    else
+        echo -e "${YELLOW}[${installed}/${total} Installed]${NC}"
+    fi
+}
+
+menu_dev_apps() {
     while true; do
-        local st_podman st_kvm st_vscode st_ag_ide st_ag_app st_chrome st_office st_media st_rustdesk st_dev_runtimes
-        local is_podman=false is_kvm=false is_vscode=false is_ag_ide=false is_ag_app=false
-        local is_chrome=false is_office=false is_media=false is_rustdesk=false is_dev_runtimes=false
-
-        is_bin_installed podman && is_podman=true
-        is_pkg_installed virt-manager && is_kvm=true
-        is_pkg_installed visual-studio-code-bin && is_vscode=true
+        local is_vscode=false is_ag_ide=false is_ag_app=false is_dotnet=false is_node=false is_clasp=false
+        { is_pkg_installed visual-studio-code-bin || is_bin_installed code; } && is_vscode=true
         is_pkg_installed antigravity-ide && is_ag_ide=true
-        (is_pkg_installed antigravity || is_bin_installed agy) && is_ag_app=true
-        is_pkg_installed google-chrome && is_chrome=true
-        is_pkg_installed libreoffice-fresh && is_office=true
-        (is_pkg_installed gimp || is_pkg_installed vlc) && is_media=true
-        (is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk) && is_rustdesk=true
-        (is_bin_installed dotnet && is_pkg_installed nvm) && is_dev_runtimes=true
+        { is_pkg_installed antigravity || is_bin_installed agy; } && is_ag_app=true
+        is_bin_installed dotnet && is_dotnet=true
+        is_node_installed && is_node=true
+        is_clasp_installed && is_clasp=true
 
-        st_podman=$([[ "$is_podman" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_kvm=$([[ "$is_kvm" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        local st_vscode st_ag_ide st_ag_app st_dotnet st_node st_clasp
         st_vscode=$([[ "$is_vscode" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_ag_ide=$([[ "$is_ag_ide" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_ag_app=$([[ "$is_ag_app" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_dotnet=$([[ "$is_dotnet" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_node=$([[ "$is_node" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_clasp=$([[ "$is_clasp" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+
+        echo ""
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e "${BOLD}                     DEVELOPMENT & AI TOOLS                             ${NC}"
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e " 1) VS Code + Extension Suite        $st_vscode ${CYAN}[OFFICIAL + 18 DEV EXTENSIONS]${NC}"
+        echo -e " 2) Antigravity IDE                  $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
+        echo -e " 3) Antigravity 2.0 Platform         $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
+        echo -e " 4) .NET Core SDK & ASP.NET (LTS)    $st_dotnet ${CYAN}[DYNAMIC LTS: v10.0]${NC}"
+        echo -e " 5) Node Version Manager (NVM/Node)  $st_node ${CYAN}[DYNAMIC LTS + COREPACK]${NC}"
+        echo -e " 6) Google Clasp CLI (@google/clasp) $st_clasp ${CYAN}[APPS SCRIPT CLI]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " A) Install ALL Development & AI Tools"
+        echo -e " U) Uninstall ALL Development & AI Tools"
+        echo -e " B) Back to Extra Applications Hub"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Select a tool (1-6) or action (A / U / B): " choice
+
+        case "$choice" in
+            1) manage_vscode_action "$is_vscode" ;;
+            2) manage_app_action "Antigravity IDE" "$is_ag_ide" install_antigravity_ide uninstall_antigravity_ide ;;
+            3) manage_app_action "Antigravity 2.0 Platform" "$is_ag_app" install_antigravity_standalone uninstall_antigravity_standalone ;;
+            4) manage_app_action ".NET Core SDK & ASP.NET Runtime" "$is_dotnet" install_dotnet uninstall_dotnet ;;
+            5) manage_app_action "Node Version Manager (NVM) & Node LTS" "$is_node" install_nvm_node uninstall_nvm_node ;;
+            6) manage_app_action "Google Clasp CLI (@google/clasp)" "$is_clasp" install_clasp uninstall_clasp ;;
+            [aA])
+                read -rp "Install ALL Development & AI Tools now? (y/N): " a_conf
+                if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    install_vscode install
+                    install_antigravity_ide install
+                    install_antigravity_standalone install
+                    install_dotnet install
+                    install_nvm_node install
+                    install_clasp install
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [uU])
+                read -rp "Are you sure you want to uninstall ALL Development & AI Tools? (y/N): " u_conf
+                if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    uninstall_vscode
+                    uninstall_antigravity_ide
+                    uninstall_antigravity_standalone
+                    uninstall_dev_runtimes
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [bB]) break ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_virt_containers() {
+    while true; do
+        local is_podman=false is_kvm=false
+        is_bin_installed podman && is_podman=true
+        is_pkg_installed virt-manager && is_kvm=true
+
+        local st_podman st_kvm
+        st_podman=$([[ "$is_podman" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_kvm=$([[ "$is_kvm" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+
+        echo ""
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e "${BOLD}                   VIRTUALIZATION & CONTAINERS                          ${NC}"
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e " 1) Podman Engine & Compose          $st_podman ${CYAN}[OFFICIAL ROOTLESS]${NC}"
+        echo -e " 2) KVM / QEMU Virt-Manager          $st_kvm ${CYAN}[OFFICIAL KERNEL VM]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " A) Install ALL Virtualization & Containers"
+        echo -e " U) Uninstall ALL Virtualization & Containers"
+        echo -e " B) Back to Extra Applications Hub"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Select an application (1-2) or action (A / U / B): " choice
+
+        case "$choice" in
+            1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
+            2) manage_app_action "KVM / QEMU Virt-Manager" "$is_kvm" install_kvm uninstall_kvm ;;
+            [aA])
+                read -rp "Install ALL Virtualization & Container platforms now? (y/N): " a_conf
+                if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    install_podman install
+                    install_kvm install
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [uU])
+                read -rp "Are you sure you want to uninstall ALL Virtualization & Container platforms? (y/N): " u_conf
+                if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    uninstall_podman
+                    uninstall_kvm
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [bB]) break ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_productivity_apps() {
+    while true; do
+        local is_chrome=false is_office=false is_rustdesk=false
+        is_pkg_installed google-chrome && is_chrome=true
+        is_pkg_installed libreoffice-fresh && is_office=true
+        { is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk; } && is_rustdesk=true
+
+        local st_chrome st_office st_rustdesk
         st_chrome=$([[ "$is_chrome" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_office=$([[ "$is_office" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_media=$([[ "$is_media" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
         st_rustdesk=$([[ "$is_rustdesk" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
-        st_dev_runtimes=$([[ "$is_dev_runtimes" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+
+        echo ""
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e "${BOLD}                   PRODUCTIVITY & REMOTE ACCESS                         ${NC}"
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e " 1) Google Chrome Browser            $st_chrome ${CYAN}[OFFICIAL WAYLAND / VA-API]${NC}"
+        echo -e " 2) LibreOffice Fresh Suite          $st_office ${CYAN}[OFFICIAL]${NC}"
+        echo -e " 3) RustDesk Remote Desktop          $st_rustdesk ${CYAN}[WAYLAND / INTEL VA-API]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " A) Install ALL Productivity & Remote Access Apps"
+        echo -e " U) Uninstall ALL Productivity & Remote Access Apps"
+        echo -e " B) Back to Extra Applications Hub"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Select an application (1-3) or action (A / U / B): " choice
+
+        case "$choice" in
+            1) manage_app_action "Google Chrome Browser" "$is_chrome" install_chrome uninstall_chrome ;;
+            2) manage_app_action "LibreOffice Fresh Suite" "$is_office" install_office uninstall_office ;;
+            3) manage_app_action "RustDesk Remote Desktop" "$is_rustdesk" install_rustdesk uninstall_rustdesk ;;
+            [aA])
+                read -rp "Install ALL Productivity & Remote Access apps now? (y/N): " a_conf
+                if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    install_chrome install
+                    install_office install
+                    install_rustdesk install
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [uU])
+                read -rp "Are you sure you want to uninstall ALL Productivity & Remote Access apps? (y/N): " u_conf
+                if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    uninstall_chrome
+                    uninstall_office
+                    uninstall_rustdesk
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [bB]) break ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_multimedia_apps() {
+    while true; do
+        local is_vlc=false is_celluloid=false is_gimp=false is_kdenlive=false
+        is_pkg_installed vlc && is_vlc=true
+        is_pkg_installed celluloid && is_celluloid=true
+        is_pkg_installed gimp && is_gimp=true
+        is_pkg_installed kdenlive && is_kdenlive=true
+
+        local st_vlc st_celluloid st_gimp st_kdenlive
+        st_vlc=$([[ "$is_vlc" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_celluloid=$([[ "$is_celluloid" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_gimp=$([[ "$is_gimp" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+        st_kdenlive=$([[ "$is_kdenlive" == "true" ]] && echo -e "${GREEN}[Installed]${NC}" || echo -e "${RED}[Not Installed]${NC}")
+
+        echo ""
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e "${BOLD}                     MULTIMEDIA & GRAPHICS                              ${NC}"
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e " 1) VLC Media Player                 $st_vlc ${CYAN}[OFFICIAL MEDIA ENGINE]${NC}"
+        echo -e " 2) Celluloid Video Player           $st_celluloid ${CYAN}[OFFICIAL MPV FRONTEND]${NC}"
+        echo -e " 3) GIMP Image Editor                $st_gimp ${CYAN}[OFFICIAL GNU IMAGE MANIPULATION]${NC}"
+        echo -e " 4) Kdenlive Video Editor            $st_kdenlive ${CYAN}[OFFICIAL MLT VIDEO EDITOR]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e " A) Install ALL Multimedia & Graphics Apps"
+        echo -e " U) Uninstall ALL Multimedia & Graphics Apps"
+        echo -e " B) Back to Extra Applications Hub"
+        echo -e "${BOLD}========================================================================${NC}"
+        read -rp "Select an application (1-4) or action (A / U / B): " choice
+
+        case "$choice" in
+            1) manage_app_action "VLC Media Player" "$is_vlc" install_vlc uninstall_vlc ;;
+            2) manage_app_action "Celluloid Video Player" "$is_celluloid" install_celluloid uninstall_celluloid ;;
+            3) manage_app_action "GIMP Image Editor" "$is_gimp" install_gimp uninstall_gimp ;;
+            4) manage_app_action "Kdenlive Video Editor" "$is_kdenlive" install_kdenlive uninstall_kdenlive ;;
+            [aA])
+                read -rp "Install ALL Multimedia & Graphics apps now? (y/N): " a_conf
+                if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    install_media install
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [uU])
+                read -rp "Are you sure you want to uninstall ALL Multimedia & Graphics apps? (y/N): " u_conf
+                if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    uninstall_media
+                    read -rp "Press [Enter] to continue..."
+                fi
+                ;;
+            [bB]) break ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_extra_apps() {
+    while true; do
+        # Count installed in Development & AI Tools (6 items)
+        local dev_cnt=0
+        { is_pkg_installed visual-studio-code-bin || is_bin_installed code; } && ((dev_cnt++))
+        is_pkg_installed antigravity-ide && ((dev_cnt++))
+        { is_pkg_installed antigravity || is_bin_installed agy; } && ((dev_cnt++))
+        is_bin_installed dotnet && ((dev_cnt++))
+        is_node_installed && ((dev_cnt++))
+        is_clasp_installed && ((dev_cnt++))
+
+        # Count installed in Virtualization & Containers (2 items)
+        local virt_cnt=0
+        is_bin_installed podman && ((virt_cnt++))
+        is_pkg_installed virt-manager && ((virt_cnt++))
+
+        # Count installed in Productivity & Remote Access (3 items)
+        local prod_cnt=0
+        is_pkg_installed google-chrome && ((prod_cnt++))
+        is_pkg_installed libreoffice-fresh && ((prod_cnt++))
+        { is_pkg_installed rustdesk-bin || is_pkg_installed rustdesk || is_bin_installed rustdesk; } && ((prod_cnt++))
+
+        # Count installed in Multimedia & Graphics (4 items)
+        local media_cnt=0
+        is_pkg_installed vlc && ((media_cnt++))
+        is_pkg_installed celluloid && ((media_cnt++))
+        is_pkg_installed gimp && ((media_cnt++))
+        is_pkg_installed kdenlive && ((media_cnt++))
+
+        local badge_dev badge_virt badge_prod badge_media
+        badge_dev=$(format_category_badge "$dev_cnt" 6)
+        badge_virt=$(format_category_badge "$virt_cnt" 2)
+        badge_prod=$(format_category_badge "$prod_cnt" 3)
+        badge_media=$(format_category_badge "$media_cnt" 4)
 
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
         echo -e "${BOLD}                     EXTRA APPLICATIONS HUB                             ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e " 1) Podman Engine & Compose      $st_podman ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 2) KVM / QEMU Virt-Manager      $st_kvm ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 3) VS Code + Extension Suite   $st_vscode ${CYAN}[OFFICIAL + 18 DEV EXTENSIONS]${NC}"
-        echo -e " 4) Antigravity IDE              $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 5) Antigravity 2.0 Platform     $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
-        echo -e " 6) Google Chrome Browser        $st_chrome ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 7) LibreOffice Fresh Suite      $st_office ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 8) Essential Multimedia Suite   $st_media ${CYAN}[OFFICIAL]${NC}"
-        echo -e " 9) RustDesk Remote Desktop      $st_rustdesk ${CYAN}[WAYLAND / INTEL VA-API]${NC}"
-        echo -e " 10) Modern Dev Runtimes         $st_dev_runtimes ${CYAN}[DYNAMIC LTS: .NET & NODE LTS]${NC}"
+        echo -e " 1) Development & AI Tools         $badge_dev"
+        echo -e " 2) Virtualization & Containers    $badge_virt"
+        echo -e " 3) Productivity & Remote Access   $badge_prod"
+        echo -e " 4) Multimedia & Graphics          $badge_media"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        echo -e " A) Install ALL Applications"
-        echo -e " U) Uninstall ALL Applications"
+        echo -e " A) Install ALL Applications across ALL Categories (15 Apps)"
+        echo -e " U) Uninstall ALL Applications across ALL Categories"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application (1-10) or action (A / U / B): " choice
+        read -rp "Select a category (1-4) or action (A / U / B): " choice
 
         case "$choice" in
-            1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
-            2) manage_app_action "KVM / QEMU Virt-Manager" "$is_kvm" install_kvm uninstall_kvm ;;
-            3) manage_vscode_action "$is_vscode" ;;
-            4) manage_app_action "Antigravity IDE" "$is_ag_ide" install_antigravity_ide uninstall_antigravity_ide ;;
-            5) manage_app_action "Antigravity 2.0 Platform" "$is_ag_app" install_antigravity_standalone uninstall_antigravity_standalone ;;
-            6) manage_app_action "Google Chrome Browser" "$is_chrome" install_chrome uninstall_chrome ;;
-            7) manage_app_action "LibreOffice Fresh Suite" "$is_office" install_office uninstall_office ;;
-            8) manage_app_action "Essential Multimedia Suite" "$is_media" install_media uninstall_media ;;
-            9) manage_app_action "RustDesk Remote Desktop" "$is_rustdesk" install_rustdesk uninstall_rustdesk ;;
-            10) manage_app_action "Modern Developer Runtimes (.NET LTS & Node.js)" "$is_dev_runtimes" install_dev_runtimes uninstall_dev_runtimes ;;
+            1) menu_dev_apps ;;
+            2) menu_virt_containers ;;
+            3) menu_productivity_apps ;;
+            4) menu_multimedia_apps ;;
             [aA])
-                read -rp "Install ALL applications now? (y/N): " a_conf
+                read -rp "Install ALL applications across ALL categories now? (y/N): " a_conf
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
                     install_all_apps
                     read -rp "Press [Enter] to continue..."
                 fi
                 ;;
             [uU])
-                read -rp "Are you sure you want to uninstall ALL applications? (y/N): " u_conf
+                read -rp "Are you sure you want to uninstall ALL applications across ALL categories? (y/N): " u_conf
                 if [[ "$u_conf" =~ ^[Yy]$ ]]; then
                     uninstall_all_apps
                     read -rp "Press [Enter] to continue..."
@@ -1849,8 +2327,16 @@ maintain_btrfs_storage() {
     fi
 }
 
+_GOODIX_DETECTED=""
 get_fingerprint_status() {
-    if ! lsusb | grep -qi "27c6:538d"; then
+    if [[ "$_GOODIX_DETECTED" != "true" && "$_GOODIX_DETECTED" != "false" ]]; then
+        if lsusb 2>/dev/null | grep -qi "27c6:538d"; then
+            _GOODIX_DETECTED="true"
+        else
+            _GOODIX_DETECTED="false"
+        fi
+    fi
+    if [[ "$_GOODIX_DETECTED" == "false" ]]; then
         echo "not_detected"
         return
     fi
