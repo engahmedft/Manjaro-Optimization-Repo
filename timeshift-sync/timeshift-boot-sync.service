@@ -1,0 +1,14 @@
+[Unit]
+Description=Timeshift Boot & GRUB Synchronization Safeguard
+After=local-fs.target
+Before=systemd-user-sessions.service graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/timeshift-boot-sync.sh
+RemainAfterExit=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

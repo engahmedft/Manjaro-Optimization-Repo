@@ -233,6 +233,14 @@ EOF
     systemctl enable --now grub-btrfsd.service > /dev/null 2>&1 || true
     systemctl restart grub-btrfsd.service > /dev/null 2>&1 || true
     log_ok "Timeshift automated snapshot synchronization daemon (grub-btrfsd) active."
+
+    # 4. Deploy Timeshift Boot & Kernel Synchronization System
+    local ts_install="${SCRIPT_DIR}/timeshift-sync/install.sh"
+    if [[ -f "$ts_install" ]]; then
+        log_info "Installing Timeshift native restore hooks & boot synchronization safeguard..."
+        bash "$ts_install" > /dev/null 2>&1 || true
+        log_ok "Timeshift & Boot synchronization safeguard active."
+    fi
 }
 
 configure_grub_hidpi_theme() {
@@ -3132,12 +3140,61 @@ run_all_stages() {
     fi
 }
 
+menu_timeshift_sync() {
+    while true; do
+        echo ""
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e "${BOLD}         TIMESHIFT SNAPSHOT & BOOT SYNCHRONIZATION MANAGER              ${NC}"
+        echo -e "${BOLD}========================================================================${NC}"
+        echo -e " ${BOLD}1)${NC} Restore Snapshot Safely (timeshift-restore-sync)"
+        echo -e " ${BOLD}2)${NC} Repair Existing Snapshots (Inject LTS fallback & fix grubenv)"
+        echo -e " ${BOLD}3)${NC} Install / Reinstall Native Hooks & First-Boot Safeguard"
+        echo -e " ${BOLD}4)${NC} Back to Main Menu"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        read -rp "Please enter your choice (1-4): " ts_opt
+
+        case "$ts_opt" in
+            1)
+                if [[ -f "$SCRIPT_DIR/timeshift-sync/timeshift-restore-sync.sh" ]]; then
+                    bash "$SCRIPT_DIR/timeshift-sync/timeshift-restore-sync.sh"
+                elif command -v timeshift-restore-sync &>/dev/null; then
+                    timeshift-restore-sync
+                else
+                    log_error "timeshift-restore-sync not found."
+                fi
+                ;;
+            2)
+                if [[ -f "$SCRIPT_DIR/timeshift-sync/fix-existing-snapshots.sh" ]]; then
+                    bash "$SCRIPT_DIR/timeshift-sync/fix-existing-snapshots.sh"
+                elif command -v timeshift-fix-snapshots &>/dev/null; then
+                    timeshift-fix-snapshots
+                else
+                    log_error "fix-existing-snapshots not found."
+                fi
+                ;;
+            3)
+                if [[ -f "$SCRIPT_DIR/timeshift-sync/install.sh" ]]; then
+                    bash "$SCRIPT_DIR/timeshift-sync/install.sh"
+                else
+                    log_error "install.sh not found."
+                fi
+                ;;
+            4) break ;;
+            *) log_warn "Invalid option. Please enter 1-4." ;;
+        esac
+    done
+}
+
 # ------------------------------------------------------------------------------
 # 8. DIRECT CLI EXECUTION & INTERACTIVE MAIN MENU
 # ------------------------------------------------------------------------------
 case "${1:-}" in
     -a|--all|all|A)
         run_all_stages noninteractive
+        exit 0
+        ;;
+    -t|--timeshift|--restore)
+        bash "${SCRIPT_DIR}/timeshift-sync/timeshift-restore-sync.sh"
         exit 0
         ;;
     -1|--optimize)
@@ -3170,6 +3227,7 @@ case "${1:-}" in
         echo "  -1, --optimize   Run Stage 1: Core System Optimization & Upgrade"
         echo "  -2, --settings   Run Stage 2: Desktop UI, Partitions & Dell Hardware"
         echo "  -3, --apps       Run Stage 3: Install all 15 Extra Applications"
+        echo "  -t, --timeshift  Launch Timeshift Restore & Boot Synchronization Manager"
         echo "  -h, --help       Show this help message"
         echo ""
         echo "Run without options to launch the interactive Control Center menu."
@@ -3185,25 +3243,27 @@ while true; do
     echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, ZRAM, Sysctl)"
     echo -e " ${BOLD}2)${NC} Desktop UI, Storage & Hardware Settings"
     echo -e " ${BOLD}3)${NC} Extra Apps (Install, Reinstall & Uninstall Hub)"
-    echo -e " ${BOLD}4)${NC} Quit"
+    echo -e " ${BOLD}4)${NC} Timeshift Restore & Boot Synchronization Manager"
+    echo -e " ${BOLD}5)${NC} Quit"
     echo -e "${BOLD}------------------------------------------------------------------------${NC}"
     echo -e " ${BOLD}A)${NC} Run ALL (Stage 1 Optimize -> Stage 2 All Settings -> Stage 3 All 15 Apps)"
     echo -e "${BOLD}------------------------------------------------------------------------${NC}"
     echo -e " 📋 Live log file: ${CYAN}$LOG_FILE${NC}"
     echo -e "${BOLD}========================================================================${NC}"
-    read -rp "Please enter your choice (1-4 / A): " main_choice
+    read -rp "Please enter your choice (1-5 / A): " main_choice
 
     case "$main_choice" in
         1) optimize_system ;;
         2) menu_desktop_settings ;;
         3) menu_extra_apps ;;
+        4) menu_timeshift_sync ;;
         [aA]) run_all_stages ;;
-        4)
+        5)
             log_ok "Exiting. Session completed successfully!"
             break
             ;;
         *)
-            log_warn "Invalid option. Please enter a number from 1 to 4, or A."
+            log_warn "Invalid option. Please enter a number from 1 to 5, or A."
             ;;
     esac
 done

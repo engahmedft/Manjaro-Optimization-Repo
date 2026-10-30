@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Timeshift Restore Notification
+Exec=/usr/local/bin/timeshift-sync-notify.sh
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+Comment=Notifies user when Timeshift restores have been synchronized
