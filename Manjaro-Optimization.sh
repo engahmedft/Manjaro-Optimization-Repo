@@ -611,14 +611,19 @@ get_eye_comfort_status() {
 configure_antigravity2_theme() {
     local gemini_cfg_dir="$USER_HOME/.gemini/config"
     local gemini_cfg="$gemini_cfg_dir/config.json"
-    mkdir -p "$gemini_cfg_dir"
+    local antigravity_cfg_dir="$USER_HOME/.config/Antigravity"
+    local antigravity_storage="$antigravity_cfg_dir/app_storage.json"
+    local antigravity_pref="$antigravity_cfg_dir/Preferences"
+    mkdir -p "$gemini_cfg_dir" "$antigravity_cfg_dir"
     python3 -c '
 import json, os, sys
-path = sys.argv[1]
+
+# 1. Antigravity Theme Seeds & Dark Mode
+gemini_path = sys.argv[1]
 data = {}
-if os.path.exists(path):
+if os.path.exists(gemini_path):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(gemini_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         data = {}
@@ -630,16 +635,153 @@ data["userSettings"]["customThemeSeedsDark"] = {
     "primary": "#58a6ff"
 }
 data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
-with open(path, "w", encoding="utf-8") as f:
+with open(gemini_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
-' "$gemini_cfg" 2>/dev/null || true
-    chown -R "$REAL_USER:" "$USER_HOME/.gemini" 2>/dev/null || true
+
+# 2. Antigravity 2 UI Zoom Level (+1 zoom level / 120% magnification)
+storage_path = sys.argv[2]
+st_data = {}
+if os.path.exists(storage_path):
+    try:
+        with open(storage_path, "r", encoding="utf-8") as f:
+            st_data = json.load(f)
+    except Exception:
+        st_data = {}
+st_data["zoomLevel"] = "1"
+with open(storage_path, "w", encoding="utf-8") as f:
+    json.dump(st_data, f, indent=2)
+
+# 3. Chromium per-host zoom levels if preferences exist
+pref_path = sys.argv[3]
+if os.path.exists(pref_path):
+    try:
+        with open(pref_path, "r", encoding="utf-8") as f:
+            pref_data = json.load(f)
+        if "partition" not in pref_data:
+            pref_data["partition"] = {}
+        if "per_host_zoom_levels" not in pref_data["partition"]:
+            pref_data["partition"]["per_host_zoom_levels"] = {}
+        for k in pref_data["partition"]["per_host_zoom_levels"]:
+            if isinstance(pref_data["partition"]["per_host_zoom_levels"][k], dict):
+                for host in pref_data["partition"]["per_host_zoom_levels"][k]:
+                    pref_data["partition"]["per_host_zoom_levels"][k][host] = 1.0
+        with open(pref_path, "w", encoding="utf-8") as f:
+            json.dump(pref_data, f, separators=(",", ":"))
+    except Exception:
+        pass
+' "$gemini_cfg" "$antigravity_storage" "$antigravity_pref" 2>/dev/null || true
+    chown -R "$REAL_USER:" "$USER_HOME/.gemini" "$antigravity_cfg_dir" 2>/dev/null || true
+}
+
+configure_editor_settings() {
+    # Configure unified eye-comfort & zoom settings for VS Code and Antigravity IDE
+    local vscode_user_dir="$USER_HOME/.config/Code/User"
+    local antigravity_ide_user_dir="$USER_HOME/.config/Antigravity IDE/User"
+    mkdir -p "$vscode_user_dir" "$antigravity_ide_user_dir"
+
+    python3 -c '
+import json, os, sys
+
+def configure_editor_json(path):
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+    data["workbench.iconTheme"] = "vscode-icons"
+    data["editor.renderWhitespace"] = "all"
+    data["editor.renderControlCharacters"] = True
+    data["editor.unicodeHighlight.nonBasicASCII"] = False
+    data["editor.unicodeHighlight.invisibleCharacters"] = True
+    data["editor.unicodeHighlight.ambiguousCharacters"] = True
+
+    # Eye comfort, zoom in (+1 zoom level / 120% magnification) & typography harmonized with Antigravity 2
+    data["window.zoomLevel"] = 1
+    data["workbench.colorTheme"] = "GitHub Dark Dimmed"
+    data["editor.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
+    data["editor.fontSize"] = 16
+    data["editor.lineHeight"] = 1.6
+    data["editor.letterSpacing"] = 1.2
+    data["editor.fontWeight"] = "500"
+    data["editor.fontLigatures"] = True
+    data["editor.smoothScrolling"] = True
+    data["editor.cursorBlinking"] = "smooth"
+    data["editor.cursorSmoothCaretAnimation"] = "on"
+    data["workbench.fontAliasing"] = "antialiased"
+
+    # Terminal styling harmonized with Antigravity 2
+    data["terminal.integrated.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
+    data["terminal.integrated.fontSize"] = 14
+    data["terminal.integrated.lineHeight"] = 1.4
+    data["terminal.integrated.letterSpacing"] = 1.0
+    data["terminal.integrated.fontWeight"] = "500"
+
+    # Global palette locked to the comfortable left-side (#1c2128 / #e6edf3)
+    data["workbench.colorCustomizations"] = {
+        "editor.background": "#1c2128",
+        "editorGroupHeader.tabsBackground": "#181c21",
+        "tab.activeBackground": "#1c2128",
+        "tab.inactiveBackground": "#181c21",
+        "sideBar.background": "#1c2128",
+        "activityBar.background": "#1c2128",
+        "panel.background": "#1c2128",
+        "terminal.background": "#1c2128",
+        "titleBar.activeBackground": "#181c21",
+        "statusBar.background": "#181c21",
+        "editor.foreground": "#e6edf3",
+        "sideBar.foreground": "#e6edf3",
+        "activityBar.foreground": "#e6edf3",
+        "terminal.foreground": "#e6edf3",
+        "editorLineNumber.foreground": "#768390",
+        "editorLineNumber.activeForeground": "#58a6ff",
+        "editorWhitespace.foreground": "#373e47"
+    }
+    data["editor.tokenColorCustomizations"] = {
+        "textMateRules": [
+            {
+                "scope": ["comment"],
+                "settings": {"foreground": "#8b949e", "fontStyle": "italic"}
+            },
+            {
+                "scope": ["string", "string.quoted"],
+                "settings": {"foreground": "#a5d6ff"}
+            },
+            {
+                "scope": ["keyword", "keyword.control", "storage.type"],
+                "settings": {"foreground": "#ff7b72", "fontStyle": "bold"}
+            },
+            {
+                "scope": ["entity.name.function", "support.function"],
+                "settings": {"foreground": "#d2a8ff"}
+            },
+            {
+                "scope": ["variable", "variable.other", "variable.parameter"],
+                "settings": {"foreground": "#e6edf3"}
+            },
+            {
+                "scope": ["constant.numeric", "constant.language"],
+                "settings": {"foreground": "#79c0ff"}
+            }
+        ]
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+configure_editor_json(sys.argv[1])
+configure_editor_json(sys.argv[2])
+' "$vscode_user_dir/settings.json" "$antigravity_ide_user_dir/settings.json" 2>/dev/null || true
+    chown -R "$REAL_USER:" "$USER_HOME/.config/Code" "$USER_HOME/.config/Antigravity IDE" 2>/dev/null || true
+    log_ok "VS Code & Antigravity IDE settings configured (zoom level 1, eye comfort, anti-glare charcoal & typography)."
 }
 
 configure_eye_comfort_display() {
     local action="${1:-enable}"
     if [[ "$action" == "enable" ]]; then
-        log_info "Enabling Eye Comfort Display, Anti-Glare Charcoal & Crisp HiDPI Font Rendering..."
+        log_info "Enabling Eye Comfort Display, Anti-Glare Charcoal, Zoom & Crisp HiDPI Font Rendering..."
         pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
 
         # GNOME Desktop typography & anti-glare rendering
@@ -649,10 +791,13 @@ configure_eye_comfort_display() {
         run_as_user gsettings set org.gnome.desktop.interface document-font-name 'Inter 11' 2>/dev/null || true
         run_as_user gsettings set org.gnome.desktop.interface monospace-font-name 'JetBrains Mono 11' 2>/dev/null || true
 
-        # Ensure Antigravity 2 uses anti-glare charcoal palette
+        # Ensure Antigravity 2 uses anti-glare charcoal palette and zoom level 1
         configure_antigravity2_theme
 
-        log_ok "Eye Comfort display & typography settings applied (Inter, JetBrains Mono & Grayscale HiDPI)."
+        # Ensure VS Code and Antigravity IDE use matched zoom level 1, eye comfort palette & typography
+        configure_editor_settings
+
+        log_ok "Eye Comfort display, zoom & typography settings applied (Inter, JetBrains Mono, Grayscale HiDPI & Zoom Level 1)."
     else
         log_info "Restoring default display and font rendering settings..."
         run_as_user gsettings set org.gnome.desktop.interface font-antialiasing 'rgba' 2>/dev/null || true
@@ -920,107 +1065,8 @@ install_vscode_extensions() {
     # Ensure JetBrains Mono and Inter fonts are installed
     pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
 
-    # Configure unified eye-comfort settings for VS Code and Antigravity IDE
-    local vscode_user_dir="$USER_HOME/.config/Code/User"
-    local antigravity_ide_user_dir="$USER_HOME/.config/Antigravity IDE/User"
-    mkdir -p "$vscode_user_dir" "$antigravity_ide_user_dir"
-
-    python3 -c '
-import json, os, sys
-
-def configure_editor_json(path):
-    data = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-
-    data["workbench.iconTheme"] = "vscode-icons"
-    data["editor.renderWhitespace"] = "all"
-    data["editor.renderControlCharacters"] = True
-    data["editor.unicodeHighlight.nonBasicASCII"] = False
-    data["editor.unicodeHighlight.invisibleCharacters"] = True
-    data["editor.unicodeHighlight.ambiguousCharacters"] = True
-
-    # Eye comfort, anti-glare charcoal & typography harmonized with Antigravity 2
-    data["workbench.colorTheme"] = "GitHub Dark Dimmed"
-    data["editor.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
-    data["editor.fontSize"] = 16
-    data["editor.lineHeight"] = 1.6
-    data["editor.letterSpacing"] = 1.2
-    data["editor.fontWeight"] = "500"
-    data["editor.fontLigatures"] = True
-    data["editor.smoothScrolling"] = True
-    data["editor.cursorBlinking"] = "smooth"
-    data["editor.cursorSmoothCaretAnimation"] = "on"
-    data["workbench.fontAliasing"] = "antialiased"
-
-    # Terminal styling harmonized with Antigravity 2
-    data["terminal.integrated.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
-    data["terminal.integrated.fontSize"] = 14
-    data["terminal.integrated.lineHeight"] = 1.4
-    data["terminal.integrated.letterSpacing"] = 1.0
-    data["terminal.integrated.fontWeight"] = "500"
-
-    # Global palette locked to the comfortable left-side (#1c2128 / #e6edf3)
-    data["workbench.colorCustomizations"] = {
-        "editor.background": "#1c2128",
-        "editorGroupHeader.tabsBackground": "#181c21",
-        "tab.activeBackground": "#1c2128",
-        "tab.inactiveBackground": "#181c21",
-        "sideBar.background": "#1c2128",
-        "activityBar.background": "#1c2128",
-        "panel.background": "#1c2128",
-        "terminal.background": "#1c2128",
-        "titleBar.activeBackground": "#181c21",
-        "statusBar.background": "#181c21",
-        "editor.foreground": "#e6edf3",
-        "sideBar.foreground": "#e6edf3",
-        "activityBar.foreground": "#e6edf3",
-        "terminal.foreground": "#e6edf3",
-        "editorLineNumber.foreground": "#768390",
-        "editorLineNumber.activeForeground": "#58a6ff",
-        "editorWhitespace.foreground": "#373e47"
-    }
-    data["editor.tokenColorCustomizations"] = {
-        "textMateRules": [
-            {
-                "scope": ["comment"],
-                "settings": {"foreground": "#8b949e", "fontStyle": "italic"}
-            },
-            {
-                "scope": ["string", "string.quoted"],
-                "settings": {"foreground": "#a5d6ff"}
-            },
-            {
-                "scope": ["keyword", "keyword.control", "storage.type"],
-                "settings": {"foreground": "#ff7b72", "fontStyle": "bold"}
-            },
-            {
-                "scope": ["entity.name.function", "support.function"],
-                "settings": {"foreground": "#d2a8ff"}
-            },
-            {
-                "scope": ["variable", "variable.other", "variable.parameter"],
-                "settings": {"foreground": "#e6edf3"}
-            },
-            {
-                "scope": ["constant.numeric", "constant.language"],
-                "settings": {"foreground": "#79c0ff"}
-            }
-        ]
-    }
-
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-
-configure_editor_json(sys.argv[1])
-configure_editor_json(sys.argv[2])
-' "$vscode_user_dir/settings.json" "$antigravity_ide_user_dir/settings.json" 2>/dev/null || true
-    chown -R "$REAL_USER:" "$USER_HOME/.config/Code" "$USER_HOME/.config/Antigravity IDE" 2>/dev/null || true
-    log_ok "VS Code & Antigravity IDE settings configured (eye comfort, anti-glare charcoal & typography)."
+    # Configure unified eye-comfort & zoom settings for VS Code and Antigravity IDE
+    configure_editor_settings
 
     log_ok "All specified VS Code extensions installed and verified."
 }
@@ -1090,6 +1136,7 @@ install_antigravity_ide() {
         if is_bin_installed antigravity-ide; then
             sudo -u "$REAL_USER" antigravity-ide --install-extension github.github-vscode-theme --force >/dev/null 2>&1 || true
         fi
+        configure_editor_settings
         return 0
     fi
     ensure_session_snapshot "Before Installing Antigravity IDE"
@@ -1101,6 +1148,7 @@ install_antigravity_ide() {
     if is_bin_installed antigravity-ide; then
         sudo -u "$REAL_USER" antigravity-ide --install-extension github.github-vscode-theme --force >/dev/null 2>&1 || true
     fi
+    configure_editor_settings
     log_ok "Antigravity IDE ready."
     post_install_hook
 }
