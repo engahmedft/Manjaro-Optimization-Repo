@@ -607,8 +607,8 @@ if os.path.exists(path):
 if "userSettings" not in data:
     data["userSettings"] = {}
 data["userSettings"]["customThemeSeedsDark"] = {
-    "background": "#22272e",
-    "foregroundOverride": "#f0f6fc",
+    "background": "#1c2128",
+    "foregroundOverride": "#e6edf3",
     "primary": "#58a6ff"
 }
 data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
@@ -952,9 +952,9 @@ def configure_editor_json(path):
     # Eye comfort, anti-glare charcoal & typography harmonized with Antigravity 2
     data["workbench.colorTheme"] = "GitHub Dark Dimmed"
     data["editor.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
-    data["editor.fontSize"] = 15
+    data["editor.fontSize"] = 16
     data["editor.lineHeight"] = 1.6
-    data["editor.letterSpacing"] = 0
+    data["editor.letterSpacing"] = 1.2
     data["editor.fontWeight"] = "500"
     data["editor.fontLigatures"] = True
     data["editor.smoothScrolling"] = True
@@ -966,54 +966,56 @@ def configure_editor_json(path):
     data["terminal.integrated.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
     data["terminal.integrated.fontSize"] = 14
     data["terminal.integrated.lineHeight"] = 1.4
-    data["terminal.integrated.letterSpacing"] = 0
+    data["terminal.integrated.letterSpacing"] = 1.0
     data["terminal.integrated.fontWeight"] = "500"
 
-    # Antigravity 2 charcoal palette & high-contrast tokens
+    # Global palette locked to the comfortable left-side (#1c2128 / #e6edf3)
     data["workbench.colorCustomizations"] = {
-        "[GitHub Dark Dimmed]": {
-            "editor.background": "#22272e",
-            "editor.foreground": "#f0f6fc",
-            "sideBar.background": "#1c2128",
-            "activityBar.background": "#1c2128",
-            "panel.background": "#22272e",
-            "terminal.background": "#22272e",
-            "terminal.foreground": "#f0f6fc",
-            "editorLineNumber.foreground": "#768390",
-            "editorLineNumber.activeForeground": "#58a6ff",
-            "sideBar.foreground": "#e6edf3",
-            "activityBar.foreground": "#f0f6fc"
-        }
+        "editor.background": "#1c2128",
+        "editorGroupHeader.tabsBackground": "#181c21",
+        "tab.activeBackground": "#1c2128",
+        "tab.inactiveBackground": "#181c21",
+        "sideBar.background": "#1c2128",
+        "activityBar.background": "#1c2128",
+        "panel.background": "#1c2128",
+        "terminal.background": "#1c2128",
+        "titleBar.activeBackground": "#181c21",
+        "statusBar.background": "#181c21",
+        "editor.foreground": "#e6edf3",
+        "sideBar.foreground": "#e6edf3",
+        "activityBar.foreground": "#e6edf3",
+        "terminal.foreground": "#e6edf3",
+        "editorLineNumber.foreground": "#768390",
+        "editorLineNumber.activeForeground": "#58a6ff",
+        "editorWhitespace.foreground": "#373e47"
     }
     data["editor.tokenColorCustomizations"] = {
-        "[GitHub Dark Dimmed]": {
-            "textMateRules": [
-                {
-                    "scope": ["comment"],
-                    "settings": {"foreground": "#8b949e", "fontStyle": "italic"}
-                },
-                {
-                    "scope": ["string", "string.quoted"],
-                    "settings": {"foreground": "#a5d6ff"}
-                },
-                {
-                    "scope": ["keyword", "keyword.control", "storage.type"],
-                    "settings": {"foreground": "#ff7b72", "fontStyle": "bold"}
-                },
-                {
-                    "scope": ["entity.name.function", "support.function"],
-                    "settings": {"foreground": "#d2a8ff"}
-                },
-                {
-                    "scope": ["variable", "variable.other", "variable.parameter"],
-                    "settings": {"foreground": "#f0f6fc"}
-                },
-                {
-                    "scope": ["constant.numeric", "constant.language"],
-                    "settings": {"foreground": "#79c0ff"}
-                }
-            ]
-        }
+        "textMateRules": [
+            {
+                "scope": ["comment"],
+                "settings": {"foreground": "#8b949e", "fontStyle": "italic"}
+            },
+            {
+                "scope": ["string", "string.quoted"],
+                "settings": {"foreground": "#a5d6ff"}
+            },
+            {
+                "scope": ["keyword", "keyword.control", "storage.type"],
+                "settings": {"foreground": "#ff7b72", "fontStyle": "bold"}
+            },
+            {
+                "scope": ["entity.name.function", "support.function"],
+                "settings": {"foreground": "#d2a8ff"}
+            },
+            {
+                "scope": ["variable", "variable.other", "variable.parameter"],
+                "settings": {"foreground": "#e6edf3"}
+            },
+            {
+                "scope": ["constant.numeric", "constant.language"],
+                "settings": {"foreground": "#79c0ff"}
+            }
+        ]
     }
 
     with open(path, "w", encoding="utf-8") as f:
@@ -1108,8 +1110,8 @@ if os.path.exists(path):
 if "userSettings" not in data:
     data["userSettings"] = {}
 data["userSettings"]["customThemeSeedsDark"] = {
-    "background": "#22272e",
-    "foregroundOverride": "#f0f6fc",
+    "background": "#1c2128",
+    "foregroundOverride": "#e6edf3",
     "primary": "#58a6ff"
 }
 data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
