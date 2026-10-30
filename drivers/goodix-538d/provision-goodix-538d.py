@@ -405,15 +405,17 @@ class GoodixDevice:
                 encode_message_protocol(b"\x00\x00", COMMAND_FIRMWARE_VERSION)
             )
         )
-        check_ack(
-            check_message_protocol(
-                check_message_pack(self.protocol.read()), COMMAND_ACK
-            ),
-            COMMAND_FIRMWARE_VERSION,
-        )
-        reply = check_message_protocol(
-            check_message_pack(self.protocol.read()), COMMAND_FIRMWARE_VERSION
-        )
+        first_pack = check_message_pack(self.protocol.read())
+        if first_pack[0] == COMMAND_ACK:
+            check_ack(
+                check_message_protocol(first_pack, COMMAND_ACK),
+                COMMAND_FIRMWARE_VERSION,
+            )
+            reply = check_message_protocol(
+                check_message_pack(self.protocol.read()), COMMAND_FIRMWARE_VERSION
+            )
+        else:
+            reply = check_message_protocol(first_pack, COMMAND_FIRMWARE_VERSION)
         return reply.split(b"\x00")[0].decode("ascii", errors="replace")
 
     def preset_psk_read(

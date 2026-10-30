@@ -189,13 +189,18 @@ ensure_session_snapshot() {
         pacman -S --needed --noconfirm timeshift || true
     fi
 
-    if timeshift --create --comments "$reason" --tags O > /dev/null 2>&1; then
+    local ts_output
+    if ts_output=$(timeshift --create --comments "$reason" --tags O 2>&1); then
         SESSION_SNAPSHOT_TAKEN=true
         log_ok "Timeshift restore point created successfully."
         sync_grub_snapshots
     else
         SESSION_SNAPSHOT_TAKEN=true
-        log_warn "Timeshift snapshot skipped (run Timeshift GUI once to configure disk if needed)."
+        if echo "$ts_output" | grep -qi "Another instance"; then
+            log_warn "Timeshift snapshot skipped: Timeshift GUI is currently open (close Timeshift window to enable automatic snapshots)."
+        else
+            log_warn "Timeshift snapshot skipped (run Timeshift GUI once to configure disk if needed)."
+        fi
     fi
 }
 
