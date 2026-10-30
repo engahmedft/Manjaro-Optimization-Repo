@@ -117,20 +117,39 @@ main() {
         snap_kernels=$(ls "$snap_root/boot"/vmlinuz-* 2>/dev/null | xargs -n1 basename | sed 's/vmlinuz-//' | tr '\n' ' ' || true)
         log_info "  Installed kernels in snapshot: ${snap_kernels:-none}"
 
+        # Determine if repair is actually required before altering Btrfs properties
+        local needs_grubenv_clean=false
+        local needs_lts_injection=false
+        local needs_ucode=false
+
+        if [[ -f "$snap_root/boot/grub/grubenv" ]] && grub-editenv "$snap_root/boot/grub/grubenv" list 2>/dev/null | grep -qE "saved_entry=|next_entry="; then
+            needs_grubenv_clean=true
+        fi
+
+        if [[ "$has_lts_source" == "true" && ! -f "$snap_root/boot/vmlinuz-6.12-x86_64" ]]; then
+            needs_lts_injection=true
+        fi
+
+        if [[ -f /boot/intel-ucode.img && ! -f "$snap_root/boot/intel-ucode.img" ]]; then
+            needs_ucode=true
+        fi
+
+        if [[ "$needs_grubenv_clean" == "false" && "$needs_lts_injection" == "false" && "$needs_ucode" == "false" ]]; then
+            log_ok "  Snapshot ${BOLD}$snap_name${NC} already healthy & synchronized. (Skipping)"
+            continue
+        fi
+
         # Temporarily make snapshot read-write for repair
         btrfs property set "$snap_root" ro false
 
-        local modified=false
-
         # 1. Clear stale grubenv in snapshot
-        if [[ -f "$snap_root/boot/grub/grubenv" ]]; then
+        if [[ "$needs_grubenv_clean" == "true" ]]; then
             grub-editenv "$snap_root/boot/grub/grubenv" unset saved_entry 2>/dev/null || true
             grub-editenv "$snap_root/boot/grub/grubenv" unset next_entry 2>/dev/null || true
-            modified=true
         fi
 
         # 2. Inject LTS kernel if snapshot lacks modern/stable kernel
-        if [[ "$has_lts_source" == "true" && ! -f "$snap_root/boot/vmlinuz-6.12-x86_64" ]]; then
+        if [[ "$needs_lts_injection" == "true" ]]; then
             log_info "  Injecting LTS Kernel 6.12 into $snap_name to ensure safe booting..."
             mkdir -p "$snap_root/boot"
             cp -p "$lts_vmlinuz" "$snap_root/boot/"
@@ -145,24 +164,18 @@ main() {
                 mkdir -p "$mod_target_base"
                 cp -a "$lts_modules_dir" "$mod_target_base/"
             fi
-            modified=true
         fi
 
         # 3. Ensure intel-ucode is present in snapshot
-        if [[ -f /boot/intel-ucode.img && ! -f "$snap_root/boot/intel-ucode.img" ]]; then
+        if [[ "$needs_ucode" == "true" ]]; then
             cp -p /boot/intel-ucode.img "$snap_root/boot/"
-            modified=true
         fi
 
         # Re-lock snapshot as read-only
         btrfs property set "$snap_root" ro true
 
-        if [[ "$modified" == "true" ]]; then
-            log_ok "  Snapshot ${BOLD}$snap_name${NC} successfully repaired & synchronized."
-            ((fixed_count++))
-        else
-            log_ok "  Snapshot ${BOLD}$snap_name${NC} already in healthy state."
-        fi
+        log_ok "  Snapshot ${BOLD}$snap_name${NC} successfully repaired & synchronized."
+        ((fixed_count++))
 
     done < <(find "$snap_dir" -mindepth 1 -maxdepth 1 -type d | sort)
 

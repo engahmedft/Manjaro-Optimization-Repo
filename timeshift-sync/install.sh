@@ -41,7 +41,10 @@ chmod +x /usr/local/bin/timeshift-sync-notify.sh
 
 cp "$SCRIPT_DIR/fix-existing-snapshots.sh" /usr/local/bin/timeshift-fix-snapshots
 chmod +x /usr/local/bin/timeshift-fix-snapshots
-log_ok "Global CLI commands installed (timeshift-restore-sync, timeshift-fix-snapshots)."
+
+cp "$SCRIPT_DIR/check-grub-menu.sh" /usr/local/bin/timeshift-check-grub
+chmod +x /usr/local/bin/timeshift-check-grub
+log_ok "Global CLI commands installed (timeshift-restore-sync, timeshift-fix-snapshots, timeshift-check-grub)."
 
 # 2. Install Native Timeshift GUI/CLI Restore Hook
 log_info "2/6: Installing native Timeshift post-restore hook..."
@@ -70,9 +73,11 @@ log_ok "Existing snapshots repaired and verified."
 
 # 6. Ensure GRUB BTRFS daemon is watching
 log_info "6/6: Verifying grub-btrfsd daemon..."
-if systemctl is-enabled grub-btrfsd.service &>/dev/null; then
-    systemctl restart grub-btrfsd.service || true
-    log_ok "grub-btrfsd daemon running."
+if systemctl is-active grub-btrfsd.service &>/dev/null; then
+    log_ok "grub-btrfsd daemon is active and monitoring."
+elif systemctl is-enabled grub-btrfsd.service &>/dev/null; then
+    systemctl start grub-btrfsd.service || true
+    log_ok "grub-btrfsd daemon started."
 fi
 
 echo -e "\n${BOLD}${GREEN}================================================================${NC}"

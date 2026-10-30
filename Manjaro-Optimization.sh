@@ -92,6 +92,7 @@ SESSION_GRUB_SYNCED=false
 SESSION_SLEEP_FIX_APPLIED=false
 SESSION_BTRFS_MAINTAINED=false
 SESSION_GOODIX_CONFIGURED=false
+SESSION_TIMESHIFT_SYNC_INSTALLED=false
 
 timestamp() { printf '%(%Y-%m-%d %H:%M:%S)T' -1; }
 log_info()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;34m[INFO]\033[0m %b\n' -1 "$1"; }
@@ -176,9 +177,10 @@ ensure_session_snapshot() {
 
     # Ensure Timeshift native hooks, boot safeguard & snapshot repairs are deployed
     local ts_install="${SCRIPT_DIR}/timeshift-sync/install.sh"
-    if [[ -f "$ts_install" ]]; then
+    if [[ "$SESSION_TIMESHIFT_SYNC_INSTALLED" != "true" && -f "$ts_install" ]]; then
         log_info "Ensuring Timeshift restore hooks, boot safeguard & snapshot repairs are deployed..."
         bash "$ts_install" > /dev/null 2>&1 || true
+        SESSION_TIMESHIFT_SYNC_INSTALLED=true
         log_ok "Timeshift synchronization suite deployed and verified."
     fi
 
@@ -244,9 +246,10 @@ EOF
 
     # 4. Deploy Timeshift Boot & Kernel Synchronization System
     local ts_install="${SCRIPT_DIR}/timeshift-sync/install.sh"
-    if [[ -f "$ts_install" ]]; then
+    if [[ "$SESSION_TIMESHIFT_SYNC_INSTALLED" != "true" && -f "$ts_install" ]]; then
         log_info "Installing Timeshift native restore hooks & boot synchronization safeguard..."
         bash "$ts_install" > /dev/null 2>&1 || true
+        SESSION_TIMESHIFT_SYNC_INSTALLED=true
         log_ok "Timeshift & Boot synchronization safeguard active."
     fi
 }
@@ -407,7 +410,13 @@ configure_grub_dual_boot() {
         return 0
     fi
     log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync & LocalRTC)..."
-    pacman -S --needed --noconfirm os-prober grub-btrfs inotify-tools || true
+    local grub_pkgs=()
+    for pkg in os-prober grub-btrfs inotify-tools; do
+        is_pkg_installed "$pkg" || grub_pkgs+=("$pkg")
+    done
+    if [[ ${#grub_pkgs[@]} -gt 0 ]]; then
+        pacman -S --needed --noconfirm "${grub_pkgs[@]}" || true
+    fi
 
     if [[ $(timedatectl show --property=LocalRTC --value 2>/dev/null) != "yes" ]]; then
         timedatectl set-local-rtc 1 --adjust-system-clock 2>/dev/null || true
@@ -798,7 +807,9 @@ configure_eye_comfort_display() {
     local action="${1:-enable}"
     if [[ "$action" == "enable" ]]; then
         log_info "Enabling Eye Comfort Display, Anti-Glare Charcoal, Zoom & Crisp HiDPI Font Rendering..."
-        pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
+        if ! is_pkg_installed ttf-jetbrains-mono || ! is_pkg_installed inter-font; then
+            pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
+        fi
 
         # GNOME Desktop typography & anti-glare rendering
         run_as_user gsettings set org.gnome.desktop.interface font-antialiasing 'grayscale' 2>/dev/null || true
@@ -913,7 +924,7 @@ optimize_system() {
         log_info "Installing current stable kernel meta package (linux-meta)..."
         pacman -S --needed --noconfirm linux-meta || true
     fi
-    pacman -D --asexplicit linux-meta linux72 linux612 2>/dev/null || true
+    pacman -D --asexplicit linux-meta "linux${k_major}${k_minor}" linux612 2>/dev/null || true
 
     # Microcode Hygiene: Remove redundant amd-ucode on this Intel Tiger Lake system
     if is_pkg_installed amd-ucode; then
@@ -1079,7 +1090,9 @@ install_vscode_extensions() {
     done
 
     # Ensure JetBrains Mono and Inter fonts are installed
-    pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
+    if ! is_pkg_installed ttf-jetbrains-mono || ! is_pkg_installed inter-font; then
+        pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
+    fi
 
     # Configure unified eye-comfort & zoom settings for VS Code and Antigravity IDE
     configure_editor_settings
@@ -3157,9 +3170,10 @@ menu_timeshift_sync() {
         echo -e " ${BOLD}1)${NC} Restore Snapshot Safely (timeshift-restore-sync)"
         echo -e " ${BOLD}2)${NC} Repair Existing Snapshots (Inject LTS fallback & fix grubenv)"
         echo -e " ${BOLD}3)${NC} Install / Reinstall Native Hooks & First-Boot Safeguard"
-        echo -e " ${BOLD}4)${NC} Back to Main Menu"
+        echo -e " ${BOLD}4)${NC} Audit & Inspect GRUB Menu Entries (Check for duplicates)"
+        echo -e " ${BOLD}5)${NC} Back to Main Menu"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        read -rp "Please enter your choice (1-4): " ts_opt
+        read -rp "Please enter your choice (1-5): " ts_opt
 
         case "$ts_opt" in
             1)
@@ -3187,8 +3201,17 @@ menu_timeshift_sync() {
                     log_error "install.sh not found."
                 fi
                 ;;
-            4) break ;;
-            *) log_warn "Invalid option. Please enter 1-4." ;;
+            4)
+                if [[ -f "$SCRIPT_DIR/timeshift-sync/check-grub-menu.sh" ]]; then
+                    bash "$SCRIPT_DIR/timeshift-sync/check-grub-menu.sh"
+                elif command -v timeshift-check-grub &>/dev/null; then
+                    timeshift-check-grub
+                else
+                    log_error "check-grub-menu.sh not found."
+                fi
+                ;;
+            5) break ;;
+            *) log_warn "Invalid option. Please enter 1-5." ;;
         esac
     done
 }
