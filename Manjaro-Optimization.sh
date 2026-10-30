@@ -567,6 +567,67 @@ configure_hot_corner() {
     fi
 }
 
+get_eye_comfort_status() {
+    local aa
+    aa=$(run_as_user gsettings get org.gnome.desktop.interface font-antialiasing 2>/dev/null)
+    if [[ "$aa" == "'grayscale'" ]]; then
+        echo "enabled"
+    else
+        echo "disabled"
+    fi
+}
+
+configure_eye_comfort_display() {
+    local action="${1:-enable}"
+    if [[ "$action" == "enable" ]]; then
+        log_info "Enabling Eye Comfort Display, Anti-Glare Charcoal & Crisp HiDPI Font Rendering..."
+        pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
+
+        # GNOME Desktop typography & anti-glare rendering
+        run_as_user gsettings set org.gnome.desktop.interface font-antialiasing 'grayscale' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface font-hinting 'none' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface font-name 'Inter 11' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface document-font-name 'Inter 11' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface monospace-font-name 'JetBrains Mono 11' 2>/dev/null || true
+
+        # Ensure Antigravity 2 uses anti-glare charcoal palette
+        local gemini_cfg_dir="$USER_HOME/.gemini/config"
+        local gemini_cfg="$gemini_cfg_dir/config.json"
+        mkdir -p "$gemini_cfg_dir"
+        python3 -c '
+import json, os, sys
+path = sys.argv[1]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+if "userSettings" not in data:
+    data["userSettings"] = {}
+data["userSettings"]["customThemeSeedsDark"] = {
+    "background": "#22272e",
+    "foregroundOverride": "#f0f6fc",
+    "primary": "#58a6ff"
+}
+data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+' "$gemini_cfg" 2>/dev/null || true
+        chown -R "$REAL_USER:" "$USER_HOME/.gemini" 2>/dev/null || true
+
+        log_ok "Eye Comfort display & typography settings applied (Inter, JetBrains Mono & Grayscale HiDPI)."
+    else
+        log_info "Restoring default display and font rendering settings..."
+        run_as_user gsettings set org.gnome.desktop.interface font-antialiasing 'rgba' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface font-hinting 'slight' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface font-name 'Noto Sans 11' 2>/dev/null || true
+        run_as_user gsettings set org.gnome.desktop.interface document-font-name 'Sans 11' 2>/dev/null || true
+        log_ok "Default display and font rendering restored."
+    fi
+}
+
 configure_dock_favorites() {
     log_info "Configuring workflow-sorted GNOME Dock favorites..."
     local sorted_favorites=(
@@ -754,7 +815,8 @@ EOF
         configure_goodix_fingerprint noninteractive
     fi
 
-    log_info "12/13: Enabling Desktop Icons, Disabling Top-Left Hot Corner & Sorting Dock Favorites..."
+    log_info "12/13: Configuring Eye Comfort & Font Sharpness, Desktop Icons, Disabling Hot Corner & Sorting Dock Favorites..."
+    configure_eye_comfort_display enable
     configure_desktop_icons enable
     configure_hot_corner disable
     configure_dock_favorites
@@ -852,6 +914,7 @@ install_vscode_extensions() {
         "ms-dotnettools.csdevkit"
         "moshfeu.compare-folders"
         "nhoizey.gremlins"
+        "github.github-vscode-theme"
     )
 
     for ext in "${vscode_extensions[@]}"; do
@@ -859,31 +922,108 @@ install_vscode_extensions() {
         sudo -u "$REAL_USER" code --install-extension "$ext" --force || true
     done
 
-    # Configure vscode-icons and hidden/whitespace character detection in VS Code settings.json
+    # Ensure JetBrains Mono and Inter fonts are installed
+    pacman -S --needed --noconfirm ttf-jetbrains-mono inter-font 2>/dev/null || true
+
+    # Configure unified eye-comfort settings for VS Code and Antigravity IDE
     local vscode_user_dir="$USER_HOME/.config/Code/User"
-    local vscode_settings="$vscode_user_dir/settings.json"
-    mkdir -p "$vscode_user_dir"
+    local antigravity_ide_user_dir="$USER_HOME/.config/Antigravity IDE/User"
+    mkdir -p "$vscode_user_dir" "$antigravity_ide_user_dir"
+
     python3 -c '
 import json, os, sys
-path = sys.argv[1]
-data = {}
-if os.path.exists(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-data["workbench.iconTheme"] = "vscode-icons"
-data["editor.renderWhitespace"] = "all"
-data["editor.renderControlCharacters"] = True
-data["editor.unicodeHighlight.nonBasicASCII"] = False
-data["editor.unicodeHighlight.invisibleCharacters"] = True
-data["editor.unicodeHighlight.ambiguousCharacters"] = True
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=4)
-' "$vscode_settings" 2>/dev/null || true
-    chown -R "$REAL_USER:" "$USER_HOME/.config/Code" 2>/dev/null || true
-    log_ok "VS Code user settings configured (vscode-icons & hidden/unicode character visualization)."
+
+def configure_editor_json(path):
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+    data["workbench.iconTheme"] = "vscode-icons"
+    data["editor.renderWhitespace"] = "all"
+    data["editor.renderControlCharacters"] = True
+    data["editor.unicodeHighlight.nonBasicASCII"] = False
+    data["editor.unicodeHighlight.invisibleCharacters"] = True
+    data["editor.unicodeHighlight.ambiguousCharacters"] = True
+
+    # Eye comfort, anti-glare charcoal & typography harmonized with Antigravity 2
+    data["workbench.colorTheme"] = "GitHub Dark Dimmed"
+    data["editor.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
+    data["editor.fontSize"] = 15
+    data["editor.lineHeight"] = 1.6
+    data["editor.letterSpacing"] = 0
+    data["editor.fontWeight"] = "500"
+    data["editor.fontLigatures"] = True
+    data["editor.smoothScrolling"] = True
+    data["editor.cursorBlinking"] = "smooth"
+    data["editor.cursorSmoothCaretAnimation"] = "on"
+    data["workbench.fontAliasing"] = "antialiased"
+
+    # Terminal styling harmonized with Antigravity 2
+    data["terminal.integrated.fontFamily"] = "\x27JetBrains Mono\x27, \x27Hack Nerd Font\x27, monospace"
+    data["terminal.integrated.fontSize"] = 14
+    data["terminal.integrated.lineHeight"] = 1.4
+    data["terminal.integrated.letterSpacing"] = 0
+    data["terminal.integrated.fontWeight"] = "500"
+
+    # Antigravity 2 charcoal palette & high-contrast tokens
+    data["workbench.colorCustomizations"] = {
+        "[GitHub Dark Dimmed]": {
+            "editor.background": "#22272e",
+            "editor.foreground": "#f0f6fc",
+            "sideBar.background": "#1c2128",
+            "activityBar.background": "#1c2128",
+            "panel.background": "#22272e",
+            "terminal.background": "#22272e",
+            "terminal.foreground": "#f0f6fc",
+            "editorLineNumber.foreground": "#768390",
+            "editorLineNumber.activeForeground": "#58a6ff",
+            "sideBar.foreground": "#e6edf3",
+            "activityBar.foreground": "#f0f6fc"
+        }
+    }
+    data["editor.tokenColorCustomizations"] = {
+        "[GitHub Dark Dimmed]": {
+            "textMateRules": [
+                {
+                    "scope": ["comment"],
+                    "settings": {"foreground": "#8b949e", "fontStyle": "italic"}
+                },
+                {
+                    "scope": ["string", "string.quoted"],
+                    "settings": {"foreground": "#a5d6ff"}
+                },
+                {
+                    "scope": ["keyword", "keyword.control", "storage.type"],
+                    "settings": {"foreground": "#ff7b72", "fontStyle": "bold"}
+                },
+                {
+                    "scope": ["entity.name.function", "support.function"],
+                    "settings": {"foreground": "#d2a8ff"}
+                },
+                {
+                    "scope": ["variable", "variable.other", "variable.parameter"],
+                    "settings": {"foreground": "#f0f6fc"}
+                },
+                {
+                    "scope": ["constant.numeric", "constant.language"],
+                    "settings": {"foreground": "#79c0ff"}
+                }
+            ]
+        }
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+configure_editor_json(sys.argv[1])
+configure_editor_json(sys.argv[2])
+' "$vscode_user_dir/settings.json" "$antigravity_ide_user_dir/settings.json" 2>/dev/null || true
+    chown -R "$REAL_USER:" "$USER_HOME/.config/Code" "$USER_HOME/.config/Antigravity IDE" 2>/dev/null || true
+    log_ok "VS Code & Antigravity IDE settings configured (eye comfort, anti-glare charcoal & typography)."
 
     log_ok "All specified VS Code extensions installed and verified."
 }
@@ -918,6 +1058,10 @@ install_antigravity_ide() {
     local mode="${1:-install}"
     if [[ "$mode" != "reinstall" ]] && is_pkg_installed antigravity-ide; then
         log_ok "Antigravity IDE is already installed. Skipping package build."
+        # Ensure GitHub Dark Dimmed theme extension and settings are configured
+        if is_bin_installed antigravity-ide; then
+            sudo -u "$REAL_USER" antigravity-ide --install-extension github.github-vscode-theme --force >/dev/null 2>&1 || true
+        fi
         return 0
     fi
     ensure_session_snapshot "Before Installing Antigravity IDE"
@@ -926,6 +1070,9 @@ install_antigravity_ide() {
     sudo -u "$REAL_USER" pamac build --no-confirm antigravity-ide || {
         sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/install-ide.sh | bash' || true
     }
+    if is_bin_installed antigravity-ide; then
+        sudo -u "$REAL_USER" antigravity-ide --install-extension github.github-vscode-theme --force >/dev/null 2>&1 || true
+    fi
     log_ok "Antigravity IDE ready."
     post_install_hook
 }
@@ -943,6 +1090,34 @@ install_antigravity_standalone() {
         log_warn "AUR package build had an issue. Falling back to official installer..."
         sudo -u "$REAL_USER" bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' || true
     }
+
+    # Initialize Antigravity 2 anti-glare charcoal theme
+    local gemini_cfg_dir="$USER_HOME/.gemini/config"
+    local gemini_cfg="$gemini_cfg_dir/config.json"
+    mkdir -p "$gemini_cfg_dir"
+    python3 -c '
+import json, os, sys
+path = sys.argv[1]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+if "userSettings" not in data:
+    data["userSettings"] = {}
+data["userSettings"]["customThemeSeedsDark"] = {
+    "background": "#22272e",
+    "foregroundOverride": "#f0f6fc",
+    "primary": "#58a6ff"
+}
+data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+' "$gemini_cfg" 2>/dev/null || true
+    chown -R "$REAL_USER:" "$USER_HOME/.gemini" 2>/dev/null || true
+
     log_ok "Antigravity 2.0 Platform & CLI ready."
     post_install_hook
 }
@@ -2719,13 +2894,15 @@ EOF
 # ------------------------------------------------------------------------------
 menu_desktop_settings() {
     while true; do
-        local di_raw di_st hc_raw hc_st fp_raw fp_st
+        local di_raw di_st hc_raw hc_st fp_raw fp_st ec_raw ec_st
         di_raw=$(get_desktop_icons_status)
         hc_raw=$(get_hot_corner_status)
         fp_raw=$(get_fingerprint_status)
+        ec_raw=$(get_eye_comfort_status)
 
         [[ "$di_raw" == "enabled" ]] && di_st="${GREEN}[Enabled (Files Only)]${NC}" || di_st="${RED}[Disabled]${NC}"
         [[ "$hc_raw" == "enabled" ]] && hc_st="${RED}[Enabled]${NC}" || hc_st="${GREEN}[Disabled (Recommended)]${NC}"
+        [[ "$ec_raw" == "enabled" ]] && ec_st="${GREEN}[Active (Grayscale, Inter, JetBrains Mono)]${NC}" || ec_st="${YELLOW}[Disabled]${NC}"
 
         case "$fp_raw" in
             enrolled:*)
@@ -2748,18 +2925,19 @@ menu_desktop_settings() {
         echo -e "${BOLD}========================================================================${NC}"
         echo -e " 1) Top-Left Hot Corner                      $hc_st"
         echo -e " 2) Desktop Files & Folders                  $di_st"
-        echo -e " 3) Dock Pinned Apps & Workflow Order        ${CYAN}[11 Apps: Pamac, Files, Dev/AI, RustDesk]${NC}"
-        echo -e " 4) Configure Windows & Data Partitions      ${CYAN}[NTFS3 / Auto-Mount]${NC}"
-        echo -e " 5) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
-        echo -e " 6) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
-        echo -e " 7) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
-        echo -e " 8) Dell Hardware Tuning                     ${CYAN}[Battery, Sleep/Wake Fix & Fastboot]${NC}"
-        echo -e " 9) Dell UEFI BIOS & Firmware Updates        ${CYAN}[LVFS / fwupd]${NC}"
+        echo -e " 3) Eye Comfort Display & Font Sharpness     $ec_st"
+        echo -e " 4) Dock Pinned Apps & Workflow Order        ${CYAN}[11 Apps: Pamac, Files, Dev/AI, RustDesk]${NC}"
+        echo -e " 5) Configure Windows & Data Partitions      ${CYAN}[NTFS3 / Auto-Mount]${NC}"
+        echo -e " 6) Btrfs Health & Storage Maintenance       ${CYAN}[Balance & SSD TRIM]${NC}"
+        echo -e " 7) Dual-Boot GRUB & Snapshot Sync           ${CYAN}[10s Timeout, Shutdown Menu, grub-btrfsd]${NC}"
+        echo -e " 8) Goodix Fingerprint Sensor (27c6:538d)    $fp_st"
+        echo -e " 9) Dell Hardware Tuning                     ${CYAN}[Battery, Sleep/Wake Fix & Fastboot]${NC}"
+        echo -e " 10) Dell UEFI BIOS & Firmware Updates       ${CYAN}[LVFS / fwupd]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-9 / A / B): " choice
+        read -rp "Select an option (1-10 / A / B): " choice
 
         case "$choice" in
             1)
@@ -2771,30 +2949,34 @@ menu_desktop_settings() {
                 read -rp "Press [Enter] to continue..."
                 ;;
             3)
-                configure_dock_favorites
+                [[ "$ec_raw" == "enabled" ]] && configure_eye_comfort_display disable || configure_eye_comfort_display enable
                 read -rp "Press [Enter] to continue..."
                 ;;
             4)
-                configure_permanent_partitions
+                configure_dock_favorites
                 read -rp "Press [Enter] to continue..."
                 ;;
             5)
-                maintain_btrfs_storage
+                configure_permanent_partitions
                 read -rp "Press [Enter] to continue..."
                 ;;
             6)
-                configure_grub_dual_boot
+                maintain_btrfs_storage
                 read -rp "Press [Enter] to continue..."
                 ;;
             7)
-                configure_goodix_fingerprint interactive
+                configure_grub_dual_boot
                 read -rp "Press [Enter] to continue..."
                 ;;
             8)
-                configure_dell_hardware
+                configure_goodix_fingerprint interactive
                 read -rp "Press [Enter] to continue..."
                 ;;
             9)
+                configure_dell_hardware
+                read -rp "Press [Enter] to continue..."
+                ;;
+            10)
                 update_dell_firmware
                 read -rp "Press [Enter] to continue..."
                 ;;
@@ -2802,6 +2984,7 @@ menu_desktop_settings() {
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
                 configure_hot_corner disable
                 configure_desktop_icons enable
+                configure_eye_comfort_display enable
                 configure_dock_favorites
                 configure_permanent_partitions
                 maintain_btrfs_storage
