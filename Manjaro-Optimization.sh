@@ -159,6 +159,18 @@ log_ok()      { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;32m[OK]\033[0m %b\n' -1 "
 log_warn()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[1;33m[WARN]\033[0m %b\n' -1 "$1"; }
 log_error()   { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;31m[ERROR]\033[0m %b\n' -1 "$1"; }
 
+ask() {
+    local __var_name="$1"
+    local __prompt="$2"
+    local __input=""
+    if ! read -rp "$__prompt" __input; then
+        echo ""
+        log_warn "Standard input closed (EOF). Exiting."
+        exit 0
+    fi
+    printf -v "$__var_name" '%s' "$__input"
+}
+
 check_pacman_lock() {
     if [[ -f /var/lib/pacman/db.lck ]]; then
         if ! fuser /var/lib/pacman/db.lck &>/dev/null; then
@@ -202,7 +214,7 @@ is_bin_installed() {
 }
 
 is_node_installed() {
-    is_bin_installed node || { is_pkg_installed nvm && [[ -d "$USER_HOME/.nvm/versions/node" ]] && compgen -G "$USER_HOME/.nvm/versions/node/*" >/dev/null; }
+    is_bin_installed node || compgen -G "$USER_HOME/.nvm/versions/node/*/bin/node" >/dev/null
 }
 
 is_clasp_installed() {
@@ -1015,7 +1027,16 @@ optimize_system() {
     installed_kernels=$(mhwd-kernel -li 2>/dev/null || true)
     if ! echo "$installed_kernels" | grep -qE "linux612|linux66"; then
         log_warn "Only rolling kernel branch detected. For dual-boot resilience, an LTS fallback is recommended."
-        mhwd-kernel -i linux612 || log_warn "LTS fallback kernel installation deferred. Continuing with $running_ver."
+        if [[ "${mode:-}" == "noninteractive" ]]; then
+            log_info "Installing linux612 fallback kernel non-interactively..."
+            local k_pkgs=("linux612")
+            if is_pkg_installed "linux${k_major}${k_minor}-headers"; then
+                k_pkgs+=("linux612-headers")
+            fi
+            pacman -S --needed --noconfirm "${k_pkgs[@]}" || log_warn "LTS fallback kernel installation deferred. Continuing with $running_ver."
+        else
+            mhwd-kernel -i linux612 || log_warn "LTS fallback kernel installation deferred. Continuing with $running_ver."
+        fi
     else
         log_ok "Reliable fallback LTS kernel series verified."
     fi
@@ -1183,21 +1204,42 @@ install_vscode_extensions() {
         installed_exts=$(sudo -u "$REAL_USER" code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
     fi
 
+    local exts_to_install=()
     for ext in "${vscode_extensions[@]}"; do
         if echo "$installed_exts" | grep -qx "${ext,,}"; then
             log_ok "VS Code extension already installed: ${CYAN}${ext}${NC}"
             continue
         fi
-        log_info "Installing VS Code extension: ${CYAN}${ext}${NC}..."
-        local ok=false
-        for attempt in 1 2; do
-            if sudo -u "$REAL_USER" code --install-extension "$ext" --force 2>&1 | grep -vE "Warning: '(ozone-platform-hint|enable-features)'" ; then
-                ok=true
-                break
-            fi
-            sleep 1
-        done
+        exts_to_install+=("$ext")
     done
+
+    if (( ${#exts_to_install[@]} > 0 )); then
+        log_info "Batch-installing ${#exts_to_install[@]} missing VS Code extension(s)..."
+        local batch_args=()
+        for ext in "${exts_to_install[@]}"; do
+            batch_args+=(--install-extension "$ext")
+        done
+        local ext_out ext_exit=0
+        ext_out=$(sudo -u "$REAL_USER" code "${batch_args[@]}" --force 2>&1) || ext_exit=$?
+        echo "$ext_out" | grep -vE "Warning: '(ozone-platform-hint|enable-features)'" || true
+        if [[ $ext_exit -eq 0 ]]; then
+            log_ok "Batch installation of VS Code extensions completed."
+        else
+            log_warn "Batch installation encountered errors. Retrying missing extensions individually..."
+            for ext in "${exts_to_install[@]}"; do
+                local single_out single_exit=0
+                single_out=$(sudo -u "$REAL_USER" code --install-extension "$ext" --force 2>&1) || single_exit=$?
+                echo "$single_out" | grep -vE "Warning: '(ozone-platform-hint|enable-features)'" || true
+                if [[ $single_exit -eq 0 ]]; then
+                    log_ok "Installed: $ext"
+                else
+                    log_error "Failed to install VS Code extension: $ext"
+                fi
+            done
+        fi
+    else
+        log_ok "All VS Code extensions are already installed."
+    fi
 
     # Ensure JetBrains Mono and Inter fonts are installed
     if ! is_pkg_installed ttf-jetbrains-mono || ! is_pkg_installed inter-font; then
@@ -1450,7 +1492,7 @@ get_dotnet_latest_lts() {
         lts_ver=$(python3 -c '
 import sys, json, urllib.request
 try:
-    with urllib.request.urlopen("https://dotnetcli.azureedge.net/dotnet/release-metadata/releases-index.json", timeout=3) as response:
+    with urllib.request.urlopen("https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json", timeout=3) as response:
         data = json.loads(response.read().decode())
     active = [r["channel-version"] for r in data.get("releases-index", []) if r.get("release-type") == "lts" and r.get("support-phase") == "active"]
     if active:
@@ -1561,14 +1603,18 @@ install_clasp() {
 
     # Dependency check: Node.js & NVM
     if ! is_node_installed; then
-        echo ""
-        log_warn "Google Clasp requires Node.js LTS via NVM."
-        read -rp "Would you like to automatically install Node.js LTS via NVM now? (Y/n): " dep_conf
-        if [[ "$dep_conf" =~ ^[Nn]$ ]]; then
-            log_warn "Google Clasp installation cancelled: Node.js LTS is required."
-            return 1
+        if [[ "${SKIP_POST_HOOK:-0}" == "1" || "${mode:-}" == "noninteractive" ]]; then
+            install_nvm_node install
+        else
+            echo ""
+            log_warn "Google Clasp requires Node.js LTS via NVM."
+            read -rp "Would you like to automatically install Node.js LTS via NVM now? (Y/n): " dep_conf
+            if [[ "$dep_conf" =~ ^[Nn]$ ]]; then
+                log_warn "Google Clasp installation cancelled: Node.js LTS is required."
+                return 1
+            fi
+            install_nvm_node install
         fi
-        install_nvm_node install
     fi
 
     ensure_session_snapshot "Before Installing Google Clasp"
@@ -1592,6 +1638,7 @@ export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 nvm use default >/dev/null 2>&1 || true
 NODE_BIN_DIR="$(nvm which default 2>/dev/null | sed 's#/node$##')"
 if [[ -x "$NODE_BIN_DIR/clasp" ]]; then
+    export PATH="$NODE_BIN_DIR:$PATH"
     exec "$NODE_BIN_DIR/clasp" "$@"
 fi
 echo "Error: Google Clasp CLI is not found in the active Node.js environment ($NODE_BIN_DIR)." >&2
@@ -2044,7 +2091,7 @@ manage_vscode_action() {
         echo -e " Status:      ${GREEN}[Installed]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " 1) Reinstall / Update VS Code & Full Extension Suite"
-        echo -e " 2) Install / Sync Curated Extension Suite Only (18 Extensions)"
+        echo -e " 2) Install / Sync Curated Extension Suite Only (20 Extensions)"
         echo -e " 3) Uninstall VS Code"
         echo -e " 4) Cancel & Return"
         echo -e "${BOLD}========================================================================${NC}"
@@ -2131,7 +2178,7 @@ menu_dev_apps() {
         echo -e " 1) VS Code + Extension Suite        $st_vscode ${CYAN}[OFFICIAL + 18 DEV EXTENSIONS]${NC}"
         echo -e " 2) Antigravity IDE                  $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
         echo -e " 3) Antigravity 2.0 Platform         $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
-        echo -e " 4) .NET Core SDK & ASP.NET (LTS)    $st_dotnet ${CYAN}[DYNAMIC LTS: v10.0]${NC}"
+        echo -e " 4) .NET Core SDK & ASP.NET (LTS)    $st_dotnet ${CYAN}[DYNAMIC LTS: v$(get_dotnet_latest_lts)]${NC}"
         echo -e " 5) Node Version Manager (NVM/Node)  $st_node ${CYAN}[DYNAMIC LTS + COREPACK]${NC}"
         echo -e " 6) Google Clasp CLI (@google/clasp) $st_clasp ${CYAN}[APPS SCRIPT CLI]${NC}"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
@@ -2139,7 +2186,7 @@ menu_dev_apps() {
         echo -e " U) Uninstall ALL Development & AI Tools"
         echo -e " B) Back to Extra Applications Hub"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select a tool (1-6) or action (A / U / B): " choice
+        ask choice "Select a tool (1-6) or action (A / U / B): "
 
         case "$choice" in
             1) manage_vscode_action "$is_vscode" ;;
@@ -2197,7 +2244,7 @@ menu_virt_containers() {
         echo -e " U) Uninstall ALL Virtualization & Containers"
         echo -e " B) Back to Extra Applications Hub"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application (1-2) or action (A / U / B): " choice
+        ask choice "Select an application (1-2) or action (A / U / B): "
 
         case "$choice" in
             1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
@@ -2248,7 +2295,7 @@ menu_productivity_apps() {
         echo -e " U) Uninstall ALL Productivity & Remote Access Apps"
         echo -e " B) Back to Extra Applications Hub"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application (1-3) or action (A / U / B): " choice
+        ask choice "Select an application (1-3) or action (A / U / B): "
 
         case "$choice" in
             1) manage_app_action "Google Chrome Browser" "$is_chrome" install_chrome uninstall_chrome ;;
@@ -2305,7 +2352,7 @@ menu_multimedia_apps() {
         echo -e " U) Uninstall ALL Multimedia & Graphics Apps"
         echo -e " B) Back to Extra Applications Hub"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an application (1-4) or action (A / U / B): " choice
+        ask choice "Select an application (1-4) or action (A / U / B): "
 
         case "$choice" in
             1) manage_app_action "VLC Media Player" "$is_vlc" install_vlc uninstall_vlc ;;
@@ -2313,17 +2360,17 @@ menu_multimedia_apps() {
             3) manage_app_action "GIMP Image Editor" "$is_gimp" install_gimp uninstall_gimp ;;
             4) manage_app_action "Kdenlive Video Editor" "$is_kdenlive" install_kdenlive uninstall_kdenlive ;;
             [aA])
-                read -rp "Install ALL Multimedia & Graphics apps now? (y/N): " a_conf
+                ask a_conf "Install ALL Multimedia & Graphics apps now? (y/N): "
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
                     install_media install
-                    read -rp "Press [Enter] to continue..."
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [uU])
-                read -rp "Are you sure you want to uninstall ALL Multimedia & Graphics apps? (y/N): " u_conf
+                ask u_conf "Are you sure you want to uninstall ALL Multimedia & Graphics apps? (y/N): "
                 if [[ "$u_conf" =~ ^[Yy]$ ]]; then
                     uninstall_media
-                    read -rp "Press [Enter] to continue..."
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [bB]) break ;;
@@ -2380,7 +2427,7 @@ menu_extra_apps() {
         echo -e " U) Uninstall ALL Applications across ALL Categories"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select a category (1-4) or action (A / U / B): " choice
+        ask choice "Select a category (1-4) or action (A / U / B): "
 
         case "$choice" in
             1) menu_dev_apps ;;
@@ -2388,17 +2435,17 @@ menu_extra_apps() {
             3) menu_productivity_apps ;;
             4) menu_multimedia_apps ;;
             [aA])
-                read -rp "Install ALL applications across ALL categories now? (y/N): " a_conf
+                ask a_conf "Install ALL applications across ALL categories now? (y/N): "
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
                     install_all_apps
-                    read -rp "Press [Enter] to continue..."
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [uU])
-                read -rp "Are you sure you want to uninstall ALL applications across ALL categories? (y/N): " u_conf
+                ask u_conf "Are you sure you want to uninstall ALL applications across ALL categories? (y/N): "
                 if [[ "$u_conf" =~ ^[Yy]$ ]]; then
                     uninstall_all_apps
-                    read -rp "Press [Enter] to continue..."
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [bB]) break ;;
@@ -2435,6 +2482,47 @@ is_sensitive_partition() {
     return 1
 }
 
+fstab_ensure_btrfs_opts() {
+    local f="${1:-/etc/fstab}"
+    [[ ! -f "$f" ]] && return 1
+    shift || true
+    local opts_to_add=("noatime" "discard=async")
+    [[ $# -gt 0 ]] && opts_to_add=("$@")
+
+    local line out=() modified=false
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^([^#].*[[:space:]]btrfs[[:space:]]+)([^[:space:]]+)(.*)$ ]]; then
+            local prefix="${BASH_REMATCH[1]}"
+            local cur_opts="${BASH_REMATCH[2]}"
+            local suffix="${BASH_REMATCH[3]}"
+            local opt_list=",${cur_opts},"
+            local opt_changed=false
+
+            for o in "${opts_to_add[@]}"; do
+                local key="${o%%=*}"
+                if [[ "$opt_list" != *",$o,"* && "$opt_list" != *",$key="* ]]; then
+                    opt_list+="${o},"
+                    opt_changed=true
+                fi
+            done
+
+            if [[ "$opt_changed" == "true" ]]; then
+                opt_list="${opt_list#,}"
+                opt_list="${opt_list%,}"
+                line="${prefix}${opt_list}${suffix}"
+                modified=true
+            fi
+        fi
+        out+=("$line")
+    done < "$f"
+
+    if [[ "$modified" == "true" ]]; then
+        printf '%s\n' "${out[@]}" > "$f"
+        return 0
+    fi
+    return 1
+}
+
 configure_permanent_partitions() {
     local force="${1:-false}"
     if [[ "$SESSION_PARTITIONS_SYNCED" == "true" && "$force" != "force" ]]; then
@@ -2456,16 +2544,11 @@ configure_permanent_partitions() {
     fi
 
     # Apply Btrfs NVMe 'noatime,discard=async' mount optimization & label system partition
-    if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "discard=async"; then
-        sed -i 's/compress=zstd:1/noatime,discard=async,compress=zstd:1/g' /etc/fstab
-        sed -i 's/defaults,noatime,noatime/defaults,noatime/g' /etc/fstab
-        sed -i 's/defaults,noatime,compress=zstd/defaults,noatime,discard=async,compress=zstd/g' /etc/fstab
-        mount -o remount / 2>/dev/null || true
-        mount -o remount /home 2>/dev/null || true
-        mount -o remount /var/cache 2>/dev/null || true
-        mount -o remount /var/log 2>/dev/null || true
-        mount -o remount /mnt/my-data 2>/dev/null || true
-        log_ok "Btrfs subvolumes remounted with noatime and discard=async."
+    if fstab_ensure_btrfs_opts /etc/fstab "noatime" "discard=async"; then
+        for btrfs_mp in $(findmnt -rn -t btrfs -o TARGET 2>/dev/null || true); do
+            mount -o remount "$btrfs_mp" 2>/dev/null || true
+        done
+        log_ok "Btrfs subvolumes updated with noatime and discard=async (idempotent)."
     fi
 
     local root_src root_dev part_num disk_dev
@@ -2847,8 +2930,9 @@ get_fingerprint_status() {
     fi
     if is_pkg_installed libfprint-goodix-538d || is_pkg_installed libfprint-goodix-521d || [[ -f /usr/lib/goodix-538d/provision-goodix-538d.py ]]; then
         local count
-        count=$(run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -cE "^ - #[0-9]+:" || echo 0)
-        if [[ $count -gt 0 ]]; then
+        count=$(run_as_user fprintd-list "$REAL_USER" 2>/dev/null | grep -cE "^ - #[0-9]+:" || true)
+        count="${count:-0}"
+        if (( count > 0 )); then
             echo "enrolled:$count"
         elif find "/var/lib/fprint/$REAL_USER" -type f 2>/dev/null | grep -q .; then
             echo "enrolled:1"
@@ -3024,7 +3108,7 @@ manage_fingerprints_menu() {
         fi
         echo -e " B) Back to Hardware Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option: " fp_act
+        ask fp_act "Select an option: "
 
         case "$fp_act" in
             1) enroll_single_finger "right-index-finger" "Right Index Finger" ;;
@@ -3085,7 +3169,7 @@ configure_goodix_fingerprint() {
             echo -e " 1) Manage / Enroll Fingerprints"
             echo -e " 2) Force Reinstall / Recompile Driver"
             echo -e " 3) Return to Menu"
-            read -rp "Select an option (1-3): " fp_choice
+            ask fp_choice "Select an option (1-3): "
             case "$fp_choice" in
                 1)
                     manage_fingerprints_menu
@@ -3147,7 +3231,7 @@ configure_goodix_fingerprint() {
 
     # Pin in /etc/pacman.conf to prevent official updates from breaking the driver
     if grep -q "^IgnorePkg" /etc/pacman.conf; then
-        if ! grep -E "^IgnorePkg.*libfprint" /etc/pacman.conf; then
+        if ! grep -qE "^IgnorePkg.*libfprint" /etc/pacman.conf; then
             sed -i '/^IgnorePkg/ s/$/ libfprint libfprint-goodix-538d libfprint-goodix-521d/' /etc/pacman.conf
         fi
     else
@@ -3292,48 +3376,48 @@ menu_desktop_settings() {
         echo -e " A) Run / Apply ALL Settings & Hardware Tuning"
         echo -e " B) Back to Main Menu"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Select an option (1-10 / A / B): " choice
+        ask choice "Select an option (1-10 / A / B): "
 
         case "$choice" in
             1)
                 [[ "$hc_raw" == "enabled" ]] && configure_hot_corner disable || configure_hot_corner enable
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             2)
                 [[ "$di_raw" == "enabled" ]] && configure_desktop_icons disable || configure_desktop_icons enable
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             3)
                 [[ "$ec_raw" == "enabled" ]] && configure_eye_comfort_display disable || configure_eye_comfort_display enable
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             4)
                 configure_dock_favorites
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             5)
                 configure_permanent_partitions
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             6)
                 maintain_btrfs_storage
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             7)
                 configure_grub_dual_boot
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             8)
                 configure_goodix_fingerprint interactive
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             9)
                 configure_dell_hardware
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             10)
                 update_dell_firmware
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             [aA])
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
@@ -3348,7 +3432,7 @@ menu_desktop_settings() {
                 configure_dell_hardware noninteractive
                 update_dell_firmware noninteractive
                 log_ok "All settings and hardware tuning routines completed."
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             [bB]) break ;;
             *) log_warn "Invalid selection." ;;
@@ -3393,7 +3477,7 @@ run_all_stages() {
     log_ok "🎉 ALL 3 STAGES (OPTIMIZE, SETTINGS & EXTRA APPS) COMPLETED SUCCESSFULLY!"
     log_info "========================================================================"
     if [[ "$mode" != "noninteractive" ]]; then
-        read -rp "Press [Enter] to return to the main menu..."
+        ask _ "Press [Enter] to return to the main menu..."
     fi
 }
 
@@ -3409,7 +3493,7 @@ menu_timeshift_sync() {
         echo -e " ${BOLD}4)${NC} Audit & Inspect GRUB Menu Entries (Check for duplicates)"
         echo -e " ${BOLD}5)${NC} Back to Main Menu"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        read -rp "Please enter your choice (1-5): " ts_opt
+        ask ts_opt "Please enter your choice (1-5): "
 
         case "$ts_opt" in
             1)
@@ -3523,7 +3607,7 @@ while true; do
     echo -e "${BOLD}------------------------------------------------------------------------${NC}"
     echo -e " 📋 Live log file: ${CYAN}$LOG_FILE${NC}"
     echo -e "${BOLD}========================================================================${NC}"
-    read -rp "Please enter your choice (1-5 / A): " main_choice
+    ask main_choice "Please enter your choice (1-5 / A): "
 
     case "$main_choice" in
         1) optimize_system ;;

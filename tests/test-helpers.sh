@@ -101,6 +101,39 @@ purge_mount_dir "/media"
 assert_eq 0 0 "purge_mount_dir safely skips root/system directories"
 
 # ------------------------------------------------------------------------------
+# Test 2B: Idempotent Btrfs Options in fstab (fstab_ensure_btrfs_opts)
+# ------------------------------------------------------------------------------
+echo "--- Testing fstab_ensure_btrfs_opts ---"
+MOCK_FSTAB="$TEST_DIR/fstab"
+cat << 'EOF' > "$MOCK_FSTAB"
+# /etc/fstab: static file system information.
+UUID=1111-2222 / btrfs subvol=/@,defaults,noatime,discard=async,compress=zstd:1 0 0
+UUID=3333-4444 /home btrfs subvol=/@home,defaults,noatime,discard=async,compress=zstd:1 0 0
+UUID=5555-6666 /mnt/my-data btrfs defaults,noatime,compress=zstd 0 0
+UUID=7777-8888 /boot/efi vfat defaults,noatime 0 2
+EOF
+
+# Pass 1: should detect that /mnt/my-data lacks discard=async, modify it, and return 0
+if fstab_ensure_btrfs_opts "$MOCK_FSTAB" "noatime" "discard=async"; then
+    assert_eq 0 0 "fstab_ensure_btrfs_opts pass 1 modifies fstab"
+else
+    assert_eq 0 1 "fstab_ensure_btrfs_opts pass 1 failed"
+fi
+
+# Verify /mnt/my-data line now has discard=async
+grep -q "/mnt/my-data btrfs defaults,noatime,compress=zstd,discard=async" "$MOCK_FSTAB" && assert_eq 0 0 "/mnt/my-data gained discard=async" || assert_eq 0 1 "Option not added"
+
+# Pass 2: running on already compliant fstab should make NO changes and return 1 (no changes)
+before_hash=$(md5sum "$MOCK_FSTAB" | cut -d' ' -f1)
+if fstab_ensure_btrfs_opts "$MOCK_FSTAB" "noatime" "discard=async"; then
+    assert_eq 1 0 "Pass 2 should not modify compliant file"
+else
+    assert_eq 0 0 "Pass 2 is idempotent (no changes returned)"
+fi
+after_hash=$(md5sum "$MOCK_FSTAB" | cut -d' ' -f1)
+assert_eq "$before_hash" "$after_hash" "fstab byte-identical across repeated passes"
+
+# ------------------------------------------------------------------------------
 # Test 3: Hardware Guard (is_supported_hardware)
 # ------------------------------------------------------------------------------
 echo "--- Testing is_supported_hardware ---"
