@@ -46,13 +46,48 @@ detect_root_device() {
     echo "$dev"
 }
 
+BROKEN_KERNELS=("7.1")
+declare -a UNLOCKED_SNAPSHOTS=()
+
+discover_host_kernels() {
+    local k_list=()
+    local img
+    for img in /boot/vmlinuz-*-x86_64; do
+        [[ ! -f "$img" ]] && continue
+        local k
+        k=$(basename "$img" | sed -E 's/^vmlinuz-([0-9]+\.[0-9]+).*/\1/')
+        local broken=false
+        local b
+        for b in "${BROKEN_KERNELS[@]}"; do
+            if [[ "$k" == "$b" ]]; then
+                broken=true
+                break
+            fi
+        done
+        if [[ "$broken" == "false" && -n "$k" ]]; then
+            if [[ ! " ${k_list[*]:-} " =~ " ${k} " ]]; then
+                k_list+=("$k")
+            fi
+        fi
+    done
+    echo "${k_list[@]:-}"
+}
+
 cleanup() {
+    if (( ${#UNLOCKED_SNAPSHOTS[@]} > 0 )); then
+        local s
+        for s in "${UNLOCKED_SNAPSHOTS[@]}"; do
+            if [[ -d "$s" ]]; then
+                btrfs property set "$s" ro true 2>/dev/null || true
+            fi
+        done
+    fi
     if [[ -d "/mnt/ts-fix-root" ]]; then
         umount "/mnt/ts-fix-root" 2>/dev/null || true
         rmdir "/mnt/ts-fix-root" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 main() {
     echo -e "${BOLD}${CYAN}================================================================${NC}"
@@ -97,8 +132,9 @@ main() {
         snap_kernels=$(ls "$snap_root/boot"/vmlinuz-* 2>/dev/null | xargs -n1 basename | sed 's/vmlinuz-//' | tr '\n' ' ' || true)
         log_info "  Current kernels in snapshot: ${snap_kernels:-none}"
 
-        # Temporarily make snapshot read-write for repair
+        # Temporarily make snapshot read-write for repair and track in unlock list
         btrfs property set "$snap_root" ro false
+        UNLOCKED_SNAPSHOTS+=("$snap_root")
 
         # 1. Clear stale grubenv in snapshot
         if [[ -f "$snap_root/boot/grub/grubenv" ]]; then
@@ -106,16 +142,11 @@ main() {
             grub-editenv "$snap_root/boot/grub/grubenv" unset next_entry 2>/dev/null || true
         fi
 
-        # 2. Remove obsolete broken 7.1 kernel that crashes touchpad/IRQ 27 on Dell Inspiron 7706
-        if [[ -f "$snap_root/boot/vmlinuz-7.1-x86_64" ]]; then
-            log_info "  Purging obsolete broken kernel 7.1 from snapshot..."
-            rm -f "$snap_root/boot/vmlinuz-7.1-x86_64"*
-            rm -f "$snap_root/boot/initramfs-7.1-x86_64"*
-            rm -f "$snap_root/boot/linux71-x86_64.kver"*
-        fi
-
-        # 3. Inject modern working kernels (6.12 LTS & 7.2) into snapshot
-        for kver in "6.12" "7.2"; do
+        # 2. Inject modern working host kernels dynamically into snapshot
+        local host_kernels=()
+        read -r -a host_kernels <<< "$(discover_host_kernels)"
+        for kver in "${host_kernels[@]}"; do
+            [[ -z "$kver" ]] && continue
             if [[ -f "/boot/vmlinuz-${kver}-x86_64" && ! -f "$snap_root/boot/vmlinuz-${kver}-x86_64" ]]; then
                 log_info "  Injecting Kernel ${kver} into $snap_name..."
                 mkdir -p "$snap_root/boot"
@@ -138,6 +169,20 @@ main() {
             done
         done
 
+        # 3. Clean obsolete broken 7.1 kernel ONLY if another valid kernel is present
+        if [[ -f "$snap_root/boot/vmlinuz-7.1-x86_64" ]]; then
+            local other_kernels
+            other_kernels=$(find "$snap_root/boot" -maxdepth 1 -name "vmlinuz-*-x86_64" ! -name "vmlinuz-7.1-x86_64" 2>/dev/null || true)
+            if [[ -n "$other_kernels" ]]; then
+                log_info "  Purging obsolete broken kernel 7.1 from snapshot..."
+                rm -f "$snap_root/boot/vmlinuz-7.1-x86_64"*
+                rm -f "$snap_root/boot/initramfs-7.1-x86_64"*
+                rm -f "$snap_root/boot/linux71-x86_64.kver"*
+            else
+                log_warn "  Kernel 7.1 is the only kernel in $snap_name and no other kernel could be injected. Retaining to preserve bootability."
+            fi
+        fi
+
         # 4. Ensure microcode is present in snapshot
         if [[ -f /boot/intel-ucode.img && ! -f "$snap_root/boot/intel-ucode.img" ]]; then
             cp -p /boot/intel-ucode.img "$snap_root/boot/"
@@ -155,8 +200,13 @@ main() {
         # 6. Clear stale fontconfig cache to avoid GNOME Shell startup issues
         rm -rf "$snap_root/var/cache/fontconfig"/* 2>/dev/null || true
 
-        # Re-lock snapshot as read-only
+        # Re-lock snapshot as read-only and remove from tracking list
         btrfs property set "$snap_root" ro true
+        local remaining_unlocked=()
+        for u in "${UNLOCKED_SNAPSHOTS[@]}"; do
+            [[ "$u" != "$snap_root" ]] && remaining_unlocked+=("$u")
+        done
+        UNLOCKED_SNAPSHOTS=("${remaining_unlocked[@]:-}")
 
         log_ok "  Snapshot ${BOLD}$snap_name${NC} successfully repaired & synchronized."
         (( ++fixed_count ))

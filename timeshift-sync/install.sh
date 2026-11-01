@@ -19,6 +19,13 @@ log_ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
+REPAIR_SNAPSHOTS=false
+for arg in "$@"; do
+    case "$arg" in
+        --repair-snapshots) REPAIR_SNAPSHOTS=true ;;
+    esac
+done
+
 if [[ $EUID -ne 0 ]]; then
     echo -e "${YELLOW}Superuser privileges required. Elevating via sudo...${NC}"
     exec sudo "$0" "$@"
@@ -67,10 +74,15 @@ mkdir -p /etc/xdg/autostart
 cp "$SCRIPT_DIR/timeshift-sync-notify.desktop" /etc/xdg/autostart/timeshift-sync-notify.desktop
 log_ok "Desktop notification handler installed."
 
-# 5. Fix Existing Older Snapshots
-log_info "5/6: Inspecting and fixing existing Timeshift snapshots..."
-bash "$SCRIPT_DIR/fix-existing-snapshots.sh"
-log_ok "Existing snapshots repaired and verified."
+# 5. Fix Existing Older Snapshots (On-Demand)
+if [[ "$REPAIR_SNAPSHOTS" == "true" ]]; then
+    log_info "5/6: Inspecting and fixing existing Timeshift snapshots (--repair-snapshots enabled)..."
+    bash "$SCRIPT_DIR/fix-existing-snapshots.sh"
+    log_ok "Existing snapshots repaired and verified."
+else
+    log_info "5/6: Existing snapshot repair skipped by default."
+    log_info "     (Use --repair-snapshots or run 'timeshift-fix-snapshots' on demand)."
+fi
 
 # 6. Ensure GRUB BTRFS daemon is watching
 log_info "6/6: Verifying grub-btrfsd daemon..."

@@ -14,6 +14,32 @@ echo "=================================================================="
 echo "Timeshift Post-Restore Hook triggered at: $(date -Iseconds)"
 echo "TS_SNAPSHOT_PATH: ${TS_SNAPSHOT_PATH:-undefined}"
 
+BROKEN_KERNELS=("7.1")
+
+discover_host_kernels() {
+    local k_list=()
+    local img
+    for img in /boot/vmlinuz-*-x86_64; do
+        [[ ! -f "$img" ]] && continue
+        local k
+        k=$(basename "$img" | sed -E 's/^vmlinuz-([0-9]+\.[0-9]+).*/\1/')
+        local broken=false
+        local b
+        for b in "${BROKEN_KERNELS[@]}"; do
+            if [[ "$k" == "$b" ]]; then
+                broken=true
+                break
+            fi
+        done
+        if [[ "$broken" == "false" && -n "$k" ]]; then
+            if [[ ! " ${k_list[*]:-} " =~ " ${k} " ]]; then
+                k_list+=("$k")
+            fi
+        fi
+    done
+    echo "${k_list[@]:-}"
+}
+
 # Detect root device
 root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
 root_dev="${root_dev%%\[*}"
@@ -60,9 +86,12 @@ if [[ ! -d "$chroot_dir/boot" ]]; then
     exit 0
 fi
 
-# Ensure working modern kernels (6.12 / 7.2) exist in restored root, and clean obsolete broken 7.1
+# Ensure working modern kernels from host exist in restored root, and clean obsolete broken 7.1
 echo "[INFO] Verifying kernel targets in restored system..."
-for kver in "6.12" "7.2"; do
+host_kernels=()
+read -r -a host_kernels <<< "$(discover_host_kernels)"
+for kver in "${host_kernels[@]}"; do
+    [[ -z "$kver" ]] && continue
     if [[ -f "/boot/vmlinuz-${kver}-x86_64" && ! -f "$chroot_dir/boot/vmlinuz-${kver}-x86_64" ]]; then
         echo "[INFO] Copying working kernel ${kver} into restored root..."
         cp -p "/boot/vmlinuz-${kver}-x86_64" "$chroot_dir/boot/"
@@ -81,12 +110,17 @@ for kver in "6.12" "7.2"; do
     done
 done
 
-# Clean obsolete broken 7.1 kernel that crashes Dell Inspiron 7706 touchpad
+# Clean obsolete broken 7.1 kernel ONLY if another valid kernel is present
 if [[ -f "$chroot_dir/boot/vmlinuz-7.1-x86_64" ]]; then
-    echo "[INFO] Removing obsolete kernel 7.1 from restored root to avoid hardware freeze..."
-    rm -f "$chroot_dir/boot/vmlinuz-7.1-x86_64"*
-    rm -f "$chroot_dir/boot/initramfs-7.1-x86_64"*
-    rm -f "$chroot_dir/boot/linux71-x86_64.kver"*
+    other_kernels=$(find "$chroot_dir/boot" -maxdepth 1 -name "vmlinuz-*-x86_64" ! -name "vmlinuz-7.1-x86_64" 2>/dev/null || true)
+    if [[ -n "$other_kernels" ]]; then
+        echo "[INFO] Removing obsolete kernel 7.1 from restored root to avoid hardware freeze..."
+        rm -f "$chroot_dir/boot/vmlinuz-7.1-x86_64"*
+        rm -f "$chroot_dir/boot/initramfs-7.1-x86_64"*
+        rm -f "$chroot_dir/boot/linux71-x86_64.kver"*
+    else
+        echo "[WARN] Kernel 7.1 is the only kernel in restored root and no alternative could be copied. Retaining to preserve bootability."
+    fi
 fi
 
 # Deploy first-boot safeguard service into restored root so it's guaranteed present

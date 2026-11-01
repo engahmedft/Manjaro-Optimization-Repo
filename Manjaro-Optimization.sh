@@ -3564,9 +3564,10 @@ menu_timeshift_sync() {
         echo -e " ${BOLD}2)${NC} Repair Existing Snapshots (Inject LTS fallback & fix grubenv)"
         echo -e " ${BOLD}3)${NC} Install / Reinstall Native Hooks & First-Boot Safeguard"
         echo -e " ${BOLD}4)${NC} Audit & Inspect GRUB Menu Entries (Check for duplicates)"
-        echo -e " ${BOLD}5)${NC} Back to Main Menu"
+        echo -e " ${BOLD}5)${NC} Uninstall Timeshift Synchronization Suite"
+        echo -e " ${BOLD}6)${NC} Back to Main Menu"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        ask ts_opt "Please enter your choice (1-5): "
+        ask ts_opt "Please enter your choice (1-6): "
 
         case "$ts_opt" in
             1)
@@ -3603,8 +3604,15 @@ menu_timeshift_sync() {
                     log_error "check-grub-menu.sh not found."
                 fi
                 ;;
-            5) break ;;
-            *) log_warn "Invalid option. Please enter 1-5." ;;
+            5)
+                if [[ -f "$SCRIPT_DIR/timeshift-sync/uninstall.sh" ]]; then
+                    bash "$SCRIPT_DIR/timeshift-sync/uninstall.sh"
+                else
+                    log_error "uninstall.sh not found."
+                fi
+                ;;
+            6) break ;;
+            *) log_warn "Invalid option. Please enter 1-6." ;;
         esac
     done
 }

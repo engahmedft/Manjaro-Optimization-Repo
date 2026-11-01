@@ -35,11 +35,9 @@ main() {
     echo -e "${BOLD}${CYAN}             GRUB MENU STRUCTURE & DUPLICATION AUDIT            ${NC}"
     echo -e "${BOLD}${CYAN}================================================================${NC}"
 
-    # Check for stale temporary files
+    # Check for temporary build files (read-only audit)
     if [[ -f "/boot/grub/grub.cfg.new" ]]; then
-        log_warn "Detected stale temporary file: /boot/grub/grub.cfg.new (clearing...)"
-        rm -f "/boot/grub/grub.cfg.new"
-        log_ok "Stale /boot/grub/grub.cfg.new removed."
+        log_warn "Detected temporary build file: /boot/grub/grub.cfg.new (grub-mkconfig may currently be generating)."
     fi
 
     # Extract top-level menu entries and submenus
