@@ -232,6 +232,38 @@ assert_eq 1 "$(( auth_count >= 2 ))" "PAM has at least 2 auth lines (sufficient 
 assert_eq 1 "$([[ -f $TEST_PAM.pre-fprintd ]] && echo 1 || echo 0)" "PAM pre-fprintd backup created"
 assert_eq 1 "$(grep -q "auth       include      system-auth" "$TEST_PAM" && echo 1 || echo 0)" "Fallback system-auth rule preserved"
 
+# ------------------------------------------------------------------------------
+# Test 6: Idempotent set_grub_var Helper
+# ------------------------------------------------------------------------------
+echo "--- Testing set_grub_var ---"
+TEST_GRUB="$TEST_DIR/grub_default"
+cat << 'EOF' > "$TEST_GRUB"
+GRUB_TIMEOUT=5
+#GRUB_DISABLE_OS_PROBER=false
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+EOF
+
+# 1. Update existing key
+set_grub_var "GRUB_TIMEOUT" "10" "$TEST_GRUB"
+grep -q "^GRUB_TIMEOUT=10" "$TEST_GRUB"
+assert_eq 0 $? "set_grub_var updates existing key"
+
+# 2. Uncomment and set key
+set_grub_var "GRUB_DISABLE_OS_PROBER" "false" "$TEST_GRUB"
+grep -q "^GRUB_DISABLE_OS_PROBER=false" "$TEST_GRUB"
+assert_eq 0 $? "set_grub_var uncomments commented key"
+
+# 3. Append missing key
+set_grub_var "GRUB_THEME" '"/usr/share/grub/themes/manjaro-hidpi/theme.txt"' "$TEST_GRUB"
+grep -q 'GRUB_THEME="/usr/share/grub/themes/manjaro-hidpi/theme.txt"' "$TEST_GRUB"
+assert_eq 0 $? "set_grub_var appends new key"
+
+# 4. Idempotency on exact value
+hash1=$(md5sum "$TEST_GRUB" | cut -d' ' -f1)
+set_grub_var "GRUB_TIMEOUT" "10" "$TEST_GRUB"
+hash2=$(md5sum "$TEST_GRUB" | cut -d' ' -f1)
+assert_eq "$hash1" "$hash2" "set_grub_var is byte-identical when key=val is already current"
+
 echo ""
 echo "========================================================================"
 echo "TEST RESULTS: $PASSED passed, $FAILED failed."

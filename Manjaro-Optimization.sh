@@ -128,7 +128,8 @@ if [[ "${MANJARO_OPT_SOURCE_ONLY:-0}" != "1" ]]; then
         chown "$REAL_USER:" "$LOG_FILE" 2>/dev/null || true
     fi
 
-    exec > >(tee -a "$LOG_FILE") 2>&1
+    # Strip ANSI color codes from disk log while keeping full color on stdout
+    exec > >(tee >(sed -u -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' >> "$LOG_FILE")) 2>&1
 
     trap cleanup EXIT
     trap 'exit 130' INT
@@ -152,6 +153,11 @@ SESSION_SLEEP_FIX_APPLIED=false
 SESSION_BTRFS_MAINTAINED=false
 SESSION_GOODIX_CONFIGURED=false
 SESSION_TIMESHIFT_SYNC_INSTALLED=false
+
+# Deferred GRUB regeneration states
+PENDING_GRUB_REBUILD=false
+DEFER_GRUB_REBUILD=false
+GRUB_CONFIG_CHANGED=false
 
 timestamp() { printf '%(%Y-%m-%d %H:%M:%S)T' -1; }
 log_info()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;34m[INFO]\033[0m %b\n' -1 "$1"; }
@@ -221,6 +227,59 @@ is_clasp_installed() {
     is_bin_installed clasp
 }
 
+set_grub_var() {
+    local key="$1"
+    local val="$2"
+    local file="${3:-/etc/default/grub}"
+    [[ ! -f "$file" ]] && return 1
+
+    local new_entry="${key}=${val}"
+    # Check if exact uncommented entry already exists
+    if grep -qE "^[[:space:]]*${key}=" "$file"; then
+        local current_line
+        current_line=$(grep -E "^[[:space:]]*${key}=" "$file" | head -n 1)
+        if [[ "$current_line" == "$new_entry" ]]; then
+            return 0
+        fi
+    fi
+
+    local escaped_entry="${new_entry//\\/\\\\}"
+    escaped_entry="${escaped_entry//&/\\&}"
+
+    if grep -qE "^#?[[:space:]]*${key}=" "$file"; then
+        sed -i -E "s|^#?[[:space:]]*${key}=.*|${escaped_entry}|" "$file"
+    else
+        echo "$new_entry" >> "$file"
+    fi
+    GRUB_CONFIG_CHANGED=true
+    PENDING_GRUB_REBUILD=true
+}
+
+regenerate_grub_cfg() {
+    local mode="${1:-normal}" # "normal", "force", "defer"
+    if [[ "$mode" == "defer" || "$DEFER_GRUB_REBUILD" == "true" ]]; then
+        PENDING_GRUB_REBUILD=true
+        log_info "GRUB configuration update marked as pending."
+        return 0
+    fi
+
+    if [[ "$mode" != "force" && "$PENDING_GRUB_REBUILD" != "true" && "$GRUB_CONFIG_CHANGED" != "true" ]]; then
+        log_info "GRUB configuration is already up to date. Skipping regeneration."
+        return 0
+    fi
+
+    log_info "Regenerating GRUB configuration (/boot/grub/grub.cfg)..."
+    if command -v update-grub &>/dev/null; then
+        update-grub > /dev/null 2>&1 || true
+    elif command -v grub-mkconfig &>/dev/null; then
+        grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+    fi
+    PENDING_GRUB_REBUILD=false
+    GRUB_CONFIG_CHANGED=false
+    SESSION_GRUB_SYNCED=true
+    log_ok "GRUB configuration generated successfully."
+}
+
 sync_grub_snapshots() {
     log_info "Synchronizing Timeshift snapshots with GRUB boot menu..."
     # If grub.cfg already contains snapshots submenu hook, regenerating 41_snapshots-btrfs is instantaneous (<0.2s)
@@ -230,11 +289,7 @@ sync_grub_snapshots() {
         fi
     else
         # Full generation needed only once to register submenu in grub.cfg
-        if command -v update-grub &>/dev/null; then
-            update-grub > /dev/null 2>&1 || true
-        elif command -v grub-mkconfig &>/dev/null; then
-            grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
-        fi
+        regenerate_grub_cfg force
     fi
     log_ok "GRUB boot menu snapshots synchronized."
 }
@@ -348,12 +403,12 @@ configure_grub_hidpi_theme() {
         pacman -S --needed --noconfirm ttf-dejavu || true
     fi
 
-    # Generate crisp HiDPI vector fonts
+    # Generate crisp HiDPI vector fonts if not already cached
     if command -v grub-mkfont &>/dev/null; then
-        grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_28.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
-        grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_bold_28.pf2" /usr/share/fonts/TTF/DejaVuSans-Bold.ttf 2>/dev/null || true
-        grub-mkfont -s 20 -o "$hidpi_theme/dejavu_sans_20.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
-        grub-mkfont -s 18 -o "$hidpi_theme/dejavu_sans_18.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+        [[ ! -s "$hidpi_theme/dejavu_sans_28.pf2" ]] && grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_28.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+        [[ ! -s "$hidpi_theme/dejavu_sans_bold_28.pf2" ]] && grub-mkfont -s 28 -o "$hidpi_theme/dejavu_sans_bold_28.pf2" /usr/share/fonts/TTF/DejaVuSans-Bold.ttf 2>/dev/null || true
+        [[ ! -s "$hidpi_theme/dejavu_sans_20.pf2" ]] && grub-mkfont -s 20 -o "$hidpi_theme/dejavu_sans_20.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
+        [[ ! -s "$hidpi_theme/dejavu_sans_18.pf2" ]] && grub-mkfont -s 18 -o "$hidpi_theme/dejavu_sans_18.pf2" /usr/share/fonts/TTF/DejaVuSans.ttf 2>/dev/null || true
     fi
 
     # Write calibrated theme geometry for high-resolution displays
@@ -420,11 +475,8 @@ terminal-border: "0"
 EOF
 
     # Configure /etc/default/grub with HiDPI theme and resolution fallbacks
-    sed -i '/^GRUB_THEME=/d' /etc/default/grub
-    echo 'GRUB_THEME="/usr/share/grub/themes/manjaro-hidpi/theme.txt"' >> /etc/default/grub
-
-    sed -i '/^GRUB_GFXMODE=/d' /etc/default/grub
-    echo 'GRUB_GFXMODE="2560x1600,1920x1200,1280x800,auto"' >> /etc/default/grub
+    set_grub_var "GRUB_THEME" '"/usr/share/grub/themes/manjaro-hidpi/theme.txt"'
+    set_grub_var "GRUB_GFXMODE" '"2560x1600,1920x1200,1280x800,auto"'
 
     log_ok "GRUB HiDPI theme (28pt font & scaled geometry) configured."
 }
@@ -449,11 +501,14 @@ EOF
     log_ok "Intel i915 modprobe configuration updated (PSR/FBC/DC deep sleep states disabled)."
 
     # 2. Ensure all sleep mitigation parameters exist in /etc/default/grub
+    local param
     local grub_modified=false
     for param in "i915.enable_guc=3" "i915.enable_psr=0" "i915.enable_fbc=0" "i915.enable_dc=0"; do
         if ! grep -q "$param" /etc/default/grub; then
             sed -i -E "s/GRUB_CMDLINE_LINUX_DEFAULT=(['\"])/GRUB_CMDLINE_LINUX_DEFAULT=\1${param} /" /etc/default/grub
             grub_modified=true
+            GRUB_CONFIG_CHANGED=true
+            PENDING_GRUB_REBUILD=true
         fi
     done
 
@@ -471,12 +526,7 @@ EOF
     fi
 
     if [[ "$grub_modified" == "true" ]]; then
-        log_info "Regenerating GRUB configuration with sleep mitigation flags..."
-        if command -v update-grub &>/dev/null; then
-            update-grub > /dev/null 2>&1 || true
-        elif command -v grub-mkconfig &>/dev/null; then
-            grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
-        fi
+        regenerate_grub_cfg
     fi
 
     SESSION_SLEEP_FIX_APPLIED=true
@@ -490,6 +540,7 @@ configure_grub_dual_boot() {
         return 0
     fi
     log_info "Configuring dual-boot GRUB (menu visible, 10s timeout, shutdown menu, snapshot sync & LocalRTC)..."
+    local pkg
     local grub_pkgs=()
     for pkg in os-prober grub-btrfs inotify-tools; do
         is_pkg_installed "$pkg" || grub_pkgs+=("$pkg")
@@ -502,13 +553,11 @@ configure_grub_dual_boot() {
         timedatectl set-local-rtc 1 --adjust-system-clock 2>/dev/null || true
     fi
 
-    # Unconditionally configure GRUB for dual-boot visibility
-    sed -i '/GRUB_DISABLE_OS_PROBER/d' /etc/default/grub
-    echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
-
-    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
-    sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
-    sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
+    # Unconditionally configure GRUB for dual-boot visibility using set_grub_var
+    set_grub_var "GRUB_DISABLE_OS_PROBER" "false"
+    set_grub_var "GRUB_TIMEOUT" "10"
+    set_grub_var "GRUB_TIMEOUT_STYLE" "menu"
+    set_grub_var "GRUB_SAVEDEFAULT" "true"
 
     # Ensure Intel GuC/HuC and Tiger Lake sleep/suspend freeze mitigation flags are present
     configure_tigerlake_sleep_fix
@@ -519,11 +568,11 @@ configure_grub_dual_boot() {
     # Configure HiDPI theme with 28pt font for high-resolution displays
     configure_grub_hidpi_theme
 
-    # Regenerate grub.cfg in a single pass to compile settings, shutdown entries, and snapshots submenu
-    if command -v update-grub &>/dev/null; then
-        update-grub > /dev/null 2>&1 || true
-    elif command -v grub-mkconfig &>/dev/null; then
-        grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true
+    # Regenerate grub.cfg if needed (respects DEFER_GRUB_REBUILD)
+    if [[ "$force" == "force" ]]; then
+        regenerate_grub_cfg force
+    else
+        regenerate_grub_cfg
     fi
     SESSION_GRUB_SYNCED=true
     log_ok "GRUB dual-boot configuration updated."
@@ -544,6 +593,7 @@ init_downloads() {
 
     local aria_rule="'https::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'"
     local aria_rule_http="'http::/usr/bin/aria2c -c -m2 -s4 -x4 -k1M --file-allocation=none -o %o %u'"
+    local conf
 
     for conf in /etc/makepkg.conf "$USER_HOME/.makepkg.conf"; do
         if [[ -f "$conf" ]]; then
@@ -565,6 +615,7 @@ init_downloads() {
 safe_pacman_remove() {
     check_pacman_lock || return 1
     local to_remove=()
+    local pkg
     for pkg in "$@"; do
         if is_pkg_installed "$pkg"; then
             to_remove+=("$pkg")
@@ -589,6 +640,7 @@ safe_pacman_remove() {
 post_install_hook() {
     [[ "${SKIP_POST_HOOK:-0}" == "1" ]] && return 0
     log_info "Running post-install setup (syncing PATH across shells & environment)..."
+    local rc
     for rc in "$USER_HOME/.zshrc" "$USER_HOME/.bashrc"; do
         if [[ -f "$rc" ]] && ! grep -q '\.local/bin' "$rc"; then
             echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
@@ -615,6 +667,7 @@ EOF
 }
 
 post_uninstall_hook() {
+    [[ "${SKIP_POST_HOOK:-0}" == "1" ]] && return 0
     log_info "Running post-uninstall cleanup..."
     flatpak uninstall --unused -y > /dev/null 2>&1 || true
     
@@ -653,6 +706,7 @@ get_hot_corner_status() {
 
 configure_desktop_icons() {
     local action="$1"
+    local ext
     if [[ "$action" == "enable" ]]; then
         log_info "Enabling Desktop Files (Disabling volume/drive icons on desktop)..."
         if ! is_pkg_installed "gnome-shell-extension-gtk4-desktop-icons-ng" && ! is_pkg_installed "gnome-shell-extension-desktop-icons-ng"; then
@@ -951,6 +1005,7 @@ configure_eye_comfort_display() {
 
 configure_dock_favorites() {
     log_info "Configuring workflow-sorted GNOME Dock favorites..."
+    local idx
     local sorted_favorites=(
         "org.manjaro.pamac.manager.desktop"
         "timeshift-gtk.desktop"
@@ -1204,6 +1259,7 @@ install_vscode_extensions() {
         installed_exts=$(sudo -u "$REAL_USER" code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
     fi
 
+    local ext
     local exts_to_install=()
     for ext in "${vscode_extensions[@]}"; do
         if echo "$installed_exts" | grep -qx "${ext,,}"; then
@@ -1275,7 +1331,7 @@ EOF
 configure_rustdesk_service() {
     usermod -aG input,video "$REAL_USER" 2>/dev/null || true
     echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-rustdesk-uinput.rules
-    udevadm control --reload-rules && udevadm trigger 2>/dev/null || true
+    udevadm control --reload-rules && udevadm trigger --subsystem-match=misc --action=change 2>/dev/null || true
 
     mkdir -p /etc/systemd/system/rustdesk.service.d
     cat << 'EOF' > /etc/systemd/system/rustdesk.service.d/intel-vaapi.conf
@@ -1565,6 +1621,7 @@ install_nvm_node() {
     log_info "Installing Node Version Manager (NVM)..."
     pacman -S --needed --noconfirm nvm || true
 
+    local shrc
     # Inject NVM initialization into user bashrc & zshrc safely
     for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
         if [[ -f "$shrc" ]] && ! grep -q "init-nvm.sh" "$shrc"; then
@@ -1707,6 +1764,7 @@ install_all_apps() {
 
     log_info "2/4. Checking and building required AUR packages..."
     pamac enable-aur > /dev/null 2>&1 || true
+    local pkg
     local aur_pkgs=(visual-studio-code-bin antigravity-ide antigravity google-chrome rustdesk-bin)
     local aur_to_build=()
     for pkg in "${aur_pkgs[@]}"; do
@@ -1935,6 +1993,7 @@ uninstall_nvm_node() {
     safe_pacman_remove nvm
     rm -rf "$USER_HOME/.nvm" 2>/dev/null || true
 
+    local shrc
     for shrc in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc"; do
         if [[ -f "$shrc" ]]; then
             sed -i '/# Node Version Manager (NVM)/d' "$shrc" 2>/dev/null || true
@@ -1951,11 +2010,12 @@ uninstall_nvm_node() {
 uninstall_dev_runtimes() {
     ensure_session_snapshot "Before Uninstalling Developer Suite"
     log_warn "Removing Developer Suite (.NET, Node & Google Clasp)..."
+    local SKIP_POST_HOOK=1
     uninstall_clasp
     uninstall_nvm_node
     uninstall_dotnet
     log_ok "All Developer Runtimes and Tools removed."
-    post_uninstall_hook
+    SKIP_POST_HOOK=0 post_uninstall_hook
 }
 
 uninstall_all_apps() {
@@ -2497,6 +2557,7 @@ fstab_ensure_btrfs_opts() {
             local suffix="${BASH_REMATCH[3]}"
             local opt_list=",${cur_opts},"
             local opt_changed=false
+            local o
 
             for o in "${opts_to_add[@]}"; do
                 local key="${o%%=*}"
@@ -2545,6 +2606,7 @@ configure_permanent_partitions() {
 
     # Apply Btrfs NVMe 'noatime,discard=async' mount optimization & label system partition
     if fstab_ensure_btrfs_opts /etc/fstab "noatime" "discard=async"; then
+        local btrfs_mp
         for btrfs_mp in $(findmnt -rn -t btrfs -o TARGET 2>/dev/null || true); do
             mount -o remount "$btrfs_mp" 2>/dev/null || true
         done
@@ -2714,6 +2776,16 @@ configure_permanent_partitions() {
     log_ok "Partition sync complete: $configured_count valid data partition(s) active, $purged_count recovery/OEM partition(s) purged."
 }
 
+persist_battery_threshold() {
+    local b_name="$1"
+    mkdir -p /etc/tmpfiles.d
+    cat << EOF > /etc/tmpfiles.d/battery-threshold.conf
+w /sys/class/power_supply/${b_name}/charge_control_start_threshold - - - - 50
+w /sys/class/power_supply/${b_name}/charge_control_end_threshold - - - - 90
+EOF
+    systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
+}
+
 configure_dell_hardware() {
     local mode="${1:-interactive}"
     echo ""
@@ -2735,16 +2807,6 @@ configure_dell_hardware() {
         bat_name=$(basename "$(dirname "$start_thresh")")
     fi
 
-    persist_battery_threshold() {
-        local b_name="$1"
-        mkdir -p /etc/tmpfiles.d
-        cat << EOF > /etc/tmpfiles.d/battery-threshold.conf
-w /sys/class/power_supply/${b_name}/charge_control_start_threshold - - - - 50
-w /sys/class/power_supply/${b_name}/charge_control_end_threshold - - - - 90
-EOF
-        systemd-tmpfiles --create /etc/tmpfiles.d/battery-threshold.conf > /dev/null 2>&1 || true
-    }
-
     if [[ -d "$batt_cfg_path" ]]; then
         local cur_batt
         cur_batt=$(cat "$batt_cfg_path/current_value" 2>/dev/null || true)
@@ -2755,7 +2817,7 @@ EOF
             echo " 2) Custom (50% Start, 90% Stop Threshold) - Dell BIOS NVRAM & Sysfs"
             echo " 3) Adaptive / Standard (100% capacity)"
             echo " 4) Keep current setting"
-            read -rp "Select battery profile (1-4): " b_choice
+            ask b_choice "Select battery profile (1-4): "
         else
             log_info "Applying default Custom battery longevity profile (50% Start, 90% Stop)..."
         fi
@@ -2825,6 +2887,7 @@ update_dell_firmware() {
 
     # Check AC power status to protect against flashing on battery
     local on_battery=false
+    local ac
     for ac in /sys/class/power_supply/AC*/online /sys/class/power_supply/ADP*/online; do
         if [[ -f "$ac" ]] && [[ $(cat "$ac" 2>/dev/null) -eq 0 ]]; then
             on_battery=true
@@ -2882,6 +2945,7 @@ maintain_btrfs_storage() {
     fi
     echo ""
     log_info "=== BTRFS HEALTH & SSD STORAGE MAINTENANCE ==="
+    local mp
     for mp in "/" "/mnt/my-data"; do
         if findmnt -n -t btrfs "$mp" >/dev/null 2>&1; then
             log_info "Refreshing space allocation on $mp..."
@@ -3026,6 +3090,7 @@ delete_single_finger() {
 
     echo -e "${BOLD}--- Select Fingerprint to Delete ---${NC}"
     local i=1
+    local f
     for f in "${enrolled_list[@]}"; do
         echo -e " ${i}) $f"
         ((i++))
@@ -3061,6 +3126,15 @@ clear_all_fingerprints() {
     read -rp "Press [Enter] to continue..."
 }
 
+is_finger_enrolled() {
+    local target="$1"
+    local ef
+    for ef in "${enrolled_list[@]}"; do
+        [[ "$ef" == "$target" ]] && return 0
+    done
+    return 1
+}
+
 manage_fingerprints_menu() {
     while true; do
         echo ""
@@ -3075,24 +3149,17 @@ manage_fingerprints_menu() {
         if [[ ${#enrolled_list[@]} -eq 0 ]]; then
             echo -e "  ${YELLOW}(No fingerprints enrolled yet)${NC}"
         else
+            local f
             for f in "${enrolled_list[@]}"; do
                 echo -e "  ${GREEN}✓${NC} $f"
             done
         fi
 
-        is_enrolled() {
-            local target="$1"
-            for ef in "${enrolled_list[@]}"; do
-                [[ "$ef" == "$target" ]] && return 0
-            done
-            return 1
-        }
-
         local ri_badge rt_badge li_badge lt_badge
-        is_enrolled "right-index-finger" && ri_badge="${GREEN}[Enrolled]${NC}" || ri_badge="${CYAN}[Available]${NC}"
-        is_enrolled "right-thumb"        && rt_badge="${GREEN}[Enrolled]${NC}" || rt_badge="${CYAN}[Available]${NC}"
-        is_enrolled "left-index-finger"  && li_badge="${GREEN}[Enrolled]${NC}" || li_badge="${CYAN}[Available]${NC}"
-        is_enrolled "left-thumb"         && lt_badge="${GREEN}[Enrolled]${NC}" || lt_badge="${CYAN}[Available]${NC}"
+        is_finger_enrolled "right-index-finger" && ri_badge="${GREEN}[Enrolled]${NC}" || ri_badge="${CYAN}[Available]${NC}"
+        is_finger_enrolled "right-thumb"        && rt_badge="${GREEN}[Enrolled]${NC}" || rt_badge="${CYAN}[Available]${NC}"
+        is_finger_enrolled "left-index-finger"  && li_badge="${GREEN}[Enrolled]${NC}" || li_badge="${CYAN}[Available]${NC}"
+        is_finger_enrolled "left-thumb"         && lt_badge="${GREEN}[Enrolled]${NC}" || lt_badge="${CYAN}[Available]${NC}"
 
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
         echo -e " 1) Enroll Right Index Finger        $ri_badge"
@@ -3131,6 +3198,46 @@ manage_fingerprints_menu() {
             *) log_warn "Invalid selection." ;;
         esac
     done
+}
+
+clean_stock_libfprint_conflict() {
+    if pacman -Qq libfprint &>/dev/null && ! pacman -Qq libfprint-goodix-538d &>/dev/null; then
+        log_info "Safely detaching conflicting stock libfprint (preserving fprintd)..."
+        pacman -Rdd --noconfirm libfprint 2>/dev/null || true
+    fi
+}
+
+configure_pam_fingerprint() {
+    local target="$1"
+    [[ ! -f "$target" ]] && return 0
+
+    # Create safety backup before editing
+    if [[ ! -f "$target.pre-fprintd" ]]; then
+        cp -a "$target" "$target.pre-fprintd" 2>/dev/null || true
+    fi
+
+    # If already configured, keep idempotent
+    if grep -qE '^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so' "$target"; then
+        return 0
+    fi
+
+    # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
+    if grep -q "^auth" "$target"; then
+        sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
+    else
+        sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
+    fi
+
+    # Safety check: ensure at least one additional fallback auth rule remains
+    local auth_count
+    auth_count=$(grep -cE '^[[:space:]]*auth' "$target" || true)
+    if (( auth_count < 2 )); then
+        log_error "Refused to modify $target: no fallback password auth rule detected. Reverting."
+        if [[ -f "$target.pre-fprintd" ]]; then
+            cp -a "$target.pre-fprintd" "$target"
+        fi
+        return 1
+    fi
 }
 
 configure_goodix_fingerprint() {
@@ -3182,14 +3289,6 @@ configure_goodix_fingerprint() {
             installed=true
         fi
     fi
-
-    # Ensure stock conflicting libfprint is cleanly replaced without breaking fprintd
-    clean_stock_libfprint_conflict() {
-        if pacman -Qq libfprint &>/dev/null && ! pacman -Qq libfprint-goodix-538d &>/dev/null; then
-            log_info "Safely detaching conflicting stock libfprint (preserving fprintd)..."
-            pacman -Rdd --noconfirm libfprint 2>/dev/null || true
-        fi
-    }
 
     if [[ "$installed" == "false" ]]; then
         # Step 1: Install verified precompiled package cache (.pkg.tar.zst)
@@ -3272,42 +3371,10 @@ EOF
     fi
 
     # Configure PAM authentication (fingerprint evaluated first & sufficient on its own)
-    configure_pam_fingerprint() {
-        local target="$1"
-        [[ ! -f "$target" ]] && return 0
-
-        # Create safety backup before editing
-        if [[ ! -f "$target.pre-fprintd" ]]; then
-            cp -a "$target" "$target.pre-fprintd" 2>/dev/null || true
-        fi
-
-        # If already configured, keep idempotent
-        if grep -qE '^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so' "$target"; then
-            return 0
-        fi
-
-        # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
-        if grep -q "^auth" "$target"; then
-            sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
-        else
-            sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
-        fi
-
-        # Safety check: ensure at least one additional fallback auth rule remains
-        local auth_count
-        auth_count=$(grep -cE '^[[:space:]]*auth' "$target" || true)
-        if (( auth_count < 2 )); then
-            log_error "Refused to modify $target: no fallback password auth rule detected. Reverting."
-            if [[ -f "$target.pre-fprintd" ]]; then
-                cp -a "$target.pre-fprintd" "$target"
-            fi
-            return 1
-        fi
-    }
-
     if [[ ! -f /etc/pam.d/polkit-1 && -f /usr/lib/pam.d/polkit-1 ]]; then
         cp -a /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
     fi
+    local pam_file
     for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/system-local-login; do
         if [[ -f "$pam_file" ]]; then
             configure_pam_fingerprint "$pam_file"
@@ -3316,7 +3383,7 @@ EOF
     done
 
     # Restart fprintd daemon
-    udevadm control --reload-rules && udevadm trigger 2>/dev/null || true
+    udevadm control --reload-rules && udevadm trigger --subsystem-match=usb --action=change 2>/dev/null || true
     systemctl daemon-reload
     systemctl restart fprintd.service 2>/dev/null || true
     SESSION_GOODIX_CONFIGURED=true
@@ -3421,6 +3488,7 @@ menu_desktop_settings() {
                 ;;
             [aA])
                 log_info "=== APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS ==="
+                DEFER_GRUB_REBUILD=true
                 configure_hot_corner disable
                 configure_desktop_icons enable
                 configure_eye_comfort_display enable
@@ -3431,6 +3499,8 @@ menu_desktop_settings() {
                 configure_goodix_fingerprint noninteractive
                 configure_dell_hardware noninteractive
                 update_dell_firmware noninteractive
+                DEFER_GRUB_REBUILD=false
+                regenerate_grub_cfg
                 log_ok "All settings and hardware tuning routines completed."
                 ask _ "Press [Enter] to continue..."
                 ;;
@@ -3454,6 +3524,7 @@ run_all_stages() {
     optimize_system noninteractive
 
     log_info ">>> [STAGE 2/3] APPLYING ALL DESKTOP, STORAGE & HARDWARE SETTINGS..."
+    DEFER_GRUB_REBUILD=true
     configure_hot_corner disable
     configure_desktop_icons enable
     configure_eye_comfort_display enable
@@ -3463,6 +3534,8 @@ run_all_stages() {
     configure_grub_dual_boot
     configure_goodix_fingerprint noninteractive
     configure_dell_hardware noninteractive
+    DEFER_GRUB_REBUILD=false
+    regenerate_grub_cfg
     log_ok "Desktop, storage and hardware settings applied."
 
     log_info ">>> [STAGE 3/3] INSTALLING ALL 15 APPLICATIONS (DEV/AI, CONTAINERS, PRODUCTIVITY, MEDIA)..."
@@ -3554,6 +3627,7 @@ case "${1:-}" in
         exit 0
         ;;
     -2|--settings)
+        DEFER_GRUB_REBUILD=true
         configure_hot_corner disable
         configure_desktop_icons enable
         configure_eye_comfort_display enable
@@ -3564,6 +3638,8 @@ case "${1:-}" in
         configure_goodix_fingerprint noninteractive
         configure_dell_hardware noninteractive
         update_dell_firmware noninteractive
+        DEFER_GRUB_REBUILD=false
+        regenerate_grub_cfg
         exit 0
         ;;
     -3|--apps)
