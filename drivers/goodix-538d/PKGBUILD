@@ -8,8 +8,8 @@ pkgdesc="Library for fingerprint readers - Patched with SIGFM matching for Goodi
 arch=(x86_64)
 url="https://github.com/lbssousa/libfprint"
 license=(LGPL-2.1-or-later)
-depends=('libgusb>=0.3.0' nss pixman openssl)
-makedepends=(git meson ninja cmake pkg-config libgudev)
+depends=(glib2 'libgusb>=0.3.0' libgudev json-glib nss pixman openssl libusb python)
+makedepends=(git meson ninja cmake pkg-config)
 provides=(libfprint libfprint-2.so libfprint-goodix-521d libfprint-goodix-538d libfprint-2.so=2-64 "libfprint=${pkgver}")
 conflicts=(libfprint libfprint-goodix-521d)
 replaces=(libfprint libfprint-goodix-521d)
@@ -22,7 +22,7 @@ source=(
 )
 sha256sums=(
   'SKIP'
-  'SKIP'
+  'f3ad6f9f5221759233cd2f53e2e1a2b3d4701a00678b37915fef9d6f7a167249'
   'SKIP'
   '0f28f8f52860afea86bd56d869cd7f4fe41ba943edd1d56100113e94ecfd6c0d'
 )

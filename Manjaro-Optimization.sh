@@ -3296,12 +3296,26 @@ configure_goodix_fingerprint() {
         cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
         if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
             log_info "Step 1: Installing precompiled driver package: $(basename "$cached_pkg")..."
-            clean_stock_libfprint_conflict
-            if pacman -U --overwrite '*' --noconfirm "$cached_pkg" 2>/dev/null; then
-                log_ok "Driver installed cleanly from precompiled package cache."
-                installed=true
-            else
-                log_warn "Cached package installation encountered an issue. Falling back to Step 2..."
+            if [[ -f "$driver_dir/SHA256SUMS" ]]; then
+                local exp_hash act_hash
+                exp_hash=$(grep "libfprint-goodix-538d" "$driver_dir/SHA256SUMS" | awk '{print $1}')
+                act_hash=$(sha256sum "$cached_pkg" | awk '{print $1}')
+                if [[ "$exp_hash" != "$act_hash" ]]; then
+                    log_warn "Checksum mismatch for $(basename "$cached_pkg")! Falling back to Step 2 clean compile..."
+                    cached_pkg=""
+                else
+                    log_ok "Cryptographic SHA-256 integrity verified for $(basename "$cached_pkg")."
+                fi
+            fi
+
+            if [[ -n "$cached_pkg" ]]; then
+                clean_stock_libfprint_conflict
+                if pacman -U --overwrite '*' --noconfirm "$cached_pkg" 2>/dev/null; then
+                    log_ok "Driver installed cleanly from precompiled package cache."
+                    installed=true
+                else
+                    log_warn "Cached package installation encountered an issue. Falling back to Step 2..."
+                fi
             fi
         fi
 
@@ -3345,13 +3359,14 @@ configure_goodix_fingerprint() {
 
         cat > /etc/systemd/system/goodix-538d-provision.service <<'EOF'
 [Unit]
-Description=Goodix 27c6:538d Fingerprint Sensor TLS-PSK Provisioner
+Description=Goodix 27c6:538d Fingerprint Sensor TLS-PSK Provisioner Check
 Before=fprintd.service
 PartOf=fprintd.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/lib/goodix-538d/provision-goodix-538d.py
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /usr/lib/goodix-538d/provision-goodix-538d.py --check
 EOF
 
         mkdir -p /etc/systemd/system/fprintd.service.d
@@ -3361,12 +3376,14 @@ Wants=goodix-538d-provision.service
 After=goodix-538d-provision.service
 EOF
 
-        log_info "Provisioning Goodix 27c6:538d sensor TLS-PSK & verifying firmware..."
+        log_info "Verifying Goodix 27c6:538d sensor TLS-PSK & firmware state..."
         systemctl stop fprintd.service 2>/dev/null || true
-        if python3 /usr/lib/goodix-538d/provision-goodix-538d.py; then
+        local prov_arg="--check"
+        [[ "$mode" == "interactive" ]] && prov_arg="--flash"
+        if python3 /usr/lib/goodix-538d/provision-goodix-538d.py $prov_arg; then
             log_ok "Sensor TLS-PSK and firmware verified."
         else
-            log_warn "Sensor TLS-PSK provisioning encountered an issue."
+            log_warn "Sensor TLS-PSK provisioning requires flashing (run provision-goodix-538d.py --flash)."
         fi
     fi
 

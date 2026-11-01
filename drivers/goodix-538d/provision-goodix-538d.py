@@ -26,6 +26,7 @@ via ctypes.
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import hashlib
 import hmac
@@ -670,35 +671,81 @@ def locate_firmware() -> str:
 
 
 def main() -> int:
-    fw_path = locate_firmware()
-    firmware_bytes, firmware_hmac = load_verified_firmware(fw_path)
+    parser = argparse.ArgumentParser(
+        description="Goodix 27c6:538d TLS-PSK & Firmware Provisioner"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Non-destructive check: verify sensor firmware and TLS-PSK without flashing",
+    )
+    parser.add_argument(
+        "--flash",
+        action="store_true",
+        help="Explicitly permit firmware flashing/re-provisioning",
+    )
+    args = parser.parse_args()
 
     device = init_device()
-    previous_firmware = None
-    unchanged_count = 0
-
     try:
+        try:
+            firmware = device.firmware_version()
+        except USBError:
+            device.close()
+            time.sleep(0.25)
+            device = init_device()
+            firmware = device.firmware_version()
+
+        print(f"[INFO] Sensor firmware: {firmware}")
+        valid_psk = check_psk(device)
+
+        if re.fullmatch(TARGET_FIRMWARE, firmware) and valid_psk:
+            print(
+                f"[OK] Goodix 27c6:538d is running {TARGET_FIRMWARE} with valid Linux TLS-PSK."
+            )
+            return 0
+
+        if args.check:
+            print(
+                f"[WARN] Goodix 27c6:538d requires provisioning (Firmware: {firmware}, Valid TLS-PSK: {valid_psk})."
+            )
+            print("[INFO] Run with --flash to provision the sensor.")
+            return 1
+
+        if not args.flash and sys.stdin.isatty():
+            ans = input("Proceed with erasing app and flashing Goodix sensor firmware? (y/N): ").strip()
+            if ans.lower() not in ("y", "yes"):
+                print("[INFO] Provisioning cancelled by user.")
+                return 0
+
+        fw_path = locate_firmware()
+        firmware_bytes, firmware_hmac = load_verified_firmware(fw_path)
+
+        previous_firmware = firmware
+        unchanged_count = 0
+
         for step in range(8):
-            try:
-                firmware = device.firmware_version()
-            except USBError:
-                device.close()
-                time.sleep(0.25)
-                device = init_device()
-                firmware = device.firmware_version()
+            if step > 0:
+                try:
+                    firmware = device.firmware_version()
+                except USBError:
+                    device.close()
+                    time.sleep(0.25)
+                    device = init_device()
+                    firmware = device.firmware_version()
 
-            print(f"[INFO] Sensor firmware: {firmware}")
-            valid_psk = check_psk(device)
+                print(f"[INFO] Sensor firmware: {firmware}")
+                valid_psk = check_psk(device)
 
-            if firmware == previous_firmware:
-                unchanged_count += 1
-                if unchanged_count >= 3:
-                    raise RuntimeError(
-                        f"Sensor firmware state did not advance from {firmware}"
-                    )
-            else:
-                unchanged_count = 0
-            previous_firmware = firmware
+                if firmware == previous_firmware:
+                    unchanged_count += 1
+                    if unchanged_count >= 3:
+                        raise RuntimeError(
+                            f"Sensor firmware state did not advance from {firmware}"
+                        )
+                else:
+                    unchanged_count = 0
+                previous_firmware = firmware
 
             if re.fullmatch(TARGET_FIRMWARE, firmware):
                 if valid_psk:

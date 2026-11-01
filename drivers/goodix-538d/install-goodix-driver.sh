@@ -72,13 +72,26 @@ if [[ "$INSTALLED" == "false" ]]; then
 
     if [[ -n "$CACHED_PKG" && -f "$CACHED_PKG" ]]; then
         log_info "Found cached package: $(basename "$CACHED_PKG")"
-        clean_stock_conflict
-        log_info "Installing via pacman -U (with --overwrite to prevent file collisions)..."
-        if pacman -U --overwrite '*' --noconfirm "$CACHED_PKG"; then
-            log_ok "Precompiled driver package installed successfully!"
-            INSTALLED=true
-        else
-            log_warn "Failed to install cached package. Proceeding to Step 2 fallback..."
+        if [[ -f "$SCRIPT_DIR/SHA256SUMS" ]]; then
+            expected_hash=$(grep "libfprint-goodix-538d" "$SCRIPT_DIR/SHA256SUMS" | awk '{print $1}')
+            actual_hash=$(sha256sum "$CACHED_PKG" | awk '{print $1}')
+            if [[ "$expected_hash" != "$actual_hash" ]]; then
+                log_warn "Checksum mismatch on $CACHED_PKG! Expected: $expected_hash, Got: $actual_hash. Falling back to clean build..."
+                CACHED_PKG=""
+            else
+                log_ok "Cryptographic SHA-256 integrity verified for $(basename "$CACHED_PKG")."
+            fi
+        fi
+
+        if [[ -n "$CACHED_PKG" ]]; then
+            clean_stock_conflict
+            log_info "Installing via pacman -U (with --overwrite to prevent file collisions)..."
+            if pacman -U --overwrite '*' --noconfirm "$CACHED_PKG"; then
+                log_ok "Precompiled driver package installed successfully!"
+                INSTALLED=true
+            else
+                log_warn "Failed to install cached package. Proceeding to Step 2 fallback..."
+            fi
         fi
     fi
 fi
@@ -125,19 +138,31 @@ log_ok "libfprint pinned in /etc/pacman.conf."
 # TLS-PSK & FIRMWARE PROVISIONING (IAP Bootloader Provisioner)
 # ------------------------------------------------------------------------------
 if [[ -f "$SCRIPT_DIR/provision-goodix-538d.py" && -f "$SCRIPT_DIR/GF5298_GM168SEC_APP_13016.bin" ]]; then
+    # Verify cryptographic integrity of firmware binary
+    if [[ -f "$SCRIPT_DIR/SHA256SUMS" ]]; then
+        expected_fw_hash=$(grep "GF5298_GM168SEC_APP_13016.bin" "$SCRIPT_DIR/SHA256SUMS" | awk '{print $1}')
+        actual_fw_hash=$(sha256sum "$SCRIPT_DIR/GF5298_GM168SEC_APP_13016.bin" | awk '{print $1}')
+        if [[ "$expected_fw_hash" != "$actual_fw_hash" ]]; then
+            log_error "Cryptographic checksum mismatch on firmware binary! Aborting."
+            exit 1
+        fi
+        log_ok "Cryptographic SHA-256 integrity verified for GF5298_GM168SEC_APP_13016.bin."
+    fi
+
     log_info "Installing Goodix 27c6:538d TLS-PSK provisioner to /usr/lib/goodix-538d/..."
     install -Dm755 "$SCRIPT_DIR/provision-goodix-538d.py" /usr/lib/goodix-538d/provision-goodix-538d.py
     install -Dm644 "$SCRIPT_DIR/GF5298_GM168SEC_APP_13016.bin" /usr/lib/goodix-538d/GF5298_GM168SEC_APP_13016.bin
 
     cat > /etc/systemd/system/goodix-538d-provision.service <<'EOF'
 [Unit]
-Description=Goodix 27c6:538d Fingerprint Sensor TLS-PSK Provisioner
+Description=Goodix 27c6:538d Fingerprint Sensor TLS-PSK Provisioner Check
 Before=fprintd.service
 PartOf=fprintd.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/lib/goodix-538d/provision-goodix-538d.py
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /usr/lib/goodix-538d/provision-goodix-538d.py --check
 EOF
 
     mkdir -p /etc/systemd/system/fprintd.service.d
@@ -149,7 +174,7 @@ EOF
 
     log_info "Provisioning Goodix 27c6:538d sensor TLS-PSK & verifying firmware..."
     systemctl stop fprintd.service 2>/dev/null || true
-    if python3 /usr/lib/goodix-538d/provision-goodix-538d.py; then
+    if python3 /usr/lib/goodix-538d/provision-goodix-538d.py --flash; then
         log_ok "Sensor TLS-PSK and firmware verified!"
     else
         log_error "Sensor TLS-PSK provisioning failed."
@@ -165,17 +190,32 @@ configure_pam_fingerprint() {
     local target="$1"
     [[ ! -f "$target" ]] && return 0
 
-    # Remove existing pam_fprintd and any stale trailing fallback rules
-    sed -i '/pam_fprintd\.so/d' "$target"
-    sed -i '/# Manjaro defaults/d' "$target"
-    sed -i '/pam_unix\.so.*likeauth/d' "$target"
-    sed -i '/auth.*pam_deny\.so/d' "$target"
+    # Create safety backup before editing
+    if [[ ! -f "$target.pre-fprintd" ]]; then
+        cp -a "$target" "$target.pre-fprintd" 2>/dev/null || true
+    fi
+
+    # If already configured, keep idempotent
+    if grep -qE '^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so' "$target"; then
+        return 0
+    fi
 
     # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
     if grep -q "^auth" "$target"; then
         sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
     else
         sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
+    fi
+
+    # Safety check: ensure at least one additional fallback auth rule remains
+    local auth_count
+    auth_count=$(grep -cE '^[[:space:]]*auth' "$target" || true)
+    if (( auth_count < 2 )); then
+        log_error "Refused to modify $target: no fallback password auth rule detected. Reverting."
+        if [[ -f "$target.pre-fprintd" ]]; then
+            cp -a "$target.pre-fprintd" "$target"
+        fi
+        return 1
     fi
 }
 
@@ -190,7 +230,7 @@ for pam_file in /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/system-local-logi
 done
 
 log_info "Restarting fprintd daemon service..."
-udevadm control --reload-rules && udevadm trigger 2>/dev/null || true
+udevadm control --reload-rules && udevadm trigger --subsystem-match=usb --action=change 2>/dev/null || true
 systemctl daemon-reload
 systemctl restart fprintd.service 2>/dev/null || true
 
