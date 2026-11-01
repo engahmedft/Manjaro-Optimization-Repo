@@ -1,8 +1,42 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Manjaro Modular Optimizer, System Maintainer & Software Hub (v9.5 - Complete)
+# Manjaro Modular Optimizer, System Maintainer & Software Hub (v10.0.0-dev)
 # Target: Dell Inspiron 7706 | GNOME Wayland | RustDesk | Full AUR & Kernel Sync
 # ==============================================================================
+
+SCRIPT_VERSION="10.0.0-dev"
+
+# Allow non-privileged queries (--help, --version, -h, -v) before root checks or side effects
+case "${1:-}" in
+    -h|--help)
+        echo -e "\033[1mManjaro Optimization & Control Center (v${SCRIPT_VERSION})\033[0m"
+        echo "Usage: sudo ./Manjaro-Optimization.sh [OPTION]"
+        echo ""
+        echo "Options:"
+        echo "  -a, --all        Run all 3 stages unattended (Optimize -> Settings -> 15 Apps)"
+        echo "  -1, --optimize   Run Stage 1: Core System Optimization & Upgrade"
+        echo "  -2, --settings   Run Stage 2: Desktop UI, Partitions & Dell Hardware"
+        echo "  -3, --apps       Run Stage 3: Install all 15 Extra Applications"
+        echo "  -t, --timeshift  Launch Timeshift Restore & Boot Synchronization Manager"
+        echo "  -v, --version    Show script version"
+        echo "  -h, --help       Show this help message"
+        echo ""
+        echo "Run without options to launch the interactive Control Center menu."
+        exit 0
+        ;;
+    -v|--version)
+        echo "Manjaro Optimization & Control Center v${SCRIPT_VERSION}"
+        exit 0
+        ;;
+    ""|-a|--all|all|A|-1|--optimize|-2|--settings|-3|--apps|-t|--timeshift|--restore)
+        # Valid execution options (fall through to root check and execution)
+        ;;
+    *)
+        echo -e "\033[0;31m[ERROR]\033[0m Unknown option: $1" >&2
+        echo "Try './Manjaro-Optimization.sh --help' for usage instructions." >&2
+        exit 2
+        ;;
+esac
 
 set -o pipefail
 export TERM="${TERM:-xterm-256color}"
@@ -10,22 +44,29 @@ export TERM="${TERM:-xterm-256color}"
 # ------------------------------------------------------------------------------
 # 0. ROOT CHECK, USER ENVIRONMENT & LOCAL LOGGING
 # ------------------------------------------------------------------------------
-if [[ "$EUID" -ne 0 ]]; then
-    echo -e "\033[0;31m[ERROR]\033[0m Please run this script with sudo: sudo ./Manjaro-Optimization.sh"
-    exit 1
+if [[ "${MANJARO_OPT_SOURCE_ONLY:-0}" != "1" ]]; then
+    if [[ "$EUID" -ne 0 ]]; then
+        echo -e "\033[0;31m[ERROR]\033[0m Please run this script with sudo: sudo ./Manjaro-Optimization.sh"
+        exit 1
+    fi
 fi
 
-if [[ -n "$SUDO_USER" && "$SUDO_USER" != "root" ]]; then
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
     REAL_USER="$SUDO_USER"
-elif [[ -n "$PKEXEC_UID" && "$PKEXEC_UID" -ne 0 ]]; then
+elif [[ -n "${PKEXEC_UID:-}" && "${PKEXEC_UID:-}" -ne 0 ]]; then
     REAL_USER=$(id -un "$PKEXEC_UID" 2>/dev/null || echo "ahmed")
-elif [[ -n "$USER" && "$USER" != "root" ]]; then
+elif [[ -n "${USER:-}" && "${USER:-}" != "root" ]]; then
     REAL_USER="$USER"
 else
     REAL_USER=$(logname 2>/dev/null || id -un 1000 2>/dev/null || echo "ahmed")
 fi
 USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 USER_UID=$(id -u "$REAL_USER")
+
+if [[ -z "$USER_HOME" || ! -d "$USER_HOME" || -z "$USER_UID" ]]; then
+    echo -e "\033[0;31m[ERROR]\033[0m Cannot resolve valid home directory for user '$REAL_USER'."
+    exit 1
+fi
 
 run_as_user() {
     if [[ "$EUID" -eq 0 ]] && [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
@@ -35,12 +76,21 @@ run_as_user() {
             XDG_RUNTIME_DIR="/run/user/$USER_UID" \
             DISPLAY="${DISPLAY:-:0}" \
             WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-            bash -c "cd '$USER_HOME' 2>/dev/null || true; exec \"\$@\"" -- "$@"
+            bash -c 'cd "$1" 2>/dev/null || true; shift; exec "$@"' _ "$USER_HOME" "$@"
     else
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
         XDG_RUNTIME_DIR="/run/user/$USER_UID" \
         "$@"
     fi
+}
+
+is_supported_hardware() {
+    local dmi_product
+    dmi_product=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "Unknown")
+    if [[ "$dmi_product" =~ Inspiron[[:space:]]+7706 ]] || [[ "${FORCE_HW:-0}" == "1" ]]; then
+        return 0
+    fi
+    return 1
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,15 +104,10 @@ if [[ -f "$LOG_FILE" ]]; then
     fi
 fi
 
-touch "$LOG_FILE" 2>/dev/null || true
-if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
-    chown "$REAL_USER:" "$LOG_FILE" 2>/dev/null || true
-fi
-
-exec > >(tee -a "$LOG_FILE") 2>&1
-
 POLKIT_RULE="/etc/polkit-1/rules.d/49-temp-Manjaro-Optimization.rules"
-cat << 'EOF' > "$POLKIT_RULE"
+create_polkit_rule() {
+    [[ -f "$POLKIT_RULE" ]] && return 0
+    cat << 'EOF' > "$POLKIT_RULE"
 polkit.addRule(function(action, subject) {
     if ((action.id.indexOf("org.manjaro.pamac") === 0 || 
          action.id.indexOf("org.freedesktop.packagekit") === 0) &&
@@ -71,11 +116,25 @@ polkit.addRule(function(action, subject) {
     }
 });
 EOF
+}
 
 cleanup() {
     rm -f "$POLKIT_RULE" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+
+if [[ "${MANJARO_OPT_SOURCE_ONLY:-0}" != "1" ]]; then
+    touch "$LOG_FILE" 2>/dev/null || true
+    if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
+        chown "$REAL_USER:" "$LOG_FILE" 2>/dev/null || true
+    fi
+
+    exec > >(tee -a "$LOG_FILE") 2>&1
+
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    create_polkit_rule
+fi
 
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -360,6 +419,10 @@ EOF
 
 configure_tigerlake_sleep_fix() {
     local force="${1:-false}"
+    if ! is_supported_hardware; then
+        log_warn "Hardware is not Dell Inspiron 7706. Skipping Intel Tiger Lake sleep fix (use FORCE_HW=1 to override)."
+        return 0
+    fi
     if [[ "$SESSION_SLEEP_FIX_APPLIED" == "true" && "$force" != "force" ]]; then
         log_info "Intel Tiger Lake sleep/suspend fix already verified in this session."
         return 0
@@ -486,7 +549,6 @@ init_downloads() {
         sed -i '/^\[options\]/a DisableDownloadTimeout' /etc/pacman.conf 2>/dev/null || true
     fi
 }
-init_downloads
 
 safe_pacman_remove() {
     check_pacman_lock || return 1
@@ -646,59 +708,70 @@ configure_antigravity2_theme() {
     local antigravity_pref="$antigravity_cfg_dir/Preferences"
     mkdir -p "$gemini_cfg_dir" "$antigravity_cfg_dir"
     python3 -c '
-import json, os, sys
+import json, os, sys, re, tempfile, shutil
+
+def load_jsonc(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        content = re.sub(r"//.*", "", content)
+        content = re.sub(r"/\*[\s\S]*?\*/", "", content)
+        content = re.sub(r",\s*([}\]])", r"\1", content)
+        return json.loads(content)
+    except Exception as e:
+        print(f"WARN: Could not parse {path} ({e}). Preserving file.", file=sys.stderr)
+        return None
+
+def atomic_save_json(path, data, indent=2):
+    dir_name = os.path.dirname(path)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
+    if os.path.exists(path):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except Exception:
+            pass
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name if dir_name else None, prefix=".tmp_json_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent)
+    os.replace(tmp_path, path)
 
 # 1. Antigravity Theme Seeds & Dark Mode
 gemini_path = sys.argv[1]
-data = {}
-if os.path.exists(gemini_path):
-    try:
-        with open(gemini_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-if "userSettings" not in data:
-    data["userSettings"] = {}
-data["userSettings"]["customThemeSeedsDark"] = {
-    "background": "#1c2128",
-    "foregroundOverride": "#e6edf3",
-    "primary": "#58a6ff"
-}
-data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
-with open(gemini_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
+data = load_jsonc(gemini_path)
+if data is not None:
+    if "userSettings" not in data:
+        data["userSettings"] = {}
+    data["userSettings"]["customThemeSeedsDark"] = {
+        "background": "#1c2128",
+        "foregroundOverride": "#e6edf3",
+        "primary": "#58a6ff"
+    }
+    data["userSettings"]["themeMode"] = "THEME_MODE_DARK"
+    atomic_save_json(gemini_path, data, indent=2)
 
 # 2. Antigravity 2 UI Zoom Level (+1 zoom level / 120% magnification)
 storage_path = sys.argv[2]
-st_data = {}
-if os.path.exists(storage_path):
-    try:
-        with open(storage_path, "r", encoding="utf-8") as f:
-            st_data = json.load(f)
-    except Exception:
-        st_data = {}
-st_data["zoomLevel"] = "1"
-with open(storage_path, "w", encoding="utf-8") as f:
-    json.dump(st_data, f, indent=2)
+st_data = load_jsonc(storage_path)
+if st_data is not None:
+    st_data["zoomLevel"] = "1"
+    atomic_save_json(storage_path, st_data, indent=2)
 
 # 3. Chromium per-host zoom levels if preferences exist
 pref_path = sys.argv[3]
-if os.path.exists(pref_path):
-    try:
-        with open(pref_path, "r", encoding="utf-8") as f:
-            pref_data = json.load(f)
-        if "partition" not in pref_data:
-            pref_data["partition"] = {}
-        if "per_host_zoom_levels" not in pref_data["partition"]:
-            pref_data["partition"]["per_host_zoom_levels"] = {}
-        for k in pref_data["partition"]["per_host_zoom_levels"]:
-            if isinstance(pref_data["partition"]["per_host_zoom_levels"][k], dict):
-                for host in pref_data["partition"]["per_host_zoom_levels"][k]:
-                    pref_data["partition"]["per_host_zoom_levels"][k][host] = 1.0
-        with open(pref_path, "w", encoding="utf-8") as f:
-            json.dump(pref_data, f, separators=(",", ":"))
-    except Exception:
-        pass
+pref_data = load_jsonc(pref_path)
+if pref_data is not None and len(pref_data) > 0:
+    if "partition" not in pref_data:
+        pref_data["partition"] = {}
+    if "per_host_zoom_levels" not in pref_data["partition"]:
+        pref_data["partition"]["per_host_zoom_levels"] = {}
+    for k in pref_data["partition"]["per_host_zoom_levels"]:
+        if isinstance(pref_data["partition"]["per_host_zoom_levels"][k], dict):
+            for host in pref_data["partition"]["per_host_zoom_levels"][k]:
+                pref_data["partition"]["per_host_zoom_levels"][k][host] = 1.0
+    atomic_save_json(pref_path, pref_data, indent=None)
 ' "$gemini_cfg" "$antigravity_storage" "$antigravity_pref" 2>/dev/null || true
     chown -R "$REAL_USER:" "$USER_HOME/.gemini" "$antigravity_cfg_dir" 2>/dev/null || true
 }
@@ -710,16 +783,40 @@ configure_editor_settings() {
     mkdir -p "$vscode_user_dir" "$antigravity_ide_user_dir"
 
     python3 -c '
-import json, os, sys
+import json, os, sys, re, tempfile, shutil
 
-def configure_editor_json(path):
-    data = {}
+def load_jsonc(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        content = re.sub(r"//.*", "", content)
+        content = re.sub(r"/\*[\s\S]*?\*/", "", content)
+        content = re.sub(r",\s*([}\]])", r"\1", content)
+        return json.loads(content)
+    except Exception as e:
+        print(f"WARN: Could not parse {path} ({e}). Preserving file.", file=sys.stderr)
+        return None
+
+def atomic_save_json(path, data, indent=4):
+    dir_name = os.path.dirname(path)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            shutil.copy2(path, path + ".bak")
         except Exception:
-            data = {}
+            pass
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name if dir_name else None, prefix=".tmp_json_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent)
+    os.replace(tmp_path, path)
+
+def configure_editor_json(path):
+    data = load_jsonc(path)
+    if data is None:
+        return
 
     data["workbench.iconTheme"] = "vscode-icons"
     data["editor.renderWhitespace"] = "all"
@@ -798,8 +895,7 @@ def configure_editor_json(path):
         ]
     }
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    atomic_save_json(path, data, indent=4)
 
 configure_editor_json(sys.argv[1])
 configure_editor_json(sys.argv[2])
@@ -1630,7 +1726,9 @@ uninstall_vscode() {
     ensure_session_snapshot "Before Uninstalling VS Code"
     log_warn "Removing VS Code..."
     safe_pacman_remove visual-studio-code-bin
-    rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" "$USER_HOME/.config/code-flags.conf" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1638,7 +1736,9 @@ uninstall_antigravity_ide() {
     ensure_session_snapshot "Before Uninstalling Antigravity IDE"
     log_warn "Removing Antigravity IDE..."
     safe_pacman_remove antigravity-ide
-    rm -rf "$USER_HOME/.antigravity-ide" "$USER_HOME/.config/antigravity-ide" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.antigravity-ide" "$USER_HOME/.config/antigravity-ide" "$USER_HOME/.config/Antigravity IDE" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1646,7 +1746,9 @@ uninstall_antigravity_standalone() {
     ensure_session_snapshot "Before Uninstalling Antigravity 2.0"
     log_warn "Removing Antigravity 2.0 Standalone..."
     safe_pacman_remove antigravity
-    rm -rf "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" "$USER_HOME/.config/Antigravity" /usr/local/bin/agy 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1654,7 +1756,10 @@ uninstall_chrome() {
     ensure_session_snapshot "Before Uninstalling Google Chrome"
     log_warn "Removing Google Chrome..."
     safe_pacman_remove google-chrome
-    rm -rf "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
+    [[ -L /usr/bin/google-chrome && ! -e /usr/bin/google-chrome ]] && rm -f /usr/bin/google-chrome 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1662,7 +1767,9 @@ uninstall_office() {
     ensure_session_snapshot "Before Uninstalling LibreOffice"
     log_warn "Removing LibreOffice..."
     safe_pacman_remove libreoffice-fresh
-    rm -rf "$USER_HOME/.config/libreoffice" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/libreoffice" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1670,7 +1777,9 @@ uninstall_vlc() {
     ensure_session_snapshot "Before Uninstalling VLC"
     log_warn "Removing VLC Media Player..."
     safe_pacman_remove vlc
-    rm -rf "$USER_HOME/.config/vlc" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/vlc" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1678,7 +1787,9 @@ uninstall_celluloid() {
     ensure_session_snapshot "Before Uninstalling Celluloid"
     log_warn "Removing Celluloid Video Player..."
     safe_pacman_remove celluloid
-    rm -rf "$USER_HOME/.config/io.github.celluloid_player.Celluloid" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/io.github.celluloid_player.Celluloid" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1686,7 +1797,9 @@ uninstall_gimp() {
     ensure_session_snapshot "Before Uninstalling GIMP"
     log_warn "Removing GIMP Image Editor..."
     safe_pacman_remove gimp
-    rm -rf "$USER_HOME/.config/GIMP" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/GIMP" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1694,7 +1807,9 @@ uninstall_kdenlive() {
     ensure_session_snapshot "Before Uninstalling Kdenlive"
     log_warn "Removing Kdenlive Video Editor..."
     safe_pacman_remove kdenlive
-    rm -rf "$USER_HOME/.config/kdenlive-appimage" "$USER_HOME/.local/share/kdenlive" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/kdenlive-appimage" "$USER_HOME/.local/share/kdenlive" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1702,7 +1817,9 @@ uninstall_media() {
     ensure_session_snapshot "Before Uninstalling Multimedia Suite"
     log_warn "Removing All Multimedia & Graphics Applications..."
     safe_pacman_remove vlc celluloid gimp kdenlive
-    rm -rf "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" "$USER_HOME/.config/io.github.celluloid_player.Celluloid" "$USER_HOME/.local/share/kdenlive" 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" "$USER_HOME/.config/io.github.celluloid_player.Celluloid" "$USER_HOME/.local/share/kdenlive" 2>/dev/null || true
+    fi
     post_uninstall_hook
 }
 
@@ -1713,7 +1830,9 @@ uninstall_rustdesk() {
     safe_pacman_remove rustdesk-bin rustdesk
     rm -f /etc/udev/rules.d/85-rustdesk-uinput.rules
     rm -rf /etc/systemd/system/rustdesk.service.d
-    rm -rf "$USER_HOME/.config/rustdesk" "$USER_HOME/.local/share/logs/RustDesk" /etc/rustdesk 2>/dev/null || true
+    if [[ "${PURGE_USER_DATA:-0}" == "1" ]]; then
+        rm -rf "$USER_HOME/.config/rustdesk" "$USER_HOME/.local/share/logs/RustDesk" /etc/rustdesk 2>/dev/null || true
+    fi
     systemctl daemon-reload 2>/dev/null || true
     post_uninstall_hook
 }
@@ -1794,6 +1913,23 @@ uninstall_dev_runtimes() {
 
 uninstall_all_apps() {
     echo ""
+    echo -e "${RED}${BOLD}========================================================================${NC}"
+    echo -e "${RED}${BOLD}             WARNING: UNINSTALL ALL 15 APPLICATIONS                     ${NC}"
+    echo -e "${RED}${BOLD}========================================================================${NC}"
+    echo -e " This action will uninstall all dev runtimes, virtualization, media and"
+    echo -e " productivity tools installed by this suite."
+    echo -e "${RED}========================================================================${NC}"
+    read -rp "Are you sure you want to proceed with uninstalling ALL applications? (y/N): " confirm_all
+    if [[ ! "$confirm_all" =~ ^[Yy]$ ]]; then
+        log_info "Bulk uninstallation cancelled."
+        return 0
+    fi
+    local purge_data=0
+    read -rp "Also purge all user profile and configuration directories? (y/N): " confirm_purge
+    if [[ "$confirm_purge" =~ ^[Yy]$ ]]; then
+        purge_data=1
+    fi
+
     log_info "=== STARTING GROUPED REMOVAL OF ALL APPS (ALL CATEGORIES) ==="
     ensure_session_snapshot "Before Uninstalling All Applications"
 
@@ -1816,18 +1952,22 @@ uninstall_all_apps() {
 
     uninstall_dev_runtimes
 
-    log_info "3/3. Wiping user configuration & cache directories..."
-    rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" \
-           "$USER_HOME/.antigravity-ide" "$USER_HOME/.config/antigravity-ide" \
-           "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" \
-           "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" \
-           "$USER_HOME/.config/libreoffice" \
-           "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" "$USER_HOME/.config/io.github.celluloid_player.Celluloid" "$USER_HOME/.local/share/kdenlive" \
-           "$USER_HOME/.config/rustdesk" \
-           "$USER_HOME/.local/share/logs/RustDesk" \
-           /etc/rustdesk \
-           /etc/udev/rules.d/85-rustdesk-uinput.rules \
-           /etc/systemd/system/rustdesk.service.d 2>/dev/null || true
+    if (( purge_data == 1 )); then
+        log_info "3/3. Wiping user configuration & cache directories..."
+        rm -rf "$USER_HOME/.config/Code" "$USER_HOME/.vscode" "$USER_HOME/.config/code-flags.conf" \
+               "$USER_HOME/.antigravity-ide" "$USER_HOME/.config/antigravity-ide" "$USER_HOME/.config/Antigravity IDE" \
+               "$USER_HOME/.local/bin/agy" "$USER_HOME/.antigravity" "$USER_HOME/.config/Antigravity" /usr/local/bin/agy \
+               "$USER_HOME/.config/google-chrome" "$USER_HOME/.cache/google-chrome" "$USER_HOME/.config/chrome-flags.conf" \
+               "$USER_HOME/.config/libreoffice" \
+               "$USER_HOME/.config/GIMP" "$USER_HOME/.config/vlc" "$USER_HOME/.config/io.github.celluloid_player.Celluloid" "$USER_HOME/.local/share/kdenlive" \
+               "$USER_HOME/.config/rustdesk" \
+               "$USER_HOME/.local/share/logs/RustDesk" \
+               /etc/rustdesk \
+               /etc/udev/rules.d/85-rustdesk-uinput.rules \
+               /etc/systemd/system/rustdesk.service.d 2>/dev/null || true
+    else
+        log_info "3/3. Preserving user configuration & cache directories (PURGE_USER_DATA=0)."
+    fi
 
     systemctl daemon-reload 2>/dev/null || true
     post_uninstall_hook
@@ -1860,7 +2000,18 @@ manage_app_action() {
                 read -rp "Press [Enter] to continue..."
                 ;;
             2)
-                $uninstall_fn
+                read -rp "Are you sure you want to uninstall $name? (y/N): " confirm_uninst
+                if [[ "$confirm_uninst" =~ ^[Yy]$ ]]; then
+                    local purge_choice="n"
+                    read -rp "Also delete user profile & configuration data (caches, settings, bookmarks)? (y/N): " purge_choice
+                    if [[ "$purge_choice" =~ ^[Yy]$ ]]; then
+                        PURGE_USER_DATA=1 $uninstall_fn
+                    else
+                        PURGE_USER_DATA=0 $uninstall_fn
+                    fi
+                else
+                    log_info "Uninstallation cancelled."
+                fi
                 read -rp "Press [Enter] to continue..."
                 ;;
             3) return ;;
@@ -1908,7 +2059,18 @@ manage_vscode_action() {
                 read -rp "Press [Enter] to continue..."
                 ;;
             3)
-                uninstall_vscode
+                read -rp "Are you sure you want to uninstall VS Code? (y/N): " confirm_uninst
+                if [[ "$confirm_uninst" =~ ^[Yy]$ ]]; then
+                    local purge_choice="n"
+                    read -rp "Also delete user profile & configuration data (Code settings, extensions)? (y/N): " purge_choice
+                    if [[ "$purge_choice" =~ ^[Yy]$ ]]; then
+                        PURGE_USER_DATA=1 uninstall_vscode
+                    else
+                        PURGE_USER_DATA=0 uninstall_vscode
+                    fi
+                else
+                    log_info "Uninstallation cancelled."
+                fi
                 read -rp "Press [Enter] to continue..."
                 ;;
             4) return ;;
@@ -2248,6 +2410,31 @@ menu_extra_apps() {
 # ------------------------------------------------------------------------------
 # 5. STORAGE & PERMANENT WINDOWS DATA PARTITION MANAGEMENT (ACTIVE SCRUBBING)
 # ------------------------------------------------------------------------------
+purge_mount_dir() {
+    local d="$1"
+    [[ -z "$d" || "$d" == "/" || "$d" == "/mnt" || "$d" == "/mnt/" || "$d" == "/media" || "$d" == "/media/" ]] && return 0
+    [[ "$d" != /mnt/* && "$d" != /media/* ]] && return 0
+    if mountpoint -q "$d" 2>/dev/null; then
+        return 0
+    fi
+    rmdir "$d" 2>/dev/null || true
+}
+
+is_sensitive_partition() {
+    local parttype="${1:-}" label="${2:-}" partlabel="${3:-}"
+    parttype="${parttype,,}"
+    label="${label,,}"
+    partlabel="${partlabel,,}"
+    if [[ "$parttype" =~ ^(de94bba4-06d1-4d40-a16a-bfd50179d6ac|e3c9e316-0b5c-4db8-817d-f92df00215ae|c12a7328-f81f-11d2-ba4b-00a0c93ec93b|21686148-6449-6e6f-744e-656564454649)$ ]]; then
+        return 0
+    fi
+    local re='(^|[^a-z0-9])(recovery|winre|winre_drv|pbr_drv|dellsupport|dellutility|dellrecovery|diagnostics|system reserved|system_reserved|efi system partition|esp|msr)([^a-z0-9]|$)'
+    if [[ "$label" =~ $re || "$partlabel" =~ $re ]]; then
+        return 0
+    fi
+    return 1
+}
+
 configure_permanent_partitions() {
     local force="${1:-false}"
     if [[ "$SESSION_PARTITIONS_SYNCED" == "true" && "$force" != "force" ]]; then
@@ -2260,6 +2447,13 @@ configure_permanent_partitions() {
     local fstab_bak="/etc/fstab.bak.$(date +%Y%m%d_%H%M%S)"
     cp -p /etc/fstab "$fstab_bak"
     log_ok "Created safety backup of /etc/fstab at: $fstab_bak"
+
+    # Prune older fstab backups, keeping at most the 3 most recent
+    local old_fstab_baks
+    mapfile -t old_fstab_baks < <(ls -t /etc/fstab.bak.* 2>/dev/null | tail -n +4 || true)
+    if (( ${#old_fstab_baks[@]} > 0 )); then
+        rm -f "${old_fstab_baks[@]}" 2>/dev/null || true
+    fi
 
     # Apply Btrfs NVMe 'noatime,discard=async' mount optimization & label system partition
     if grep -E "btrfs.*compress=zstd" /etc/fstab | grep -qv "discard=async"; then
@@ -2298,6 +2492,8 @@ configure_permanent_partitions() {
 
     local configured_count=0
     local purged_count=0
+    local root_uuid
+    root_uuid=$(findmnt -n -o UUID / 2>/dev/null || true)
 
     while IFS= read -r dev_pair; do
         local dev_name="" dev_type="" dev_fstype="" dev_label="" dev_uuid="" dev_rm="" dev_parttype="" dev_partlabel=""
@@ -2316,19 +2512,19 @@ configure_permanent_partitions() {
         [[ -z "$dev_fstype" || "$dev_fstype" == "swap" ]] && continue
         [[ "$dev_rm" == "1" ]] && continue
 
-        local combined_tags="${dev_label} ${dev_partlabel}"
-
-        # 1. DETECT SENSITIVE / RECOVERY PARTITIONS
-        local is_sensitive=false
-        if [[ "${dev_parttype,,}" =~ ^(de94bba4-06d1-4d40-a16a-bfd50179d6ac|e3c9e316-0b5c-4db8-817d-f92df00215ae|c12a7328-f81f-11d2-ba4b-00a0c93ec93b|21686148-6449-6e6f-744e-656564454649)$ ]]; then
-            is_sensitive=true
+        # 1. Protect core Linux system partitions (Root, Home, EFI, Var, Boot, Usr)
+        if [[ -n "$root_uuid" && "$dev_uuid" == "$root_uuid" ]]; then
+            continue
         fi
-        if [[ "${combined_tags,,}" =~ (recovery|winre|dell|diag|support|pbr|restore|efi[ _]system|system[ _]reserved|esp|boot|msr) ]]; then
-            is_sensitive=true
+        if findmnt -n -o TARGET -S "UUID=$dev_uuid" 2>/dev/null | grep -E '^/(home|var|boot|efi|usr|$)' >/dev/null; then
+            continue
+        fi
+        if grep -E "^[[:space:]]*[^#].*[[:space:]](UUID=$dev_uuid|/dev/[a-z0-9]+)[[:space:]]+/(|boot|boot/efi|efi|home|var|usr)[[:space:]]" /etc/fstab >/dev/null 2>&1; then
+            continue
         fi
 
         # 2. ACTIVE SCRUBBING: Remove sensitive recovery partitions from fstab & unmount them
-        if [[ "$is_sensitive" == "true" ]]; then
+        if is_sensitive_partition "$dev_parttype" "$dev_label" "$dev_partlabel"; then
             if grep -qi "$dev_uuid" /etc/fstab && grep -E "$dev_uuid" /etc/fstab | grep -q "/boot/efi"; then
                 continue
             fi
@@ -2337,16 +2533,12 @@ configure_permanent_partitions() {
                 log_warn "Active Scrubbing: Removing sensitive/recovery partition ($dev_name / ${dev_label:-OEM})..."
                 umount "UUID=$dev_uuid" 2>/dev/null || true
                 sed -i "/$dev_uuid/d" /etc/fstab
-                rm -rf "/mnt/${dev_label}" "/media/${dev_label}" 2>/dev/null || true
+                if [[ -n "$dev_label" ]]; then
+                    purge_mount_dir "/mnt/${dev_label}"
+                    purge_mount_dir "/media/${dev_label}"
+                fi
                 ((purged_count++))
             fi
-            continue
-        fi
-
-        # 3. Protect core Linux system partitions (Root, Home, EFI, etc.)
-        local root_uuid
-        root_uuid=$(findmnt -n -o UUID / 2>/dev/null || true)
-        if [[ "$dev_uuid" == "$root_uuid" ]] || findmnt -n -o TARGET -S "UUID=$dev_uuid" 2>/dev/null | grep -E '^/(home|var|boot|$)' >/dev/null; then
             continue
         fi
 
@@ -2443,6 +2635,10 @@ configure_dell_hardware() {
     local mode="${1:-interactive}"
     echo ""
     log_info "=== DELL HARDWARE & FIRMWARE TUNING ==="
+    if ! is_supported_hardware; then
+        log_warn "Hardware is not Dell Inspiron 7706. Skipping Dell WMI hardware tuning (use FORCE_HW=1 to override)."
+        return 0
+    fi
     local batt_cfg_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/PrimaryBattChargeCfg"
     local custom_start_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/CustomChargeStart"
     local custom_stop_path="/sys/class/firmware-attributes/dell-wmi-sysman/attributes/CustomChargeStop"
@@ -2534,6 +2730,10 @@ update_dell_firmware() {
     local mode="${1:-interactive}"
     echo ""
     log_info "=== DELL UEFI BIOS & HARDWARE FIRMWARE UPDATE ==="
+    if ! is_supported_hardware; then
+        log_warn "Hardware is not Dell Inspiron 7706. Skipping Dell firmware update check (use FORCE_HW=1 to override)."
+        return 0
+    fi
 
     if ! command -v fwupdmgr &>/dev/null; then
         log_info "Installing fwupd (Linux Vendor Firmware Service manager)..."
@@ -2582,7 +2782,7 @@ update_dell_firmware() {
         fi
         if [[ "$fw_confirm" =~ ^[Yy]$ ]]; then
             log_info "Downloading and staging firmware capsule..."
-            fwupdmgr update -y
+            fwupdmgr update -y --no-reboot-check
             log_ok "Firmware update staged successfully!"
             log_warn "A system reboot is required to flash the firmware. The Dell logo will show a progress bar during reboot."
         else
@@ -2858,6 +3058,11 @@ configure_goodix_fingerprint() {
     echo ""
     log_info "=== GOODIX FINGERPRINT SENSOR (27c6:538d) SETUP ==="
 
+    if ! is_supported_hardware && ! lsusb | grep -qi "27c6:538d"; then
+        log_warn "Goodix 27c6:538d sensor not detected and machine is not Inspiron 7706. Skipping."
+        return 0
+    fi
+
     if ! lsusb | grep -qi "27c6:538d"; then
         log_warn "Goodix 27c6:538d sensor not detected on USB bus."
         return 0
@@ -2987,17 +3192,32 @@ EOF
         local target="$1"
         [[ ! -f "$target" ]] && return 0
 
-        # Remove existing pam_fprintd and any stale trailing fallback rules
-        sed -i '/pam_fprintd\.so/d' "$target"
-        sed -i '/# Manjaro defaults/d' "$target"
-        sed -i '/pam_unix\.so.*likeauth/d' "$target"
-        sed -i '/auth.*pam_deny\.so/d' "$target"
+        # Create safety backup before editing
+        if [[ ! -f "$target.pre-fprintd" ]]; then
+            cp -a "$target" "$target.pre-fprintd" 2>/dev/null || true
+        fi
+
+        # If already configured, keep idempotent
+        if grep -qE '^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so' "$target"; then
+            return 0
+        fi
 
         # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
         if grep -q "^auth" "$target"; then
             sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
         else
             sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
+        fi
+
+        # Safety check: ensure at least one additional fallback auth rule remains
+        local auth_count
+        auth_count=$(grep -cE '^[[:space:]]*auth' "$target" || true)
+        if (( auth_count < 2 )); then
+            log_error "Refused to modify $target: no fallback password auth rule detected. Reverting."
+            if [[ -f "$target.pre-fprintd" ]]; then
+                cp -a "$target.pre-fprintd" "$target"
+            fi
+            return 1
         fi
     }
 
@@ -3159,12 +3379,14 @@ run_all_stages() {
     configure_grub_dual_boot
     configure_goodix_fingerprint noninteractive
     configure_dell_hardware noninteractive
-    update_dell_firmware noninteractive
     log_ok "Desktop, storage and hardware settings applied."
 
     log_info ">>> [STAGE 3/3] INSTALLING ALL 15 APPLICATIONS (DEV/AI, CONTAINERS, PRODUCTIVITY, MEDIA)..."
     install_all_apps
     log_ok "All applications installed and verified."
+
+    log_info ">>> [FIRMWARE STAGE] CHECKING FOR DELL FIRMWARE UPDATES..."
+    update_dell_firmware noninteractive
 
     echo ""
     log_info "========================================================================"
@@ -3233,6 +3455,7 @@ menu_timeshift_sync() {
 # ------------------------------------------------------------------------------
 # 8. DIRECT CLI EXECUTION & INTERACTIVE MAIN MENU
 # ------------------------------------------------------------------------------
+if [[ "${MANJARO_OPT_SOURCE_ONLY:-0}" != "1" ]]; then
 case "${1:-}" in
     -a|--all|all|A)
         run_all_stages noninteractive
@@ -3263,8 +3486,12 @@ case "${1:-}" in
         install_all_apps
         exit 0
         ;;
+    -v|--version)
+        echo "Manjaro Optimization & Control Center v${SCRIPT_VERSION}"
+        exit 0
+        ;;
     -h|--help)
-        echo -e "${BOLD}Manjaro Optimization & Control Center${NC}"
+        echo -e "${BOLD}Manjaro Optimization & Control Center (v${SCRIPT_VERSION})${NC}"
         echo "Usage: sudo ./Manjaro-Optimization.sh [OPTION]"
         echo ""
         echo "Options:"
@@ -3273,6 +3500,7 @@ case "${1:-}" in
         echo "  -2, --settings   Run Stage 2: Desktop UI, Partitions & Dell Hardware"
         echo "  -3, --apps       Run Stage 3: Install all 15 Extra Applications"
         echo "  -t, --timeshift  Launch Timeshift Restore & Boot Synchronization Manager"
+        echo "  -v, --version    Show script version"
         echo "  -h, --help       Show this help message"
         echo ""
         echo "Run without options to launch the interactive Control Center menu."
@@ -3283,7 +3511,7 @@ esac
 while true; do
     echo ""
     echo -e "${BOLD}========================================================================${NC}"
-    echo -e "${BOLD}                     MANJARO CONTROL CENTER                             ${NC}"
+    echo -e "${BOLD}              MANJARO CONTROL CENTER (v${SCRIPT_VERSION})               ${NC}"
     echo -e "${BOLD}========================================================================${NC}"
     echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, ZRAM, Sysctl)"
     echo -e " ${BOLD}2)${NC} Desktop UI, Storage & Hardware Settings"
@@ -3312,3 +3540,4 @@ while true; do
             ;;
     esac
 done
+fi
