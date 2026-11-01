@@ -137,6 +137,11 @@ if [[ "${MANJARO_OPT_SOURCE_ONLY:-0}" != "1" ]]; then
     create_polkit_rule
 fi
 
+# Load shared helper library if available
+if [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/lib/common.sh"
+fi
+
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'

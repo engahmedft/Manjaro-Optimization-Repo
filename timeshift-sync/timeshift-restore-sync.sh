@@ -8,6 +8,13 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/../lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/../lib/common.sh"
+elif [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/lib/common.sh"
+fi
+
 # Text styling
 RED='\033[0;31m'
 GREEN='\033[0;32m'

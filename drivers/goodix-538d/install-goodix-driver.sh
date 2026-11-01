@@ -13,6 +13,14 @@ fi
 
 REAL_USER="${SUDO_USER:-$USER}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load shared common library if available
+if [[ -f "${SCRIPT_DIR}/../../lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/../../lib/common.sh"
+elif [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/lib/common.sh"
+fi
+
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
