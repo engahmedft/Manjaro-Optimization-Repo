@@ -10,17 +10,14 @@
 
 set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-log_info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
-log_ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/../lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/../lib/common.sh"
+elif [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/lib/common.sh"
+elif [[ -f "/usr/local/lib/manjaro-opt/common.sh" ]]; then
+    source "/usr/local/lib/manjaro-opt/common.sh"
+fi
 
 if [[ $EUID -ne 0 ]]; then
     echo -e "${YELLOW}Superuser privileges required. Elevating via sudo...${NC}"
@@ -44,33 +41,6 @@ detect_root_device() {
         exit 1
     fi
     echo "$dev"
-}
-
-BROKEN_KERNELS=("7.1")
-declare -a UNLOCKED_SNAPSHOTS=()
-
-discover_host_kernels() {
-    local k_list=()
-    local img
-    for img in /boot/vmlinuz-*-x86_64; do
-        [[ ! -f "$img" ]] && continue
-        local k
-        k=$(basename "$img" | sed -E 's/^vmlinuz-([0-9]+\.[0-9]+).*/\1/')
-        local broken=false
-        local b
-        for b in "${BROKEN_KERNELS[@]}"; do
-            if [[ "$k" == "$b" ]]; then
-                broken=true
-                break
-            fi
-        done
-        if [[ "$broken" == "false" && -n "$k" ]]; then
-            if [[ ! " ${k_list[*]:-} " =~ " ${k} " ]]; then
-                k_list+=("$k")
-            fi
-        fi
-    done
-    echo "${k_list[@]:-}"
 }
 
 cleanup() {
@@ -134,7 +104,7 @@ main() {
 
         # Temporarily make snapshot read-write for repair and track in unlock list
         btrfs property set "$snap_root" ro false
-        UNLOCKED_SNAPSHOTS+=("$snap_root")
+        track_unlocked_snapshot "$snap_root"
 
         # 1. Clear stale grubenv in snapshot
         if [[ -f "$snap_root/boot/grub/grubenv" ]]; then
@@ -152,6 +122,7 @@ main() {
                 mkdir -p "$snap_root/boot"
                 cp -p "/boot/vmlinuz-${kver}-x86_64" "$snap_root/boot/"
                 cp -p "/boot/initramfs-${kver}-x86_64.img" "$snap_root/boot/" 2>/dev/null || true
+                cp -p "/boot/initramfs-${kver}-x86_64-fallback.img" "$snap_root/boot/" 2>/dev/null || true
                 cp -p "/boot/linux${kver//./}-x86_64.kver" "$snap_root/boot/" 2>/dev/null || true
             fi
 
@@ -169,19 +140,8 @@ main() {
             done
         done
 
-        # 3. Clean obsolete broken 7.1 kernel ONLY if another valid kernel is present
-        if [[ -f "$snap_root/boot/vmlinuz-7.1-x86_64" ]]; then
-            local other_kernels
-            other_kernels=$(find "$snap_root/boot" -maxdepth 1 -name "vmlinuz-*-x86_64" ! -name "vmlinuz-7.1-x86_64" 2>/dev/null || true)
-            if [[ -n "$other_kernels" ]]; then
-                log_info "  Purging obsolete broken kernel 7.1 from snapshot..."
-                rm -f "$snap_root/boot/vmlinuz-7.1-x86_64"*
-                rm -f "$snap_root/boot/initramfs-7.1-x86_64"*
-                rm -f "$snap_root/boot/linux71-x86_64.kver"*
-            else
-                log_warn "  Kernel 7.1 is the only kernel in $snap_name and no other kernel could be injected. Retaining to preserve bootability."
-            fi
-        fi
+        # 3. Clean obsolete broken 7.1 kernel & modules ONLY if another valid kernel is present
+        purge_broken_kernels_from_root "$snap_root" || true
 
         # 4. Ensure microcode is present in snapshot
         if [[ -f /boot/intel-ucode.img && ! -f "$snap_root/boot/intel-ucode.img" ]]; then
@@ -202,11 +162,7 @@ main() {
 
         # Re-lock snapshot as read-only and remove from tracking list
         btrfs property set "$snap_root" ro true
-        local remaining_unlocked=()
-        for u in "${UNLOCKED_SNAPSHOTS[@]}"; do
-            [[ "$u" != "$snap_root" ]] && remaining_unlocked+=("$u")
-        done
-        UNLOCKED_SNAPSHOTS=("${remaining_unlocked[@]:-}")
+        untrack_unlocked_snapshot "$snap_root"
 
         log_ok "  Snapshot ${BOLD}$snap_name${NC} successfully repaired & synchronized."
         (( ++fixed_count ))

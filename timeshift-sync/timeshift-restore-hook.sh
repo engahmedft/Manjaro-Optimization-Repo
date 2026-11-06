@@ -14,31 +14,33 @@ echo "=================================================================="
 echo "Timeshift Post-Restore Hook triggered at: $(date -Iseconds)"
 echo "TS_SNAPSHOT_PATH: ${TS_SNAPSHOT_PATH:-undefined}"
 
-BROKEN_KERNELS=("7.1")
-
-discover_host_kernels() {
-    local k_list=()
-    local img
-    for img in /boot/vmlinuz-*-x86_64; do
-        [[ ! -f "$img" ]] && continue
-        local k
-        k=$(basename "$img" | sed -E 's/^vmlinuz-([0-9]+\.[0-9]+).*/\1/')
-        local broken=false
-        local b
-        for b in "${BROKEN_KERNELS[@]}"; do
-            if [[ "$k" == "$b" ]]; then
-                broken=true
-                break
-            fi
-        done
-        if [[ "$broken" == "false" && -n "$k" ]]; then
-            if [[ ! " ${k_list[*]:-} " =~ " ${k} " ]]; then
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/../lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/../lib/common.sh"
+elif [[ -f "/usr/local/lib/manjaro-opt/common.sh" ]]; then
+    source "/usr/local/lib/manjaro-opt/common.sh"
+else
+    BROKEN_KERNELS=("7.1")
+    discover_host_kernels() {
+        local boot_dir="${1:-/boot}"
+        local k_list=()
+        local img
+        for img in "$boot_dir"/vmlinuz-*-x86_64; do
+            [[ ! -f "$img" ]] && continue
+            local k
+            k=$(basename "$img" | sed -E 's/^vmlinuz-([0-9]+\.[0-9]+).*/\1/')
+            local broken=false
+            local b
+            for b in "${BROKEN_KERNELS[@]}"; do
+                [[ "$k" == "$b" ]] && { broken=true; break; }
+            done
+            if [[ "$broken" == "false" && -n "$k" && ! " ${k_list[*]:-} " =~ " ${k} " ]]; then
                 k_list+=("$k")
             fi
-        fi
-    done
-    echo "${k_list[@]:-}"
-}
+        done
+        echo "${k_list[@]:-}"
+    }
+fi
 
 # Detect root device
 root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
@@ -96,6 +98,7 @@ for kver in "${host_kernels[@]}"; do
         echo "[INFO] Copying working kernel ${kver} into restored root..."
         cp -p "/boot/vmlinuz-${kver}-x86_64" "$chroot_dir/boot/"
         cp -p "/boot/initramfs-${kver}-x86_64.img" "$chroot_dir/boot/" 2>/dev/null || true
+        cp -p "/boot/initramfs-${kver}-x86_64-fallback.img" "$chroot_dir/boot/" 2>/dev/null || true
         cp -p "/boot/linux${kver//./}-x86_64.kver" "$chroot_dir/boot/" 2>/dev/null || true
     fi
     for mod_dir in /usr/lib/modules/${kver}*; do
@@ -110,14 +113,22 @@ for kver in "${host_kernels[@]}"; do
     done
 done
 
-# Clean obsolete broken 7.1 kernel ONLY if another valid kernel is present
-if [[ -f "$chroot_dir/boot/vmlinuz-7.1-x86_64" ]]; then
+# Ensure microcode is present in restored root
+if [[ -f /boot/intel-ucode.img && ! -f "$chroot_dir/boot/intel-ucode.img" ]]; then
+    cp -p /boot/intel-ucode.img "$chroot_dir/boot/"
+fi
+
+# Clean obsolete broken 7.1 kernel & modules ONLY if another valid kernel is present
+if declare -F purge_broken_kernels_from_root &>/dev/null; then
+    purge_broken_kernels_from_root "$chroot_dir" || true
+elif [[ -f "$chroot_dir/boot/vmlinuz-7.1-x86_64" ]]; then
     other_kernels=$(find "$chroot_dir/boot" -maxdepth 1 -name "vmlinuz-*-x86_64" ! -name "vmlinuz-7.1-x86_64" 2>/dev/null || true)
     if [[ -n "$other_kernels" ]]; then
         echo "[INFO] Removing obsolete kernel 7.1 from restored root to avoid hardware freeze..."
         rm -f "$chroot_dir/boot/vmlinuz-7.1-x86_64"*
         rm -f "$chroot_dir/boot/initramfs-7.1-x86_64"*
         rm -f "$chroot_dir/boot/linux71-x86_64.kver"*
+        rm -rf "$chroot_dir/usr/lib/modules/7.1".* "$chroot_dir/usr/lib/modules/7.1-"* 2>/dev/null || true
     else
         echo "[WARN] Kernel 7.1 is the only kernel in restored root and no alternative could be copied. Retaining to preserve bootability."
     fi

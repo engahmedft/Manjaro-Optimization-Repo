@@ -55,6 +55,26 @@ if [[ "$restore_detected" == "true" ]]; then
     rm -rf /var/cache/fontconfig/* 2>/dev/null || true
     fc-cache -r 2>/dev/null || true
 
+    # Clean up any temporary @_backup_* / @home_backup_* top-level subvolumes left from previous live swap
+    btrfs_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    btrfs_dev="${btrfs_dev%%\[*}"
+    if [[ -n "$btrfs_dev" && -b "$btrfs_dev" ]]; then
+        mkdir -p /run/timeshift-sync/btrfs-root
+        if mount -o subvolid=5 "$btrfs_dev" /run/timeshift-sync/btrfs-root 2>/dev/null; then
+            home_subvol_id=$(btrfs subvolume show /home 2>/dev/null | awk '/Subvolume ID:/ {print $NF}' || true)
+            for old_bak in /run/timeshift-sync/btrfs-root/@_backup_* /run/timeshift-sync/btrfs-root/@home_backup_*; do
+                [[ ! -d "$old_bak" ]] && continue
+                old_id=$(btrfs subvolume show "$old_bak" 2>/dev/null | awk '/Subvolume ID:/ {print $NF}' || true)
+                if [[ -n "$old_id" && "$old_id" != "$curr_subvol_id" && "$old_id" != "$home_subvol_id" ]]; then
+                    echo "[INFO] Removing stale unmounted swap subvolume: $(basename "$old_bak")"
+                    btrfs subvolume delete "$old_bak" >/dev/null 2>&1 || true
+                fi
+            done
+            umount /run/timeshift-sync/btrfs-root 2>/dev/null || true
+            rmdir /run/timeshift-sync/btrfs-root 2>/dev/null || true
+        fi
+    fi
+
     if command -v update-grub &>/dev/null; then
         update-grub >/dev/null 2>&1 || true
     elif command -v grub-mkconfig &>/dev/null; then

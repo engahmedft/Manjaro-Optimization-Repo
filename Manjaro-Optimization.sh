@@ -4,7 +4,7 @@
 # Target: Dell Inspiron 7706 | GNOME Wayland | RustDesk | Full AUR & Kernel Sync
 # ==============================================================================
 
-SCRIPT_VERSION="10.0.0-dev"
+SCRIPT_VERSION="10.0.1-dev"
 
 # Allow non-privileged queries (--help, --version, -h, -v) before root checks or side effects
 case "${1:-}" in
@@ -84,17 +84,13 @@ run_as_user() {
     fi
 }
 
-is_supported_hardware() {
-    local dmi_product
-    dmi_product=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "Unknown")
-    if [[ "$dmi_product" =~ Inspiron[[:space:]]+7706 ]] || [[ "${FORCE_HW:-0}" == "1" ]]; then
-        return 0
-    fi
-    return 1
-}
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/Manjaro-Optimization.log"
+
+# Load shared helper library
+if [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
+    source "${SCRIPT_DIR}/lib/common.sh"
+fi
 
 # Rotate and trim log file if it exceeds 5MB to keep it performant
 if [[ -f "$LOG_FILE" ]]; then
@@ -118,8 +114,12 @@ polkit.addRule(function(action, subject) {
 EOF
 }
 
+_RESTORE_AUTOSNAP_CONF=false
 cleanup() {
     rm -f "$POLKIT_RULE" 2>/dev/null || true
+    if [[ "$_RESTORE_AUTOSNAP_CONF" == "true" && -f /etc/timeshift-autosnap.conf ]]; then
+        sed -i 's/^skipAutosnap=.*/skipAutosnap=false/' /etc/timeshift-autosnap.conf 2>/dev/null || true
+    fi
 }
 
 if [[ "${MANJARO_OPT_SOURCE_ONLY:-0}" != "1" ]]; then
@@ -128,27 +128,14 @@ if [[ "${MANJARO_OPT_SOURCE_ONLY:-0}" != "1" ]]; then
         chown "$REAL_USER:" "$LOG_FILE" 2>/dev/null || true
     fi
 
-    # Strip ANSI color codes from disk log while keeping full color on stdout
-    exec > >(tee >(sed -u -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' >> "$LOG_FILE")) 2>&1
+    # Strip ANSI color codes and intermediate carriage-return (\r) progress frames from disk log
+    exec > >(tee >(sed -u -E 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r+$//; s/.*\r//g' >> "$LOG_FILE")) 2>&1
 
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     create_polkit_rule
 fi
-
-# Load shared helper library if available
-if [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
-    source "${SCRIPT_DIR}/lib/common.sh"
-fi
-
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
 
 # Session-wide snapshot and idempotency guards (ensures shared routines run only once in batch mode)
 SESSION_SNAPSHOT_TAKEN=false
@@ -163,24 +150,6 @@ SESSION_TIMESHIFT_SYNC_INSTALLED=false
 PENDING_GRUB_REBUILD=false
 DEFER_GRUB_REBUILD=false
 GRUB_CONFIG_CHANGED=false
-
-timestamp() { printf '%(%Y-%m-%d %H:%M:%S)T' -1; }
-log_info()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;34m[INFO]\033[0m %b\n' -1 "$1"; }
-log_ok()      { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;32m[OK]\033[0m %b\n' -1 "$1"; }
-log_warn()    { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[1;33m[WARN]\033[0m %b\n' -1 "$1"; }
-log_error()   { printf '[%(%Y-%m-%d %H:%M:%S)T] \033[0;31m[ERROR]\033[0m %b\n' -1 "$1"; }
-
-ask() {
-    local __var_name="$1"
-    local __prompt="$2"
-    local __input=""
-    if ! read -rp "$__prompt" __input; then
-        echo ""
-        log_warn "Standard input closed (EOF). Exiting."
-        exit 0
-    fi
-    printf -v "$__var_name" '%s' "$__input"
-}
 
 check_pacman_lock() {
     if [[ -f /var/lib/pacman/db.lck ]]; then
@@ -232,34 +201,6 @@ is_clasp_installed() {
     is_bin_installed clasp
 }
 
-set_grub_var() {
-    local key="$1"
-    local val="$2"
-    local file="${3:-/etc/default/grub}"
-    [[ ! -f "$file" ]] && return 1
-
-    local new_entry="${key}=${val}"
-    # Check if exact uncommented entry already exists
-    if grep -qE "^[[:space:]]*${key}=" "$file"; then
-        local current_line
-        current_line=$(grep -E "^[[:space:]]*${key}=" "$file" | head -n 1)
-        if [[ "$current_line" == "$new_entry" ]]; then
-            return 0
-        fi
-    fi
-
-    local escaped_entry="${new_entry//\\/\\\\}"
-    escaped_entry="${escaped_entry//&/\\&}"
-
-    if grep -qE "^#?[[:space:]]*${key}=" "$file"; then
-        sed -i -E "s|^#?[[:space:]]*${key}=.*|${escaped_entry}|" "$file"
-    else
-        echo "$new_entry" >> "$file"
-    fi
-    GRUB_CONFIG_CHANGED=true
-    PENDING_GRUB_REBUILD=true
-}
-
 regenerate_grub_cfg() {
     local mode="${1:-normal}" # "normal", "force", "defer"
     if [[ "$mode" == "defer" || "$DEFER_GRUB_REBUILD" == "true" ]]; then
@@ -281,7 +222,6 @@ regenerate_grub_cfg() {
     fi
     PENDING_GRUB_REBUILD=false
     GRUB_CONFIG_CHANGED=false
-    SESSION_GRUB_SYNCED=true
     log_ok "GRUB configuration generated successfully."
 }
 
@@ -306,10 +246,10 @@ ensure_session_snapshot() {
         return 0
     fi
 
-    # Ensure Timeshift native hooks, boot safeguard & snapshot repairs are deployed
+    # Ensure Timeshift native hooks & boot safeguard are deployed
     local ts_install="${SCRIPT_DIR}/timeshift-sync/install.sh"
     if [[ "$SESSION_TIMESHIFT_SYNC_INSTALLED" != "true" && -f "$ts_install" ]]; then
-        log_info "Ensuring Timeshift restore hooks, boot safeguard & snapshot repairs are deployed..."
+        log_info "Ensuring Timeshift restore hooks & boot safeguard are deployed..."
         bash "$ts_install" > /dev/null 2>&1 || true
         SESSION_TIMESHIFT_SYNC_INSTALLED=true
         log_ok "Timeshift synchronization suite deployed and verified."
@@ -378,6 +318,12 @@ EOF
     systemctl daemon-reload > /dev/null 2>&1 || true
     systemctl enable --now grub-btrfsd.service > /dev/null 2>&1 || true
     systemctl restart grub-btrfsd.service > /dev/null 2>&1 || true
+    if [[ -f /etc/timeshift-autosnap.conf ]]; then
+        sed -i 's/^updateGrub=.*/updateGrub=false/' /etc/timeshift-autosnap.conf 2>/dev/null || true
+    fi
+    if [[ -f /etc/default/grub-btrfs/config ]]; then
+        sed -i 's/^#*GRUB_BTRFS_TITLE_FORMAT=.*/GRUB_BTRFS_TITLE_FORMAT=("date" "description")/' /etc/default/grub-btrfs/config 2>/dev/null || true
+    fi
     log_ok "Timeshift automated snapshot synchronization daemon (grub-btrfsd) active."
 
     # 4. Deploy Timeshift Boot & Kernel Synchronization System
@@ -778,37 +724,7 @@ configure_antigravity2_theme() {
     local antigravity_storage="$antigravity_cfg_dir/app_storage.json"
     local antigravity_pref="$antigravity_cfg_dir/Preferences"
     mkdir -p "$gemini_cfg_dir" "$antigravity_cfg_dir"
-    python3 -c '
-import json, os, sys, re, tempfile, shutil
-
-def load_jsonc(path):
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        content = re.sub(r"//.*", "", content)
-        content = re.sub(r"/\*[\s\S]*?\*/", "", content)
-        content = re.sub(r",\s*([}\]])", r"\1", content)
-        return json.loads(content)
-    except Exception as e:
-        print(f"WARN: Could not parse {path} ({e}). Preserving file.", file=sys.stderr)
-        return None
-
-def atomic_save_json(path, data, indent=2):
-    dir_name = os.path.dirname(path)
-    if dir_name and not os.path.exists(dir_name):
-        os.makedirs(dir_name, exist_ok=True)
-    if os.path.exists(path):
-        try:
-            shutil.copy2(path, path + ".bak")
-        except Exception:
-            pass
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name if dir_name else None, prefix=".tmp_json_")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent)
-    os.replace(tmp_path, path)
-
+    python3 -c "${_JSONC_PY_HELPERS}"'
 # 1. Antigravity Theme Seeds & Dark Mode
 gemini_path = sys.argv[1]
 data = load_jsonc(gemini_path)
@@ -853,37 +769,7 @@ configure_editor_settings() {
     local antigravity_ide_user_dir="$USER_HOME/.config/Antigravity IDE/User"
     mkdir -p "$vscode_user_dir" "$antigravity_ide_user_dir"
 
-    python3 -c '
-import json, os, sys, re, tempfile, shutil
-
-def load_jsonc(path):
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        content = re.sub(r"//.*", "", content)
-        content = re.sub(r"/\*[\s\S]*?\*/", "", content)
-        content = re.sub(r",\s*([}\]])", r"\1", content)
-        return json.loads(content)
-    except Exception as e:
-        print(f"WARN: Could not parse {path} ({e}). Preserving file.", file=sys.stderr)
-        return None
-
-def atomic_save_json(path, data, indent=4):
-    dir_name = os.path.dirname(path)
-    if dir_name and not os.path.exists(dir_name):
-        os.makedirs(dir_name, exist_ok=True)
-    if os.path.exists(path):
-        try:
-            shutil.copy2(path, path + ".bak")
-        except Exception:
-            pass
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name if dir_name else None, prefix=".tmp_json_")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent)
-    os.replace(tmp_path, path)
-
+    python3 -c "${_JSONC_PY_HELPERS}"'
 def configure_editor_json(path):
     data = load_jsonc(path)
     if data is None:
@@ -1071,8 +957,17 @@ optimize_system() {
     log_info "3/9: Refreshing fastest mirrors & full system upgrade (Official + AUR)..."
     pacman-mirrors --fasttrack 5
     # Upgrades official packages and all AUR packages (VS Code, Chrome, Antigravity, RustDesk)
-    # Pass SKIP_AUTOSNAP=1 to prevent duplicate ALPM hook snapshot right after step 1
-    sudo -u "$REAL_USER" env SKIP_AUTOSNAP=1 pamac update --no-confirm --aur
+    # Temporarily disable timeshift-autosnap in /etc/timeshift-autosnap.conf since pamac-daemon
+    # runs over D-Bus and ignores client environment variables, and Step 1 already took a snapshot.
+    if [[ -f /etc/timeshift-autosnap.conf ]] && grep -q "^skipAutosnap=false" /etc/timeshift-autosnap.conf 2>/dev/null; then
+        _RESTORE_AUTOSNAP_CONF=true
+        sed -i 's/^skipAutosnap=.*/skipAutosnap=true/' /etc/timeshift-autosnap.conf 2>/dev/null || true
+    fi
+    sudo -u "$REAL_USER" env TERM="${TERM:-xterm-256color}" SKIP_AUTOSNAP=1 pamac update --no-confirm --aur
+    if [[ "$_RESTORE_AUTOSNAP_CONF" == "true" && -f /etc/timeshift-autosnap.conf ]]; then
+        sed -i 's/^skipAutosnap=.*/skipAutosnap=false/' /etc/timeshift-autosnap.conf 2>/dev/null || true
+        _RESTORE_AUTOSNAP_CONF=false
+    fi
     refresh_pkg_cache
 
     log_info "4/9: Checking Linux Kernel Lifecycle & Stability..."
@@ -1084,18 +979,25 @@ optimize_system() {
 
     # Check installed kernels and ensure an LTS safety branch (like linux612 or linux66) is available
     local installed_kernels
-    installed_kernels=$(mhwd-kernel -li 2>/dev/null || true)
+    installed_kernels=$(mhwd-kernel -li 2>/dev/null || pacman -Qqs "^linux[0-9]+" 2>/dev/null || true)
     if ! echo "$installed_kernels" | grep -qE "linux612|linux66"; then
         log_warn "Only rolling kernel branch detected. For dual-boot resilience, an LTS fallback is recommended."
-        if [[ "${mode:-}" == "noninteractive" ]]; then
-            log_info "Installing linux612 fallback kernel non-interactively..."
-            local k_pkgs=("linux612")
-            if is_pkg_installed "linux${k_major}${k_minor}-headers"; then
-                k_pkgs+=("linux612-headers")
+        log_info "Installing linux612 LTS fallback kernel..."
+        local k_pkgs=("linux612")
+        if is_pkg_installed "linux${k_major}${k_minor}-headers"; then
+            k_pkgs+=("linux612-headers")
+        fi
+        if pacman -S --needed --noconfirm "${k_pkgs[@]}"; then
+            refresh_pkg_cache
+            GRUB_CONFIG_CHANGED=true
+            PENDING_GRUB_REBUILD=true
+            log_ok "Installed linux612 LTS fallback kernel."
+            if [[ -f "${SCRIPT_DIR}/timeshift-sync/fix-existing-snapshots.sh" ]]; then
+                log_info "Synchronizing newly installed LTS kernel into existing Timeshift snapshots..."
+                bash "${SCRIPT_DIR}/timeshift-sync/fix-existing-snapshots.sh" || true
             fi
-            pacman -S --needed --noconfirm "${k_pkgs[@]}" || log_warn "LTS fallback kernel installation deferred. Continuing with $running_ver."
         else
-            mhwd-kernel -i linux612 || log_warn "LTS fallback kernel installation deferred. Continuing with $running_ver."
+            log_warn "LTS fallback kernel installation deferred. Continuing with $running_ver."
         fi
     else
         log_ok "Reliable fallback LTS kernel series verified."
@@ -1170,9 +1072,9 @@ EOF
     systemctl enable --now fstrim.timer > /dev/null 2>&1 || true
     systemctl enable --now paccache.timer > /dev/null 2>&1 || true
 
-    # Optimize NVMe SSD read-ahead (256KB) for faster sequential reads & project indexing
-    echo 'ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/read_ahead_kb}="256"' > /etc/udev/rules.d/60-nvme-readahead.rules
-    udevadm control --reload-rules && udevadm trigger --subsystem-match=block 2>/dev/null || true
+    # Optimize NVMe SSD read-ahead (256KB) on whole disks only (exclude partitions to avoid udev errors)
+    echo 'ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/read_ahead_kb}="256"' > /etc/udev/rules.d/60-nvme-readahead.rules
+    udevadm control --reload-rules && udevadm trigger --subsystem-match=block --property-match=DEVTYPE=disk 2>/dev/null || true
 
     log_info "9/9: Performing Deep System Clutter Cleanup (Cache, Logs & Orphans)..."
     rm -rf /var/tmp/pamac-build-* /var/tmp/pamac-*
@@ -1185,9 +1087,13 @@ EOF
     [[ -n "$orphans" ]] && pacman -Rns --noconfirm $orphans > /dev/null 2>&1 || true
     refresh_pkg_cache
 
+    if [[ "$PENDING_GRUB_REBUILD" == "true" && "$DEFER_GRUB_REBUILD" != "true" ]]; then
+        regenerate_grub_cfg
+    fi
+
     log_ok "Core system optimization complete! (OS, AUR, kernel, ZRAM, sysctl & cleanup updated)."
     if [[ "$mode" != "noninteractive" ]]; then
-        read -rp "Press [Enter] to return to the main menu..."
+        ask _ "Press [Enter] to return to the main menu..."
     fi
 }
 
@@ -1334,6 +1240,11 @@ EOF
 }
 
 configure_rustdesk_service() {
+    if ! is_pkg_installed libayatana-appindicator; then
+        log_info "Installing libayatana-appindicator for RustDesk tray support..."
+        pacman -S --needed --noconfirm libayatana-appindicator || true
+        refresh_pkg_cache
+    fi
     usermod -aG input,video "$REAL_USER" 2>/dev/null || true
     echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/85-rustdesk-uinput.rules
     udevadm control --reload-rules && udevadm trigger --subsystem-match=misc --action=change 2>/dev/null || true
@@ -1347,6 +1258,7 @@ Environment="GST_VAAPI_ALL_DRIVERS=1"
 EOF
     systemctl daemon-reload
     systemctl enable --now rustdesk.service 2>/dev/null || true
+    systemctl restart rustdesk.service 2>/dev/null || true
 }
 
 install_vscode() {
@@ -1656,9 +1568,31 @@ EOF
     post_install_hook
 }
 
+ensure_clasp_wrapper() {
+    mkdir -p "$USER_HOME/.local/bin"
+    cat << 'EOF' > "$USER_HOME/.local/bin/clasp"
+#!/usr/bin/env bash
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+[ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh" 2>/dev/null
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null
+nvm use default >/dev/null 2>&1 || true
+NODE_BIN_DIR="$(nvm which default 2>/dev/null | sed 's#/node$##')"
+if [[ -x "$NODE_BIN_DIR/clasp" ]]; then
+    export PATH="$NODE_BIN_DIR:$PATH"
+    exec "$NODE_BIN_DIR/clasp" "$@"
+fi
+echo "Error: Google Clasp CLI is not found in the active Node.js environment ($NODE_BIN_DIR)." >&2
+echo "Please run 'npm install -g @google/clasp' or reinstall via Manjaro Optimization Hub." >&2
+exit 1
+EOF
+    chmod 755 "$USER_HOME/.local/bin/clasp"
+    chown "$REAL_USER:" "$USER_HOME/.local/bin/clasp" 2>/dev/null || true
+}
+
 install_clasp() {
     local mode="${1:-install}"
     if [[ "$mode" != "reinstall" ]] && is_clasp_installed; then
+        ensure_clasp_wrapper
         log_ok "Google Clasp CLI (@google/clasp) is already installed."
         return 0
     fi
@@ -1670,7 +1604,7 @@ install_clasp() {
         else
             echo ""
             log_warn "Google Clasp requires Node.js LTS via NVM."
-            read -rp "Would you like to automatically install Node.js LTS via NVM now? (Y/n): " dep_conf
+            ask dep_conf "Would you like to automatically install Node.js LTS via NVM now? (Y/n): "
             if [[ "$dep_conf" =~ ^[Nn]$ ]]; then
                 log_warn "Google Clasp installation cancelled: Node.js LTS is required."
                 return 1
@@ -1690,25 +1624,7 @@ install_clasp() {
         npm install -g @google/clasp
     '
 
-    # Create robust launcher wrapper script in $USER_HOME/.local/bin/clasp
-    mkdir -p "$USER_HOME/.local/bin"
-    cat << 'EOF' > "$USER_HOME/.local/bin/clasp"
-#!/usr/bin/env bash
-export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-[ -s "/usr/share/nvm/init-nvm.sh" ] && \. "/usr/share/nvm/init-nvm.sh" 2>/dev/null
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null
-nvm use default >/dev/null 2>&1 || true
-NODE_BIN_DIR="$(nvm which default 2>/dev/null | sed 's#/node$##')"
-if [[ -x "$NODE_BIN_DIR/clasp" ]]; then
-    export PATH="$NODE_BIN_DIR:$PATH"
-    exec "$NODE_BIN_DIR/clasp" "$@"
-fi
-echo "Error: Google Clasp CLI is not found in the active Node.js environment ($NODE_BIN_DIR)." >&2
-echo "Please run 'npm install -g @google/clasp' or reinstall via Manjaro Optimization Hub." >&2
-exit 1
-EOF
-    chmod 755 "$USER_HOME/.local/bin/clasp"
-    chown "$REAL_USER:" "$USER_HOME/.local/bin/clasp" 2>/dev/null || true
+    ensure_clasp_wrapper
 
     log_ok "Google Clasp CLI (@google/clasp) installed and linked to ~/.local/bin/clasp."
     post_install_hook
@@ -1716,6 +1632,7 @@ EOF
 
 install_dev_runtimes() {
     local mode="${1:-install}"
+    local outer_skip="${SKIP_POST_HOOK:-0}"
     ensure_session_snapshot "Before Installing Developer Suite"
     log_info "Installing Modern Developer Suite (.NET LTS, Node LTS & Google Clasp)..."
     local SKIP_POST_HOOK=1
@@ -1723,7 +1640,7 @@ install_dev_runtimes() {
     install_nvm_node "$mode"
     install_clasp "$mode"
     configure_git_identity
-    unset SKIP_POST_HOOK
+    SKIP_POST_HOOK="$outer_skip"
     log_ok "Modern Developer Suite (.NET LTS, Node LTS & Google Clasp) fully installed."
     post_install_hook
 }
@@ -1738,7 +1655,7 @@ install_all_apps() {
     local official_pkgs=(
         podman podman-compose podman-docker fuse-overlayfs
         qemu-desktop virt-manager virt-viewer dnsmasq vde2 iptables-nft libguestfs
-        libreoffice-fresh
+        libreoffice-fresh libayatana-appindicator
         vlc celluloid gimp kdenlive
     )
     local retries=3
@@ -1984,7 +1901,7 @@ uninstall_nvm_node() {
     if is_clasp_installed; then
         echo ""
         log_warn "Google Clasp relies on Node.js/NVM and will also be removed."
-        read -rp "Proceed with removing Node.js/NVM and Google Clasp? (y/N): " nvm_rm_conf
+        ask nvm_rm_conf "Proceed with removing Node.js/NVM and Google Clasp? (y/N): "
         if ! [[ "$nvm_rm_conf" =~ ^[Yy]$ ]]; then
             log_info "Uninstallation of Node.js cancelled by user."
             return 0
@@ -2031,13 +1948,13 @@ uninstall_all_apps() {
     echo -e " This action will uninstall all dev runtimes, virtualization, media and"
     echo -e " productivity tools installed by this suite."
     echo -e "${RED}========================================================================${NC}"
-    read -rp "Are you sure you want to proceed with uninstalling ALL applications? (y/N): " confirm_all
+    ask confirm_all "Are you sure you want to proceed with uninstalling ALL applications? (y/N): "
     if [[ ! "$confirm_all" =~ ^[Yy]$ ]]; then
         log_info "Bulk uninstallation cancelled."
         return 0
     fi
     local purge_data=0
-    read -rp "Also purge all user profile and configuration directories? (y/N): " confirm_purge
+    ask confirm_purge "Also purge all user profile and configuration directories? (y/N): "
     if [[ "$confirm_purge" =~ ^[Yy]$ ]]; then
         purge_data=1
     fi
@@ -2105,17 +2022,17 @@ manage_app_action() {
         echo -e " 2) Uninstall Application"
         echo -e " 3) Cancel & Return"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Please select an action (1-3): " act_choice
+        ask act_choice "Please select an action (1-3): "
         case "$act_choice" in
             1)
                 $install_fn reinstall
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             2)
-                read -rp "Are you sure you want to uninstall $name? (y/N): " confirm_uninst
+                ask confirm_uninst "Are you sure you want to uninstall $name? (y/N): "
                 if [[ "$confirm_uninst" =~ ^[Yy]$ ]]; then
                     local purge_choice="n"
-                    read -rp "Also delete user profile & configuration data (caches, settings, bookmarks)? (y/N): " purge_choice
+                    ask purge_choice "Also delete user profile & configuration data (caches, settings, bookmarks)? (y/N): "
                     if [[ "$purge_choice" =~ ^[Yy]$ ]]; then
                         PURGE_USER_DATA=1 $uninstall_fn
                     else
@@ -2124,7 +2041,7 @@ manage_app_action() {
                 else
                     log_info "Uninstallation cancelled."
                 fi
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             3) return ;;
             *) log_warn "Invalid selection." ;;
@@ -2135,11 +2052,11 @@ manage_app_action() {
         echo -e " 1) Install Application"
         echo -e " 2) Cancel & Return"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Please select an action (1-2): " act_choice
+        ask act_choice "Please select an action (1-2): "
         case "$act_choice" in
             1)
                 $install_fn install
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             2) return ;;
             *) log_warn "Invalid selection." ;;
@@ -2160,21 +2077,21 @@ manage_vscode_action() {
         echo -e " 3) Uninstall VS Code"
         echo -e " 4) Cancel & Return"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Please select an action (1-4): " act_choice
+        ask act_choice "Please select an action (1-4): "
         case "$act_choice" in
             1)
                 install_vscode reinstall
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             2)
                 install_vscode_extensions
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             3)
-                read -rp "Are you sure you want to uninstall VS Code? (y/N): " confirm_uninst
+                ask confirm_uninst "Are you sure you want to uninstall VS Code? (y/N): "
                 if [[ "$confirm_uninst" =~ ^[Yy]$ ]]; then
                     local purge_choice="n"
-                    read -rp "Also delete user profile & configuration data (Code settings, extensions)? (y/N): " purge_choice
+                    ask purge_choice "Also delete user profile & configuration data (Code settings, extensions)? (y/N): "
                     if [[ "$purge_choice" =~ ^[Yy]$ ]]; then
                         PURGE_USER_DATA=1 uninstall_vscode
                     else
@@ -2183,7 +2100,7 @@ manage_vscode_action() {
                 else
                     log_info "Uninstallation cancelled."
                 fi
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             4) return ;;
             *) log_warn "Invalid selection." ;;
@@ -2194,11 +2111,11 @@ manage_vscode_action() {
         echo -e " 1) Install VS Code & Full Extension Suite"
         echo -e " 2) Cancel & Return"
         echo -e "${BOLD}========================================================================${NC}"
-        read -rp "Please select an action (1-2): " act_choice
+        ask act_choice "Please select an action (1-2): "
         case "$act_choice" in
             1)
                 install_vscode install
-                read -rp "Press [Enter] to continue..."
+                ask _ "Press [Enter] to continue..."
                 ;;
             2) return ;;
             *) log_warn "Invalid selection." ;;
@@ -2240,7 +2157,7 @@ menu_dev_apps() {
         echo -e "${BOLD}========================================================================${NC}"
         echo -e "${BOLD}                     DEVELOPMENT & AI TOOLS                             ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e " 1) VS Code + Extension Suite        $st_vscode ${CYAN}[OFFICIAL + 18 DEV EXTENSIONS]${NC}"
+        echo -e " 1) VS Code + Extension Suite        $st_vscode ${CYAN}[OFFICIAL + 20 DEV EXTENSIONS]${NC}"
         echo -e " 2) Antigravity IDE                  $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
         echo -e " 3) Antigravity 2.0 Platform         $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
         echo -e " 4) .NET Core SDK & ASP.NET (LTS)    $st_dotnet ${CYAN}[DYNAMIC LTS: v$(get_dotnet_latest_lts)]${NC}"
@@ -2261,25 +2178,28 @@ menu_dev_apps() {
             5) manage_app_action "Node Version Manager (NVM) & Node LTS" "$is_node" install_nvm_node uninstall_nvm_node ;;
             6) manage_app_action "Google Clasp CLI (@google/clasp)" "$is_clasp" install_clasp uninstall_clasp ;;
             [aA])
-                read -rp "Install ALL Development & AI Tools now? (y/N): " a_conf
+                ask a_conf "Install ALL Development & AI Tools now? (y/N): "
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    local SKIP_POST_HOOK=1
                     install_vscode install
                     install_antigravity_ide install
                     install_antigravity_standalone install
                     install_dotnet install
                     install_nvm_node install
                     install_clasp install
-                    read -rp "Press [Enter] to continue..."
+                    SKIP_POST_HOOK=0 post_install_hook
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [uU])
-                read -rp "Are you sure you want to uninstall ALL Development & AI Tools? (y/N): " u_conf
+                ask u_conf "Are you sure you want to uninstall ALL Development & AI Tools? (y/N): "
                 if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    local SKIP_POST_HOOK=1
                     uninstall_vscode
                     uninstall_antigravity_ide
                     uninstall_antigravity_standalone
                     uninstall_dev_runtimes
-                    read -rp "Press [Enter] to continue..."
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [bB]) break ;;
@@ -2315,19 +2235,23 @@ menu_virt_containers() {
             1) manage_app_action "Podman Engine & Compose" "$is_podman" install_podman uninstall_podman ;;
             2) manage_app_action "KVM / QEMU Virt-Manager" "$is_kvm" install_kvm uninstall_kvm ;;
             [aA])
-                read -rp "Install ALL Virtualization & Container platforms now? (y/N): " a_conf
+                ask a_conf "Install ALL Virtualization & Container platforms now? (y/N): "
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    local SKIP_POST_HOOK=1
                     install_podman install
                     install_kvm install
-                    read -rp "Press [Enter] to continue..."
+                    SKIP_POST_HOOK=0 post_install_hook
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [uU])
-                read -rp "Are you sure you want to uninstall ALL Virtualization & Container platforms? (y/N): " u_conf
+                ask u_conf "Are you sure you want to uninstall ALL Virtualization & Container platforms? (y/N): "
                 if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    local SKIP_POST_HOOK=1
                     uninstall_podman
                     uninstall_kvm
-                    read -rp "Press [Enter] to continue..."
+                    SKIP_POST_HOOK=0 post_uninstall_hook
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [bB]) break ;;
@@ -2367,21 +2291,25 @@ menu_productivity_apps() {
             2) manage_app_action "LibreOffice Fresh Suite" "$is_office" install_office uninstall_office ;;
             3) manage_app_action "RustDesk Remote Desktop" "$is_rustdesk" install_rustdesk uninstall_rustdesk ;;
             [aA])
-                read -rp "Install ALL Productivity & Remote Access apps now? (y/N): " a_conf
+                ask a_conf "Install ALL Productivity & Remote Access apps now? (y/N): "
                 if [[ "$a_conf" =~ ^[Yy]$ ]]; then
+                    local SKIP_POST_HOOK=1
                     install_chrome install
                     install_office install
                     install_rustdesk install
-                    read -rp "Press [Enter] to continue..."
+                    SKIP_POST_HOOK=0 post_install_hook
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [uU])
-                read -rp "Are you sure you want to uninstall ALL Productivity & Remote Access apps? (y/N): " u_conf
+                ask u_conf "Are you sure you want to uninstall ALL Productivity & Remote Access apps? (y/N): "
                 if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    local SKIP_POST_HOOK=1
                     uninstall_chrome
                     uninstall_office
                     uninstall_rustdesk
-                    read -rp "Press [Enter] to continue..."
+                    SKIP_POST_HOOK=0 post_uninstall_hook
+                    ask _ "Press [Enter] to continue..."
                 fi
                 ;;
             [bB]) break ;;
@@ -2522,73 +2450,6 @@ menu_extra_apps() {
 # ------------------------------------------------------------------------------
 # 5. STORAGE & PERMANENT WINDOWS DATA PARTITION MANAGEMENT (ACTIVE SCRUBBING)
 # ------------------------------------------------------------------------------
-purge_mount_dir() {
-    local d="$1"
-    [[ -z "$d" || "$d" == "/" || "$d" == "/mnt" || "$d" == "/mnt/" || "$d" == "/media" || "$d" == "/media/" ]] && return 0
-    [[ "$d" != /mnt/* && "$d" != /media/* ]] && return 0
-    if mountpoint -q "$d" 2>/dev/null; then
-        return 0
-    fi
-    rmdir "$d" 2>/dev/null || true
-}
-
-is_sensitive_partition() {
-    local parttype="${1:-}" label="${2:-}" partlabel="${3:-}"
-    parttype="${parttype,,}"
-    label="${label,,}"
-    partlabel="${partlabel,,}"
-    if [[ "$parttype" =~ ^(de94bba4-06d1-4d40-a16a-bfd50179d6ac|e3c9e316-0b5c-4db8-817d-f92df00215ae|c12a7328-f81f-11d2-ba4b-00a0c93ec93b|21686148-6449-6e6f-744e-656564454649)$ ]]; then
-        return 0
-    fi
-    local re='(^|[^a-z0-9])(recovery|winre|winre_drv|pbr_drv|dellsupport|dellutility|dellrecovery|diagnostics|system reserved|system_reserved|efi system partition|esp|msr)([^a-z0-9]|$)'
-    if [[ "$label" =~ $re || "$partlabel" =~ $re ]]; then
-        return 0
-    fi
-    return 1
-}
-
-fstab_ensure_btrfs_opts() {
-    local f="${1:-/etc/fstab}"
-    [[ ! -f "$f" ]] && return 1
-    shift || true
-    local opts_to_add=("noatime" "discard=async")
-    [[ $# -gt 0 ]] && opts_to_add=("$@")
-
-    local line out=() modified=false
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" =~ ^([^#].*[[:space:]]btrfs[[:space:]]+)([^[:space:]]+)(.*)$ ]]; then
-            local prefix="${BASH_REMATCH[1]}"
-            local cur_opts="${BASH_REMATCH[2]}"
-            local suffix="${BASH_REMATCH[3]}"
-            local opt_list=",${cur_opts},"
-            local opt_changed=false
-            local o
-
-            for o in "${opts_to_add[@]}"; do
-                local key="${o%%=*}"
-                if [[ "$opt_list" != *",$o,"* && "$opt_list" != *",$key="* ]]; then
-                    opt_list+="${o},"
-                    opt_changed=true
-                fi
-            done
-
-            if [[ "$opt_changed" == "true" ]]; then
-                opt_list="${opt_list#,}"
-                opt_list="${opt_list%,}"
-                line="${prefix}${opt_list}${suffix}"
-                modified=true
-            fi
-        fi
-        out+=("$line")
-    done < "$f"
-
-    if [[ "$modified" == "true" ]]; then
-        printf '%s\n' "${out[@]}" > "$f"
-        return 0
-    fi
-    return 1
-}
-
 configure_permanent_partitions() {
     local force="${1:-false}"
     if [[ "$SESSION_PARTITIONS_SYNCED" == "true" && "$force" != "force" ]]; then
@@ -2669,7 +2530,7 @@ configure_permanent_partitions() {
         if findmnt -n -o TARGET -S "UUID=$dev_uuid" 2>/dev/null | grep -E '^/(home|var|boot|efi|usr|$)' >/dev/null; then
             continue
         fi
-        if grep -E "^[[:space:]]*[^#].*[[:space:]](UUID=$dev_uuid|/dev/[a-z0-9]+)[[:space:]]+/(|boot|boot/efi|efi|home|var|usr)[[:space:]]" /etc/fstab >/dev/null 2>&1; then
+        if grep -E "^[[:space:]]*(UUID=['\"]?${dev_uuid}['\"]?|/dev/${dev_name})[[:space:]]+/(|boot|boot/efi|efi|home|var|usr)[[:space:]]" /etc/fstab >/dev/null 2>&1; then
             continue
         fi
 
@@ -2704,6 +2565,7 @@ configure_permanent_partitions() {
                     log_ok "Partition $dev_name upgraded to ntfs3."
                 fi
             fi
+            ((configured_count++))
             continue
         fi
 
@@ -2906,7 +2768,7 @@ update_dell_firmware() {
             log_warn "Skipping firmware flash check in unattended mode while on battery power."
             return 0
         fi
-        read -rp "Please plug in your AC charger, then press [Enter] to continue (or 'q' to cancel): " p_ans
+        ask p_ans "Please plug in your AC charger, then press [Enter] to continue (or 'q' to cancel): "
         [[ "$p_ans" =~ ^[Qq]$ ]] && return
     fi
 
@@ -2929,7 +2791,7 @@ update_dell_firmware() {
         echo ""
         local fw_confirm="y"
         if [[ "$mode" != "noninteractive" ]]; then
-            read -rp "Do you want to stage and prepare these firmware updates now? (y/N): " fw_confirm
+            ask fw_confirm "Do you want to stage and prepare these firmware updates now? (y/N): "
         fi
         if [[ "$fw_confirm" =~ ^[Yy]$ ]]; then
             log_info "Downloading and staging firmware capsule..."
@@ -2953,6 +2815,15 @@ maintain_btrfs_storage() {
     local mp
     for mp in "/" "/mnt/my-data"; do
         if findmnt -n -t btrfs "$mp" >/dev/null 2>&1; then
+            local mp_src mp_dev
+            mp_src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null || true)
+            mp_dev=$(basename "${mp_src%%\[*}" 2>/dev/null || true)
+            if [[ -n "$mp_dev" ]] && journalctl -k -b 2>/dev/null | grep -q "BTRFS error (device ${mp_dev}): incorrect extent count"; then
+                log_warn "Detected Btrfs free-space-tree (space_cache=v2) extent count mismatch on $mp ($mp_dev). Rebuilding online..."
+                if mount -o remount,clear_cache,space_cache=v2 "$mp" 2>/dev/null; then
+                    log_ok "Rebuilt Btrfs free-space tree (space_cache=v2) on $mp."
+                fi
+            fi
             log_info "Refreshing space allocation on $mp..."
             btrfs filesystem df "$mp" || true
             log_info "Executing block group balance on $mp (usage <= 10%)..."
@@ -2978,6 +2849,7 @@ maintain_btrfs_storage() {
         if echo "$trim_res" | grep -qi "FITRIM ioctl failed"; then
             log_warn "Btrfs free space cache discrepancy detected on data partition."
             log_info "Refreshing Btrfs free space tree on /mnt/my-data..."
+            mount -o remount,clear_cache,space_cache=v2 /mnt/my-data 2>/dev/null || true
             btrfs balance start -dusage=0 /mnt/my-data 2>/dev/null || true
         fi
     fi
@@ -3025,7 +2897,7 @@ enroll_single_finger() {
 
     # Check if this finger is already enrolled
     if get_enrolled_fingers | grep -qx "$finger"; then
-        read -rp "'$finger' is already enrolled. Re-enroll and overwrite? (y/N): " re_ans
+        ask re_ans "'$finger' is already enrolled. Re-enroll and overwrite? (y/N): "
         if [[ ! "$re_ans" =~ ^[Yy]$ ]]; then
             log_info "Enrollment cancelled."
             return 0
@@ -3038,7 +2910,7 @@ enroll_single_finger() {
     else
         log_warn "Fingerprint enrollment for '$finger' was interrupted or failed."
     fi
-    read -rp "Press [Enter] to continue..."
+    ask _ "Press [Enter] to continue..."
 }
 
 select_and_enroll_custom_finger() {
@@ -3051,7 +2923,7 @@ select_and_enroll_custom_finger() {
     echo -e " 5) Left Ring Finger     (left-ring-finger)"
     echo -e " 6) Left Little Finger   (left-little-finger)"
     echo -e " B) Back"
-    read -rp "Select finger (1-6 / B): " c_choice
+    ask c_choice "Select finger (1-6 / B): "
     case "$c_choice" in
         1) enroll_single_finger "right-middle-finger" "Right Middle Finger" ;;
         2) enroll_single_finger "right-ring-finger"   "Right Ring Finger" ;;
@@ -3069,7 +2941,7 @@ test_fingerprint_verification() {
     mapfile -t enrolled_list < <(get_enrolled_fingers)
     if [[ ${#enrolled_list[@]} -eq 0 ]]; then
         log_warn "No fingerprints enrolled yet to verify. Please enroll a finger first."
-        read -rp "Press [Enter] to continue..."
+        ask _ "Press [Enter] to continue..."
         return 0
     fi
 
@@ -3080,7 +2952,7 @@ test_fingerprint_verification() {
     else
         log_warn "Verification FAILED or timed out."
     fi
-    read -rp "Press [Enter] to continue..."
+    ask _ "Press [Enter] to continue..."
 }
 
 delete_single_finger() {
@@ -3089,7 +2961,7 @@ delete_single_finger() {
     mapfile -t enrolled_list < <(get_enrolled_fingers)
     if [[ ${#enrolled_list[@]} -eq 0 ]]; then
         log_warn "No fingerprints are currently enrolled."
-        read -rp "Press [Enter] to continue..."
+        ask _ "Press [Enter] to continue..."
         return 0
     fi
 
@@ -3101,10 +2973,10 @@ delete_single_finger() {
         ((i++))
     done
     echo -e " B) Cancel"
-    read -rp "Enter number to delete (1-$((i-1)) / B): " del_choice
+    ask del_choice "Enter number to delete (1-$((i-1)) / B): "
     if [[ "$del_choice" =~ ^[0-9]+$ ]] && (( del_choice >= 1 && del_choice < i )); then
         local chosen_finger="${enrolled_list[$((del_choice-1))]}"
-        read -rp "Are you sure you want to delete '$chosen_finger'? (y/N): " conf_del
+        ask conf_del "Are you sure you want to delete '$chosen_finger'? (y/N): "
         if [[ "$conf_del" =~ ^[Yy]$ ]]; then
             if run_as_user fprintd-delete "$REAL_USER" -f "$chosen_finger"; then
                 log_ok "Deleted '$chosen_finger' successfully."
@@ -3113,12 +2985,12 @@ delete_single_finger() {
             fi
         fi
     fi
-    read -rp "Press [Enter] to continue..."
+    ask _ "Press [Enter] to continue..."
 }
 
 clear_all_fingerprints() {
     echo ""
-    read -rp "Are you sure you want to delete ALL enrolled fingerprints for $REAL_USER? (y/N): " conf_all
+    ask conf_all "Are you sure you want to delete ALL enrolled fingerprints for $REAL_USER? (y/N): "
     if [[ "$conf_all" =~ ^[Yy]$ ]]; then
         if run_as_user fprintd-delete "$REAL_USER"; then
             log_ok "All fingerprints deleted successfully."
@@ -3128,7 +3000,7 @@ clear_all_fingerprints() {
     else
         log_info "Operation cancelled."
     fi
-    read -rp "Press [Enter] to continue..."
+    ask _ "Press [Enter] to continue..."
 }
 
 is_finger_enrolled() {
@@ -3212,39 +3084,6 @@ clean_stock_libfprint_conflict() {
     fi
 }
 
-configure_pam_fingerprint() {
-    local target="$1"
-    [[ ! -f "$target" ]] && return 0
-
-    # Create safety backup before editing
-    if [[ ! -f "$target.pre-fprintd" ]]; then
-        cp -a "$target" "$target.pre-fprintd" 2>/dev/null || true
-    fi
-
-    # If already configured, keep idempotent
-    if grep -qE '^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so' "$target"; then
-        return 0
-    fi
-
-    # Insert 'auth sufficient pam_fprintd.so' right before the first 'auth' rule
-    if grep -q "^auth" "$target"; then
-        sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$target"
-    else
-        sed -i '1a auth       sufficient   pam_fprintd.so' "$target"
-    fi
-
-    # Safety check: ensure at least one additional fallback auth rule remains
-    local auth_count
-    auth_count=$(grep -cE '^[[:space:]]*auth' "$target" || true)
-    if (( auth_count < 2 )); then
-        log_error "Refused to modify $target: no fallback password auth rule detected. Reverting."
-        if [[ -f "$target.pre-fprintd" ]]; then
-            cp -a "$target.pre-fprintd" "$target"
-        fi
-        return 1
-    fi
-}
-
 configure_goodix_fingerprint() {
     local mode="${1:-interactive}"
     if [[ "$mode" == "noninteractive" && "$SESSION_GOODIX_CONFIGURED" == "true" ]]; then
@@ -3296,18 +3135,45 @@ configure_goodix_fingerprint() {
     fi
 
     if [[ "$installed" == "false" ]]; then
-        # Step 1: Install verified precompiled package cache (.pkg.tar.zst)
+        # Step 1: Always try existing precompiled package cache (.pkg.tar.zst) FIRST
         local cached_pkg
-        cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+        cached_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst "$driver_dir"/*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
         if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
-            log_info "Step 1: Installing precompiled driver package: $(basename "$cached_pkg")..."
+            log_info "Step 1: Installing existing driver package: $(basename "$cached_pkg")..."
             if [[ -f "$driver_dir/SHA256SUMS" ]]; then
                 local exp_hash act_hash
-                exp_hash=$(grep "libfprint-goodix-538d" "$driver_dir/SHA256SUMS" | awk '{print $1}')
+                exp_hash=$(grep "$(basename "$cached_pkg")" "$driver_dir/SHA256SUMS" 2>/dev/null | awk '{print $1}')
                 act_hash=$(sha256sum "$cached_pkg" | awk '{print $1}')
-                if [[ "$exp_hash" != "$act_hash" ]]; then
-                    log_warn "Checksum mismatch for $(basename "$cached_pkg")! Falling back to Step 2 clean compile..."
-                    cached_pkg=""
+                if [[ -n "$exp_hash" && "$exp_hash" != "$act_hash" ]]; then
+                    log_warn "Checksum difference detected on $(basename "$cached_pkg")!"
+                    log_warn "  Expected (from SHA256SUMS): $exp_hash"
+                    log_warn "  Calculated (actual file):   $act_hash"
+                    if [[ "$mode" == "interactive" ]]; then
+                        echo -e " What would you like to do?"
+                        echo -e "  1) (Recommended / Secure) Clean build from source via PKGBUILD"
+                        echo -e "  2) Install existing package anyway (Use only if you intentionally modified/replaced it)"
+                        echo -e "  3) Cancel driver installation"
+                        ask hash_choice "Select an option (1-3) [1]: "
+                        hash_choice="${hash_choice:-1}"
+                        case "$hash_choice" in
+                            2)
+                                log_info "User override: proceeding to install existing package despite checksum difference..."
+                                ;;
+                            3)
+                                log_info "Driver installation cancelled by user."
+                                return 0
+                                ;;
+                            *)
+                                log_info "Secure choice selected: proceeding to compile fresh from source via makepkg..."
+                                cached_pkg=""
+                                ;;
+                        esac
+                    else
+                        log_warn "Non-interactive mode: Checksum difference detected. Attempting secure build from source..."
+                        cached_pkg=""
+                    fi
+                elif [[ -z "$exp_hash" ]]; then
+                    log_info "Package $(basename "$cached_pkg") not listed in SHA256SUMS. Trying first..."
                 else
                     log_ok "Cryptographic SHA-256 integrity verified for $(basename "$cached_pkg")."
                 fi
@@ -3319,24 +3185,53 @@ configure_goodix_fingerprint() {
                     log_ok "Driver installed cleanly from precompiled package cache."
                     installed=true
                 else
-                    log_warn "Cached package installation encountered an issue. Falling back to Step 2..."
+                    log_warn "Installation of $(basename "$cached_pkg") encountered an issue. Proceeding to Step 2 build fallback..."
                 fi
             fi
         fi
 
-        # Step 2: Makepkg / AUR build fallback (only if Step 1 package missing or damaged)
+        # Step 2: Makepkg / AUR build fallback (only if Step 1 package missing or failed)
         if [[ "$installed" == "false" && -f "$driver_dir/PKGBUILD" ]]; then
             log_info "Step 2: Building patched driver from PKGBUILD via makepkg..."
             pacman -S --needed --noconfirm git meson ninja cmake pkg-config libgudev libgusb nss pixman openssl
             if sudo -u "$REAL_USER" bash -c "cd '$driver_dir' && makepkg -fc --nodeps && rm -rf src pkg libfprint" 2>/dev/null; then
                 local new_pkg
-                new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+                new_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst "$driver_dir"/*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
                 if [[ -n "$new_pkg" && -f "$new_pkg" ]]; then
                     clean_stock_libfprint_conflict
                     if pacman -U --overwrite '*' --noconfirm "$new_pkg" 2>/dev/null; then
                         log_ok "Patched driver compiled and installed successfully via pacman."
                         installed=true
                     fi
+                fi
+            else
+                log_warn "Makepkg build failed or encountered an incompatible package during build."
+            fi
+        fi
+
+        # Step 3: Fallback recovery — if build failed, give full chance to install existing package
+        if [[ "$installed" == "false" ]]; then
+            local fallback_pkg
+            fallback_pkg=$(ls -t "$driver_dir"/libfprint-goodix-*.pkg.tar.zst "$driver_dir"/*.pkg.tar.zst 2>/dev/null | head -n 1 || true)
+            if [[ -n "$fallback_pkg" && -f "$fallback_pkg" ]]; then
+                log_warn "Makepkg build failed or encountered incompatibility."
+                log_warn "An existing precompiled driver package is available: $(basename "$fallback_pkg")"
+                local do_recover=true
+                if [[ "$mode" == "interactive" ]]; then
+                    ask rec_choice "Recover by installing the existing precompiled driver package? (Y/n): "
+                    [[ "$rec_choice" =~ ^[Nn]$ ]] && do_recover=false
+                fi
+                if [[ "$do_recover" == "true" ]]; then
+                    log_info "Installing fallback driver package: $(basename "$fallback_pkg")..."
+                    clean_stock_libfprint_conflict
+                    if pacman -U --overwrite '*' --noconfirm "$fallback_pkg" 2>/dev/null; then
+                        log_ok "Successfully recovered and installed driver from existing package: $(basename "$fallback_pkg")!"
+                        installed=true
+                    else
+                        log_error "Failed to install fallback package $(basename "$fallback_pkg")."
+                    fi
+                else
+                    log_info "Fallback recovery declined by user."
                 fi
             fi
         fi
@@ -3576,23 +3471,157 @@ run_all_stages() {
     fi
 }
 
+timeshift_view_snapshots_readonly() {
+    echo ""
+    echo -e "${BOLD}${CYAN}========================================================================${NC}"
+    echo -e "${BOLD}${CYAN}                TIMESHIFT SNAPSHOTS INSPECTION (READ-ONLY)              ${NC}"
+    echo -e "${BOLD}${CYAN}========================================================================${NC}"
+
+    local btrfs_dev
+    btrfs_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    btrfs_dev="${btrfs_dev%%\[*}"
+    if [[ -z "$btrfs_dev" || ! -b "$btrfs_dev" ]]; then
+        log_error "Could not determine Btrfs root device."
+        return 1
+    fi
+
+    local snap_dir=""
+    local temp_mount=""
+    local mounted_externally=false
+
+    local existing_ts
+    existing_ts=$(findmnt -rn -t btrfs -o TARGET 2>/dev/null | grep -E '^/run/timeshift/[0-9]+/backup$' | head -n 1 || true)
+    if [[ -n "$existing_ts" && -d "$existing_ts/timeshift-btrfs/snapshots" ]]; then
+        snap_dir="$existing_ts/timeshift-btrfs/snapshots"
+        mounted_externally=true
+    else
+        temp_mount=$(mktemp -d /tmp/ts-view-XXXXXX 2>/dev/null || mktemp -d)
+        if mount -o subvolid=5,ro "$btrfs_dev" "$temp_mount" 2>/dev/null; then
+            snap_dir="$temp_mount/timeshift-btrfs/snapshots"
+        else
+            rmdir "$temp_mount" 2>/dev/null || true
+            temp_mount=""
+        fi
+    fi
+
+    if [[ -z "$snap_dir" || ! -d "$snap_dir" ]]; then
+        log_warn "No snapshots directory found. No Timeshift restore points have been created yet."
+        [[ -n "$temp_mount" ]] && { umount "$temp_mount" 2>/dev/null || true; rmdir "$temp_mount" 2>/dev/null || true; }
+        return 0
+    fi
+
+    echo -e " Root Device: ${BOLD}$btrfs_dev${NC}"
+    echo "-----------------------------------------------------------------------------------------------------------------"
+    printf "${BOLD}%-4s | %-19s | %-8s | %-36s | %-22s${NC}\n" "NUM" "DATE / ID" "TAG" "DESCRIPTION / COMMENT" "BOOTABLE KERNELS"
+    echo "-----------------------------------------------------------------------------------------------------------------"
+
+    local idx=1
+    local s
+    while IFS= read -r s; do
+        [[ -z "$s" ]] && continue
+        local snap_name
+        snap_name=$(basename "$s")
+        local comment="-"
+        local tag="ondemand"
+        local info_file="$s/info.json"
+        if [[ -f "$info_file" ]]; then
+            local c
+            c=$(grep -oP '"comments"\s*:\s*"\K[^"]+' "$info_file" 2>/dev/null || true)
+            [[ -n "$c" ]] && comment="$c"
+            local t
+            t=$(grep -oP '"tags"\s*:\s*"\K[^"]+' "$info_file" 2>/dev/null || true)
+            [[ -n "$t" ]] && tag="$t"
+        fi
+
+        local kernels=""
+        if [[ -d "$s/@/boot" ]]; then
+            kernels=$(ls "$s/@/boot"/vmlinuz-* 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/vmlinuz-//' | tr '\n' ' ' || true)
+        fi
+        [[ -z "$kernels" ]] && kernels="None detected"
+
+        printf "%-4d | %-19s | %-8s | %-36s | %-22s\n" \
+            "$idx" "$snap_name" "$tag" "${comment:0:36}" "$kernels"
+        ((idx++))
+    done < <(find "$snap_dir" -mindepth 1 -maxdepth 1 -type d | sort -r)
+
+    echo "-----------------------------------------------------------------------------------------------------------------"
+    log_ok "Total snapshots recorded: $((idx - 1))"
+
+    if [[ -n "$temp_mount" && "$mounted_externally" != "true" ]]; then
+        umount "$temp_mount" 2>/dev/null || true
+        rmdir "$temp_mount" 2>/dev/null || true
+    fi
+}
+
 menu_timeshift_sync() {
     while true; do
+        local hook_status="${RED}[Not Installed]${NC}"
+        if [[ -x /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync ]]; then
+            hook_status="${GREEN}[Active & Protected]${NC}"
+        fi
+
+        local boot_status="${RED}[Disabled]${NC}"
+        if systemctl is-enabled timeshift-boot-sync.service &>/dev/null; then
+            boot_status="${GREEN}[Active]${NC}"
+        fi
+
+        local daemon_status="${YELLOW}[Inactive]${NC}"
+        if systemctl is-active grub-btrfsd.service &>/dev/null; then
+            daemon_status="${GREEN}[Active (Auto-Syncs GRUB)]${NC}"
+        fi
+
+        local snap_count=0
+        if [[ -f /boot/grub/grub-btrfs.cfg ]]; then
+            snap_count=$(grep -cE "^submenu[[:space:]]+['\"]\\|?[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}" /boot/grub/grub-btrfs.cfg 2>/dev/null || true)
+        fi
+        local snap_badge="${CYAN}[${snap_count} Snapshots in GRUB]${NC}"
+
         echo ""
         echo -e "${BOLD}========================================================================${NC}"
         echo -e "${BOLD}         TIMESHIFT SNAPSHOT & BOOT SYNCHRONIZATION MANAGER              ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e " ${BOLD}1)${NC} Restore Snapshot Safely (timeshift-restore-sync)"
-        echo -e " ${BOLD}2)${NC} Repair Existing Snapshots (Inject LTS fallback & fix grubenv)"
-        echo -e " ${BOLD}3)${NC} Install / Reinstall Native Hooks & First-Boot Safeguard"
-        echo -e " ${BOLD}4)${NC} Audit & Inspect GRUB Menu Entries (Check for duplicates)"
-        echo -e " ${BOLD}5)${NC} Uninstall Timeshift Synchronization Suite"
-        echo -e " ${BOLD}6)${NC} Back to Main Menu"
+        echo -e " 🛡️  ${BOLD}Protection Status:${NC}"
+        echo -e "   • Native Restore Hook:   $hook_status"
+        echo -e "   • First-Boot Safeguard:  $boot_status"
+        echo -e "   • GRUB Live Sync Daemon: $daemon_status"
+        echo -e "   • Registered Snapshots:  $snap_badge"
         echo -e "${BOLD}------------------------------------------------------------------------${NC}"
-        ask ts_opt "Please enter your choice (1-6): "
+        echo -e " ${CYAN}📸 SNAPSHOT OPERATIONS:${NC}"
+        echo -e "   ${BOLD}1)${NC} View / List Snapshots          ${CYAN}[Safe Read-Only Table]${NC}"
+        echo -e "   ${BOLD}2)${NC} Create New System Snapshot     ${CYAN}[One-Click Restore Point]${NC}"
+        echo -e "   ${BOLD}3)${NC} Restore System from Snapshot   ${YELLOW}[Interactive Restore Wizard]${NC}"
+        echo -e "   ${BOLD}4)${NC} Launch Timeshift Graphical App ${CYAN}[Open timeshift-gtk]${NC}"
+        echo ""
+        echo -e " ${CYAN}🔧 MAINTENANCE & BOOTLOADER AUDIT:${NC}"
+        echo -e "   ${BOLD}5)${NC} Verify / Repair Snapshots      ${CYAN}[Inject LTS 6.12 Kernel & Fix Grubenv]${NC}"
+        echo -e "   ${BOLD}6)${NC} Audit GRUB Menu Entries        ${CYAN}[Check for Duplicates / Health]${NC}"
+        echo -e "   ${BOLD}7)${NC} Reinstall Safeguard Hooks      ${CYAN}[Re-deploy Hook, Script & Daemon]${NC}"
+        echo -e "${BOLD}------------------------------------------------------------------------${NC}"
+        echo -e "   ${BOLD}U)${NC} Uninstall Timeshift Synchronization Suite"
+        echo -e "   ${BOLD}B)${NC} Back to Main Menu"
+        echo -e "${BOLD}========================================================================${NC}"
+        ask ts_opt "Select an option (1-7 / U / B): "
 
         case "$ts_opt" in
             1)
+                timeshift_view_snapshots_readonly
+                ask _ "Press [Enter] to return to Timeshift menu..."
+                ;;
+            2)
+                echo ""
+                log_info "Creating a new Timeshift system restore point..."
+                local default_comment="Manual restore point ($(date '+%Y-%m-%d %H:%M'))"
+                ask snap_comment "Enter snapshot description [Default: $default_comment]: "
+                snap_comment="${snap_comment:-$default_comment}"
+                if timeshift --create --comments "$snap_comment" --tags O; then
+                    log_ok "Snapshot '$snap_comment' created successfully."
+                    sync_grub_snapshots
+                else
+                    log_error "Failed to create snapshot (close any open Timeshift windows and retry)."
+                fi
+                ask _ "Press [Enter] to continue..."
+                ;;
+            3)
                 if [[ -f "$SCRIPT_DIR/timeshift-sync/timeshift-restore-sync.sh" ]]; then
                     bash "$SCRIPT_DIR/timeshift-sync/timeshift-restore-sync.sh"
                 elif command -v timeshift-restore-sync &>/dev/null; then
@@ -3600,8 +3629,25 @@ menu_timeshift_sync() {
                 else
                     log_error "timeshift-restore-sync not found."
                 fi
+                ask _ "Press [Enter] to continue..."
                 ;;
-            2)
+            4)
+                if ! command -v timeshift-gtk &>/dev/null; then
+                    log_warn "timeshift-gtk is not installed."
+                elif [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+                    log_warn "No graphical desktop display detected. Please run inside a desktop GUI session."
+                else
+                    log_info "Launching Timeshift GUI (timeshift-gtk)..."
+                    if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
+                        sudo -u "$REAL_USER" nohup timeshift-gtk >/dev/null 2>&1 &
+                    else
+                        nohup timeshift-gtk >/dev/null 2>&1 &
+                    fi
+                    log_ok "Timeshift GUI window opened."
+                fi
+                ask _ "Press [Enter] to continue..."
+                ;;
+            5)
                 if [[ -f "$SCRIPT_DIR/timeshift-sync/fix-existing-snapshots.sh" ]]; then
                     bash "$SCRIPT_DIR/timeshift-sync/fix-existing-snapshots.sh"
                 elif command -v timeshift-fix-snapshots &>/dev/null; then
@@ -3609,15 +3655,9 @@ menu_timeshift_sync() {
                 else
                     log_error "fix-existing-snapshots not found."
                 fi
+                ask _ "Press [Enter] to continue..."
                 ;;
-            3)
-                if [[ -f "$SCRIPT_DIR/timeshift-sync/install.sh" ]]; then
-                    bash "$SCRIPT_DIR/timeshift-sync/install.sh"
-                else
-                    log_error "install.sh not found."
-                fi
-                ;;
-            4)
+            6)
                 if [[ -f "$SCRIPT_DIR/timeshift-sync/check-grub-menu.sh" ]]; then
                     bash "$SCRIPT_DIR/timeshift-sync/check-grub-menu.sh"
                 elif command -v timeshift-check-grub &>/dev/null; then
@@ -3625,16 +3665,36 @@ menu_timeshift_sync() {
                 else
                     log_error "check-grub-menu.sh not found."
                 fi
+                ask _ "Press [Enter] to continue..."
                 ;;
-            5)
-                if [[ -f "$SCRIPT_DIR/timeshift-sync/uninstall.sh" ]]; then
-                    bash "$SCRIPT_DIR/timeshift-sync/uninstall.sh"
+            7)
+                if [[ -f "$SCRIPT_DIR/timeshift-sync/install.sh" ]]; then
+                    bash "$SCRIPT_DIR/timeshift-sync/install.sh"
                 else
-                    log_error "uninstall.sh not found."
+                    log_error "install.sh not found."
                 fi
+                ask _ "Press [Enter] to continue..."
                 ;;
-            6) break ;;
-            *) log_warn "Invalid option. Please enter 1-6." ;;
+            [uU])
+                echo ""
+                log_warn "Uninstalling Timeshift Synchronization Suite will remove:"
+                echo "  • Native post-restore hook (/etc/timeshift/restore-hooks.d/00-timeshift-boot-sync)"
+                echo "  • First-boot safeguard (timeshift-boot-sync.service)"
+                echo "  • Helper scripts in /usr/local/bin"
+                ask u_conf "Are you sure you want to proceed with uninstallation? (y/N): "
+                if [[ "$u_conf" =~ ^[Yy]$ ]]; then
+                    if [[ -f "$SCRIPT_DIR/timeshift-sync/uninstall.sh" ]]; then
+                        bash "$SCRIPT_DIR/timeshift-sync/uninstall.sh"
+                    else
+                        log_error "uninstall.sh not found."
+                    fi
+                else
+                    log_info "Uninstallation cancelled."
+                fi
+                ask _ "Press [Enter] to continue..."
+                ;;
+            [bB]) break ;;
+            *) log_warn "Invalid option. Please enter 1-7, U, or B." ;;
         esac
     done
 }
@@ -3706,7 +3766,7 @@ while true; do
     echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, ZRAM, Sysctl)"
     echo -e " ${BOLD}2)${NC} Desktop UI, Storage & Hardware Settings"
     echo -e " ${BOLD}3)${NC} Extra Apps (Install, Reinstall & Uninstall Hub)"
-    echo -e " ${BOLD}4)${NC} Timeshift Restore & Boot Synchronization Manager"
+    echo -e " ${BOLD}4)${NC} Timeshift Snapshots & Boot Synchronization Manager"
     echo -e " ${BOLD}5)${NC} Quit"
     echo -e "${BOLD}------------------------------------------------------------------------${NC}"
     echo -e " ${BOLD}A)${NC} Run ALL (Stage 1 Optimize -> Stage 2 All Settings -> Stage 3 All 15 Apps)"

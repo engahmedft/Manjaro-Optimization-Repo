@@ -14,18 +14,6 @@ elif [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
     source "${SCRIPT_DIR}/lib/common.sh"
 fi
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-log_info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
-log_ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-
 REPAIR_SNAPSHOTS=false
 for arg in "$@"; do
     case "$arg" in
@@ -42,8 +30,11 @@ echo -e "${BOLD}${CYAN}=========================================================
 echo -e "${BOLD}${CYAN}  INSTALLING TIMESHIFT, BOOT & KERNEL SYNCHRONIZATION SYSTEM   ${NC}"
 echo -e "${BOLD}${CYAN}================================================================${NC}"
 
-# 1. Install CLI commands
+# 1. Install shared library and global CLI commands
 log_info "1/6: Installing global CLI commands into /usr/local/bin..."
+if [[ -f "$SCRIPT_DIR/../lib/common.sh" ]]; then
+    install -Dm644 "$SCRIPT_DIR/../lib/common.sh" /usr/local/lib/manjaro-opt/common.sh
+fi
 cp "$SCRIPT_DIR/timeshift-restore-sync.sh" /usr/local/bin/timeshift-restore-sync
 chmod +x /usr/local/bin/timeshift-restore-sync
 
@@ -105,5 +96,9 @@ echo -e "${BOLD}${GREEN}       TIMESHIFT & BOOT SYNC SUITE INSTALLED SUCCESSFULL
 echo -e "${BOLD}${GREEN}================================================================${NC}"
 echo -e " • Restore via Script: ${BOLD}sudo timeshift-restore-sync${NC}"
 echo -e " • Restore via GUI:    ${BOLD}Protected automatically by native restore hook${NC}"
-echo -e " • Old Snapshots:      ${BOLD}Repaired with LTS kernel & clean bootloader targets${NC}"
+if [[ "$REPAIR_SNAPSHOTS" == "true" ]]; then
+    echo -e " • Old Snapshots:      ${BOLD}Repaired with LTS kernel & clean bootloader targets${NC}"
+else
+    echo -e " • Old Snapshots:      ${BOLD}On-demand repair ready ('sudo timeshift-fix-snapshots')${NC}"
+fi
 echo "----------------------------------------------------------------"

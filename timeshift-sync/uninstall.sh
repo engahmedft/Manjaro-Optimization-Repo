@@ -58,7 +58,7 @@ log_ok "CLI binaries removed."
 
 # 5. Clean runtime and state flags
 log_info "5/5: Clearing transient state files..."
-rm -rf /run/timeshift-sync /var/lib/timeshift-sync
+rm -rf /run/timeshift-sync /var/lib/timeshift-sync /usr/local/lib/manjaro-opt
 log_ok "State and runtime directories cleared."
 
 echo -e "\n${BOLD}${GREEN}================================================================${NC}"

@@ -712,7 +712,13 @@ def main() -> int:
             print("[INFO] Run with --flash to provision the sensor.")
             return 1
 
-        if not args.flash and sys.stdin.isatty():
+        if not args.flash:
+            if not sys.stdin.isatty():
+                print(
+                    "[ERROR] Refusing to flash firmware in non-interactive mode without --flash.",
+                    file=sys.stderr,
+                )
+                return 1
             ans = input("Proceed with erasing app and flashing Goodix sensor firmware? (y/N): ").strip()
             if ans.lower() not in ("y", "yes"):
                 print("[INFO] Provisioning cancelled by user.")

@@ -68,7 +68,7 @@ FORCE_HW=1 sudo ./Manjaro-Optimization.sh
 - **Idempotent `set_grub_var`**: Modifies or uncomments variables in `/etc/default/grub` in-place, returning immediately if the variable is already compliant.
 - **Batch Uninstall Hook**: Suppresses redundant font and desktop cache rebuilds during batch package removals (`SKIP_POST_HOOK=1`).
 - **Narrowed Udev Triggers**: Scopes `udevadm trigger` to specific subsystems (`--subsystem-match=misc` and `--subsystem-match=usb`), eliminating system-wide I/O freezes.
-- **Clean Disk Logs**: Strips ANSI escape codes from disk log files (`/var/log/manjaro-optimization-*.log`) while preserving full terminal colors.
+- **Clean Disk Logs**: Strips ANSI escape codes from the disk log file (`Manjaro-Optimization.log`) while preserving full terminal colors.
 
 ### 4. Timeshift Boot & Kernel Synchronization Suite (T)
 Located in `timeshift-sync/`:
@@ -81,6 +81,7 @@ Located in `timeshift-sync/`:
 
 ### 5. Goodix 27c6:538d Fingerprint Driver (D)
 Located in `drivers/goodix-538d/`:
+- **Prioritized Package Cache & Build Fallback**: Always attempts to install the existing driver package first before attempting compilation. In case of build errors with incompatible toolchains or packages, automatically falls back to install the precompiled driver package so fingerprint support is never left uninstalled.
 - **SHA-256 Integrity Verification**: Cryptographically validates driver packages and the firmware blob against `drivers/goodix-538d/SHA256SUMS`.
 - **Non-Destructive `--check` Mode**: `provision-goodix-538d.py --check` inspects sensor firmware and TLS-PSK without writing to flash.
 - **Systemd Boot Service**: `goodix-538d-provision.service` executes `--check` with `RemainAfterExit=yes` once per boot.
@@ -90,7 +91,7 @@ Located in `drivers/goodix-538d/`:
 ### 6. Repo Hygiene & Automated Tests (X)
 - **Shared Library (`lib/common.sh`)**: Centralizes colors, logging, hardware detection, input prompts, mount purging, and PAM helpers.
 - **Automated Test Runner (`tests/run-all-tests.sh`)**: Validates bash syntax across all scripts, python compilation, and executes all unit test suites.
-- **Unit Tests (`tests/test-helpers.sh` & `tests/test-timeshift.sh`)**: 31 comprehensive test cases validating partition safety, fstab idempotency, PAM backups, JSONC atomic parser, `set_grub_var`, kernel discovery, and snapshot tracking.
+- **Unit Tests (`tests/test-helpers.sh` & `tests/test-timeshift.sh`)**: 41 comprehensive test cases validating partition safety, fstab idempotency, PAM backups & rollback guards, URL-safe JSONC atomic parser, `set_grub_var`, kernel discovery, module cleanup, and snapshot tracking.
 
 ---
 

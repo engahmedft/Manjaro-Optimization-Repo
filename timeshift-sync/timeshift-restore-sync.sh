@@ -13,53 +13,15 @@ if [[ -f "${SCRIPT_DIR}/../lib/common.sh" ]]; then
     source "${SCRIPT_DIR}/../lib/common.sh"
 elif [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
     source "${SCRIPT_DIR}/lib/common.sh"
+elif [[ -f "/usr/local/lib/manjaro-opt/common.sh" ]]; then
+    source "/usr/local/lib/manjaro-opt/common.sh"
 fi
-
-# Text styling
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-log_info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
-log_ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 # Root privilege check
 if [[ $EUID -ne 0 ]]; then
     echo -e "${YELLOW}Superuser privileges required. Elevating via sudo...${NC}"
     exec sudo "$0" "$@"
 fi
-
-BROKEN_KERNELS=("7.1")
-
-discover_host_kernels() {
-    local k_list=()
-    local img
-    for img in /boot/vmlinuz-*-x86_64; do
-        [[ ! -f "$img" ]] && continue
-        local k
-        k=$(basename "$img" | sed -E 's/^vmlinuz-([0-9]+\.[0-9]+).*/\1/')
-        local broken=false
-        local b
-        for b in "${BROKEN_KERNELS[@]}"; do
-            if [[ "$k" == "$b" ]]; then
-                broken=true
-                break
-            fi
-        done
-        if [[ "$broken" == "false" && -n "$k" ]]; then
-            if [[ ! " ${k_list[*]:-} " =~ " ${k} " ]]; then
-                k_list+=("$k")
-            fi
-        fi
-    done
-    echo "${k_list[@]:-}"
-}
 
 # Detect BTRFS root device
 detect_root_device() {
@@ -123,9 +85,9 @@ list_snapshots() {
     fi
 
     echo -e "\n${BOLD}${CYAN}Available Timeshift Snapshots on $btrfs_dev:${NC}"
-    echo "--------------------------------------------------------------------------------"
-    printf "${BOLD}%-4s | %-20s | %-22s | %-22s${NC}\n" "NUM" "DATE / ID" "COMMENT / TAG" "KERNELS IN SNAPSHOT"
-    echo "--------------------------------------------------------------------------------"
+    echo "----------------------------------------------------------------------------------------------------"
+    printf "${BOLD}%-4s | %-20s | %-32s | %-24s${NC}\n" "NUM" "DATE / ID" "COMMENT / TAG" "KERNELS IN SNAPSHOT"
+    echo "----------------------------------------------------------------------------------------------------"
 
     local idx=1
     declare -g -A SNAP_PATHS
@@ -152,13 +114,13 @@ list_snapshots() {
         fi
         [[ -z "$kernels" ]] && kernels="None detected"
 
-        printf "%-4d | %-20s | %-22s | %-22s\n" "$idx" "$snap_name" "${comment:0:22}" "${kernels:0:22}"
+        printf "%-4d | %-20s | %-32s | %-24s\n" "$idx" "$snap_name" "${comment:0:32}" "${kernels:0:24}"
         SNAP_PATHS[$idx]="$s"
         SNAP_NAMES[$idx]="$snap_name"
         ((idx++))
     done < <(find "$snap_dir" -mindepth 1 -maxdepth 1 -type d | sort -r)
 
-    echo "--------------------------------------------------------------------------------"
+    echo "----------------------------------------------------------------------------------------------------"
     TOTAL_SNAPSHOTS=$((idx - 1))
 }
 
@@ -187,7 +149,7 @@ main() {
     # Select snapshot
     local choice=""
     while true; do
-        read -rp "Select snapshot number to restore [1-$TOTAL_SNAPSHOTS] (or 'q' to quit): " choice
+        ask choice "Select snapshot number to restore [1-$TOTAL_SNAPSHOTS] (or 'q' to quit): "
         [[ "$choice" =~ ^[qQ]$ ]] && { cleanup_mounts ""; exit 0; }
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= TOTAL_SNAPSHOTS )); then
             break
@@ -207,7 +169,7 @@ main() {
     echo ""
     local home_choice=""
     while true; do
-        read -rp "Choose restore scope [1 or 2, default: 1]: " home_choice
+        ask home_choice "Choose restore scope [1 or 2, default: 1]: "
         home_choice="${home_choice:-1}"
         if [[ "$home_choice" == "1" || "$home_choice" == "2" ]]; then
             break
@@ -232,6 +194,18 @@ main() {
 }
 EOF
     log_ok "Safety backup snapshot created."
+
+    # Prune any stale unmounted @_backup_* / @home_backup_* subvolumes from earlier restores
+    local live_subvol_id live_home_id old_bak old_id
+    live_subvol_id=$(btrfs subvolume show / 2>/dev/null | awk '/Subvolume ID:/ {print $NF}' || true)
+    live_home_id=$(btrfs subvolume show /home 2>/dev/null | awk '/Subvolume ID:/ {print $NF}' || true)
+    for old_bak in /mnt/ts-sync-root/@_backup_* /mnt/ts-sync-root/@home_backup_*; do
+        [[ ! -d "$old_bak" ]] && continue
+        old_id=$(btrfs subvolume show "$old_bak" 2>/dev/null | awk '/Subvolume ID:/ {print $NF}' || true)
+        if [[ -n "$old_id" && "$old_id" != "$live_subvol_id" && "$old_id" != "$live_home_id" ]]; then
+            btrfs subvolume delete "$old_bak" >/dev/null 2>&1 || true
+        fi
+    done
 
     # Perform Subvolume Swap
     log_info "Applying snapshot $selected_name to @ subvolume..."
@@ -263,6 +237,7 @@ EOF
             log_info "Copying working kernel ${kver} into restored root..."
             cp -p "/boot/vmlinuz-${kver}-x86_64" "$chroot_dir/boot/"
             cp -p "/boot/initramfs-${kver}-x86_64.img" "$chroot_dir/boot/" 2>/dev/null || true
+            cp -p "/boot/initramfs-${kver}-x86_64-fallback.img" "$chroot_dir/boot/" 2>/dev/null || true
             cp -p "/boot/linux${kver//./}-x86_64.kver" "$chroot_dir/boot/" 2>/dev/null || true
         fi
         for mod_dir in /usr/lib/modules/${kver}*; do
@@ -278,19 +253,13 @@ EOF
         done
     done
 
-    # Remove broken 7.1 kernel ONLY if another valid kernel is present
-    if [[ -f "$chroot_dir/boot/vmlinuz-7.1-x86_64" ]]; then
-        local other_kernels
-        other_kernels=$(find "$chroot_dir/boot" -maxdepth 1 -name "vmlinuz-*-x86_64" ! -name "vmlinuz-7.1-x86_64" 2>/dev/null || true)
-        if [[ -n "$other_kernels" ]]; then
-            log_info "Removing obsolete broken kernel 7.1 from restored root..."
-            rm -f "$chroot_dir/boot/vmlinuz-7.1-x86_64"*
-            rm -f "$chroot_dir/boot/initramfs-7.1-x86_64"*
-            rm -f "$chroot_dir/boot/linux71-x86_64.kver"*
-        else
-            log_warn "Kernel 7.1 is the only kernel in restored root and no alternative could be copied. Retaining to preserve bootability."
-        fi
+    # Ensure microcode is present in restored root
+    if [[ -f /boot/intel-ucode.img && ! -f "$chroot_dir/boot/intel-ucode.img" ]]; then
+        cp -p /boot/intel-ucode.img "$chroot_dir/boot/"
     fi
+
+    # Remove broken 7.1 kernel & modules ONLY if another valid kernel is present
+    purge_broken_kernels_from_root "$chroot_dir" || true
 
     # Deploy first-boot safeguard service into restored root so it's guaranteed present
     if [[ -f /etc/systemd/system/timeshift-boot-sync.service ]]; then
@@ -366,7 +335,8 @@ EOF
     echo "----------------------------------------------------------------"
     
     # Prompt for reboot
-    read -rp "Do you want to reboot the system now? [y/N]: " reboot_choice
+    local reboot_choice=""
+    ask reboot_choice "Do you want to reboot the system now? [y/N]: "
     if [[ "$reboot_choice" =~ ^[yY]$ ]]; then
         log_info "Rebooting system..."
         reboot

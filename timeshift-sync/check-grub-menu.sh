@@ -84,14 +84,15 @@ main() {
         declare -a SNAP_ORDER=()
         local snap_duplicates=false
         local snap_total=0
-        local snap_rx="^submenu[[:space:]]+['\"]\\|?[[:space:]]*([^\\|]+)\\|([^\\|]+)\\|([^\\|]+)\\|([^\\|]+)"
 
         while IFS= read -r sline; do
-            if [[ "$sline" =~ $snap_rx ]]; then
-                local snap_date snap_path
-                snap_date=$(echo "${BASH_REMATCH[1]}" | xargs)
-                snap_path=$(echo "${BASH_REMATCH[2]}" | xargs)
-                local key="$snap_date ($snap_path)"
+            if [[ "$sline" =~ ^submenu[[:space:]]+[\'\"]\|?[[:space:]]*([0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+                local snap_date="${BASH_REMATCH[1]}"
+                local raw_title="${sline#*[\'\"]}"
+                raw_title="${raw_title%%[\'\"]*}"
+                local clean_title
+                clean_title=$(echo "$raw_title" | sed 's/^|[[:space:]]*//; s/[[:space:]]*|[[:space:]]*$//' | tr -s ' ')
+                local key="$clean_title"
                 if [[ -z "${SNAP_COUNTS["$key"]:-}" ]]; then
                     SNAP_ORDER+=("$key")
                 fi

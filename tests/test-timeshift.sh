@@ -8,6 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Source canonical shared library
+source "$REPO_DIR/lib/common.sh"
+
 TEST_SANDBOX=$(mktemp -d /tmp/manjaro_opt_ts_test_XXXXXX)
 cleanup() {
     rm -rf "$TEST_SANDBOX"
@@ -33,89 +36,62 @@ assert_eq() {
 echo ">>> Running Timeshift sync tests in sandbox: $TEST_SANDBOX"
 
 # ------------------------------------------------------------------------------
-# Test 1: Dynamic Kernel Discovery & 7.1 Exclusion
+# Test 1: Dynamic Kernel Discovery & 7.1 Exclusion (discover_host_kernels)
 # ------------------------------------------------------------------------------
-echo "--- Testing discover_host_kernels logic ---"
+echo "--- Testing discover_host_kernels ---"
 MOCK_BOOT="$TEST_SANDBOX/boot"
 mkdir -p "$MOCK_BOOT"
 touch "$MOCK_BOOT/vmlinuz-6.12-x86_64"
 touch "$MOCK_BOOT/vmlinuz-6.6-x86_64"
 touch "$MOCK_BOOT/vmlinuz-7.1-x86_64" # Broken kernel
 
-BROKEN_KERNELS=("7.1")
-test_discover() {
-    local k_list=()
-    local img
-    for img in "$MOCK_BOOT"/vmlinuz-*-x86_64; do
-        [[ ! -f "$img" ]] && continue
-        local k
-        k=$(basename "$img" | sed -E 's/^vmlinuz-([0-9]+\.[0-9]+).*/\1/')
-        local broken=false
-        local b
-        for b in "${BROKEN_KERNELS[@]}"; do
-            if [[ "$k" == "$b" ]]; then
-                broken=true
-                break
-            fi
-        done
-        if [[ "$broken" == "false" && -n "$k" ]]; then
-            if [[ ! " ${k_list[*]:-} " =~ " ${k} " ]]; then
-                k_list+=("$k")
-            fi
-        fi
-    done
-    echo "${k_list[@]:-}"
-}
-
-discovered=$(test_discover)
+discovered=$(discover_host_kernels "$MOCK_BOOT")
 assert_eq 1 "$([[ "$discovered" =~ "6.12" ]] && echo 1 || echo 0)" "Discovers 6.12 LTS kernel"
 assert_eq 1 "$([[ "$discovered" =~ "6.6" ]] && echo 1 || echo 0)" "Discovers 6.6 LTS kernel"
 assert_eq 0 "$([[ "$discovered" =~ "7.1" ]] && echo 1 || echo 0)" "Excludes broken 7.1 kernel"
 
 # ------------------------------------------------------------------------------
-# Test 2: Never Purge Only Kernel in Snapshot
+# Test 2: Never Purge Only Kernel in Snapshot (purge_broken_kernels_from_root)
 # ------------------------------------------------------------------------------
-echo "--- Testing Never Purge Only Kernel ---"
-SNAP_BOOT="$TEST_SANDBOX/snap_boot"
-mkdir -p "$SNAP_BOOT"
-touch "$SNAP_BOOT/vmlinuz-7.1-x86_64"
+echo "--- Testing purge_broken_kernels_from_root ---"
+SNAP_ROOT="$TEST_SANDBOX/snap_root"
+mkdir -p "$SNAP_ROOT/boot" "$SNAP_ROOT/usr/lib/modules/7.1.0-1-MANJARO"
+touch "$SNAP_ROOT/boot/vmlinuz-7.1-x86_64"
+touch "$SNAP_ROOT/boot/initramfs-7.1-x86_64.img"
 
-# Attempt removal simulation
-other_kernels=$(find "$SNAP_BOOT" -maxdepth 1 -name "vmlinuz-*-x86_64" ! -name "vmlinuz-7.1-x86_64" 2>/dev/null || true)
-if [[ -n "$other_kernels" ]]; then
-    rm -f "$SNAP_BOOT"/vmlinuz-7.1-x86_64*
+# Attempt removal when 7.1 is the ONLY kernel (must return 1 and preserve 7.1)
+if purge_broken_kernels_from_root "$SNAP_ROOT" 2>/dev/null; then
+    assert_eq 1 0 "purge_broken_kernels_from_root returns non-zero when 7.1 is only kernel"
+else
+    assert_eq 0 0 "purge_broken_kernels_from_root returns non-zero when 7.1 is only kernel"
 fi
+assert_eq 1 "$([[ -f "$SNAP_ROOT/boot/vmlinuz-7.1-x86_64" ]] && echo 1 || echo 0)" "Kernel 7.1 preserved when no other kernel exists"
+assert_eq 1 "$([[ -d "$SNAP_ROOT/usr/lib/modules/7.1.0-1-MANJARO" ]] && echo 1 || echo 0)" "Kernel 7.1 modules preserved when no other kernel exists"
 
-assert_eq 1 "$([[ -f "$SNAP_BOOT/vmlinuz-7.1-x86_64" ]] && echo 1 || echo 0)" "Kernel 7.1 preserved when no other kernel exists"
+# Now inject fallback 6.12 kernel and verify 7.1 kernel + modules are purged
+touch "$SNAP_ROOT/boot/vmlinuz-6.12-x86_64"
+mkdir -p "$SNAP_ROOT/usr/lib/modules/6.12.0-1-MANJARO"
+purge_broken_kernels_from_root "$SNAP_ROOT" >/dev/null
 
-# Now simulate when 6.12 is injected first
-touch "$SNAP_BOOT/vmlinuz-6.12-x86_64"
-other_kernels=$(find "$SNAP_BOOT" -maxdepth 1 -name "vmlinuz-*-x86_64" ! -name "vmlinuz-7.1-x86_64" 2>/dev/null || true)
-if [[ -n "$other_kernels" ]]; then
-    rm -f "$SNAP_BOOT"/vmlinuz-7.1-x86_64*
-fi
-
-assert_eq 0 "$([[ -f "$SNAP_BOOT/vmlinuz-7.1-x86_64" ]] && echo 1 || echo 0)" "Kernel 7.1 purged when fallback 6.12 kernel is confirmed present"
+assert_eq 0 "$([[ -f "$SNAP_ROOT/boot/vmlinuz-7.1-x86_64" ]] && echo 1 || echo 0)" "Kernel 7.1 purged when fallback 6.12 kernel is confirmed present"
+assert_eq 0 "$([[ -d "$SNAP_ROOT/usr/lib/modules/7.1.0-1-MANJARO" ]] && echo 1 || echo 0)" "Orphaned 7.1 kernel modules purged alongside kernel image"
+assert_eq 1 "$([[ -d "$SNAP_ROOT/usr/lib/modules/6.12.0-1-MANJARO" ]] && echo 1 || echo 0)" "Valid 6.12 kernel modules preserved"
 
 # ------------------------------------------------------------------------------
-# Test 3: Unlocked Snapshot Tracking & Re-locking
+# Test 3: Unlocked Snapshot Tracking & Re-locking (track/untrack_unlocked_snapshot)
 # ------------------------------------------------------------------------------
-echo "--- Testing Unlocked Snapshot Tracking ---"
+echo "--- Testing track_unlocked_snapshot & untrack_unlocked_snapshot ---"
 UNLOCKED_SNAPSHOTS=()
 mock_snap1="$TEST_SANDBOX/snap1"
 mock_snap2="$TEST_SANDBOX/snap2"
 mkdir -p "$mock_snap1" "$mock_snap2"
 
-UNLOCKED_SNAPSHOTS+=("$mock_snap1")
-UNLOCKED_SNAPSHOTS+=("$mock_snap2")
-assert_eq 2 "${#UNLOCKED_SNAPSHOTS[@]}" "Tracked 2 unlocked snapshots"
+track_unlocked_snapshot "$mock_snap1"
+track_unlocked_snapshot "$mock_snap2"
+track_unlocked_snapshot "$mock_snap1" # Duplicate add should be ignored
+assert_eq 2 "${#UNLOCKED_SNAPSHOTS[@]}" "Tracked 2 unique unlocked snapshots"
 
-# Remove snap1
-remaining=()
-for u in "${UNLOCKED_SNAPSHOTS[@]}"; do
-    [[ "$u" != "$mock_snap1" ]] && remaining+=("$u")
-done
-UNLOCKED_SNAPSHOTS=("${remaining[@]:-}")
+untrack_unlocked_snapshot "$mock_snap1"
 assert_eq 1 "${#UNLOCKED_SNAPSHOTS[@]}" "Unlocked snapshots decremented after relocking"
 assert_eq "$mock_snap2" "${UNLOCKED_SNAPSHOTS[0]}" "Remaining snapshot is snap2"
 

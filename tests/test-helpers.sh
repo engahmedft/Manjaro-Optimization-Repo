@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Unit Test Suite for Manjaro Optimization Script Helpers (Phase 1 & Phase 2)
+# Unit Test Suite for Manjaro Optimization Script Helpers & Safety Guards
 # ==============================================================================
 set -euo pipefail
 
@@ -28,7 +28,7 @@ assert_eq() {
 }
 
 # ------------------------------------------------------------------------------
-# Test 1: Partition Classification (is_sensitive_partition)
+# Test 1: Partition Classification (is_sensitive_partition from lib/common.sh)
 # ------------------------------------------------------------------------------
 echo "--- Testing is_sensitive_partition ---"
 
@@ -57,7 +57,13 @@ else
     assert_eq 0 1 "'DellSupport' partlabel detected as sensitive"
 fi
 
-# Legitimate user labels containing substrings (must NOT be detected as sensitive)
+# Microsoft Basic Data GUID and legitimate user labels (must NOT be detected as sensitive)
+if is_sensitive_partition "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7" "my-data" "Basic data partition"; then
+    assert_eq 1 0 "Microsoft Basic Data GUID must NOT be detected as sensitive"
+else
+    assert_eq 0 0 "Microsoft Basic Data GUID correctly protected"
+fi
+
 if is_sensitive_partition "" "Dell-Docs" ""; then
     assert_eq 1 0 "'Dell-Docs' must NOT be detected as sensitive"
 else
@@ -93,12 +99,28 @@ fi
 # ------------------------------------------------------------------------------
 echo "--- Testing purge_mount_dir ---"
 
-# Root and critical directories must never be touched
+# Root, system, and path-traversal directories must never be touched
 purge_mount_dir ""
 purge_mount_dir "/"
 purge_mount_dir "/mnt"
+purge_mount_dir "/mnt/"
+purge_mount_dir "/mnt/.."
 purge_mount_dir "/media"
-assert_eq 0 0 "purge_mount_dir safely skips root/system directories"
+assert_eq 0 0 "purge_mount_dir safely skips root/system/traversal directories"
+
+# Verify fstab system mount regex matches column-1 UUID and device paths accurately
+MOCK_SYS_FSTAB="$TEST_DIR/sys_fstab"
+cat << 'EOF' > "$MOCK_SYS_FSTAB"
+UUID=7777-8888 /boot/efi vfat defaults,noatime 0 2
+/dev/nvme0n1p2 /home btrfs subvol=/@home,defaults 0 0
+EOF
+grep -qE "^[[:space:]]*(UUID=['\"]?7777-8888['\"]?|/dev/nvme0n1p1)[[:space:]]+/(|boot|boot/efi|efi|home|var|usr)[[:space:]]" "$MOCK_SYS_FSTAB"
+assert_eq 0 $? "fstab system guard matches UUID at start of line"
+if grep -qE "^[[:space:]]*(UUID=['\"]?9999-0000['\"]?|/dev/nvme0n1p5)[[:space:]]+/(|boot|boot/efi|efi|home|var|usr)[[:space:]]" "$MOCK_SYS_FSTAB"; then
+    assert_eq 1 0 "fstab system guard must not false-match unrelated partitions"
+else
+    assert_eq 0 0 "fstab system guard does not false-match unrelated partitions"
+fi
 
 # ------------------------------------------------------------------------------
 # Test 2B: Idempotent Btrfs Options in fstab (fstab_ensure_btrfs_opts)
@@ -144,9 +166,9 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Test 4: JSONC Comment-Tolerant Parsing & Atomic Save
+# Test 4: JSONC Comment-Tolerant Parsing & Atomic Save (Preserving URLs)
 # ------------------------------------------------------------------------------
-echo "--- Testing JSONC Parsing & Atomic Save ---"
+echo "--- Testing JSONC Parsing & Atomic Save (_JSONC_PY_HELPERS) ---"
 TEST_JSON="$TEST_DIR/settings.json"
 cat << 'EOF' > "$TEST_JSON"
 {
@@ -154,61 +176,40 @@ cat << 'EOF' > "$TEST_JSON"
     "workbench.colorTheme": "Default Dark Modern",
     /* This is a 
        multi-line comment */
+    "http.proxy": "http://127.0.0.1:8080",
+    "homepage": "https://example.com/*not-a-comment*/",
     "editor.fontSize": 14,
     "editor.tabSize": 4, // trailing comma below
 }
 EOF
 
-python3 -c '
-import json, os, sys, re, tempfile, shutil
-
-def load_jsonc(path):
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        content = re.sub(r"//.*", "", content)
-        content = re.sub(r"/\*[\s\S]*?\*/", "", content)
-        content = re.sub(r",\s*([}\]])", r"\1", content)
-        return json.loads(content)
-    except Exception as e:
-        return None
-
-def atomic_save_json(path, data, indent=4):
-    dir_name = os.path.dirname(path)
-    if dir_name and not os.path.exists(dir_name):
-        os.makedirs(dir_name, exist_ok=True)
-    if os.path.exists(path):
-        shutil.copy2(path, path + ".bak")
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name if dir_name else None, prefix=".tmp_json_")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent)
-    os.replace(tmp_path, path)
-
+python3 -c "${_JSONC_PY_HELPERS}"'
 path = sys.argv[1]
 data = load_jsonc(path)
-assert data is not None, "Failed to parse JSONC with comments"
+assert data is not None, "Failed to parse JSONC with comments and URLs"
+assert data["http.proxy"] == "http://127.0.0.1:8080", "URL with // corrupted"
+assert data["homepage"] == "https://example.com/*not-a-comment*/", "URL with /* */ corrupted"
 assert data["editor.fontSize"] == 14, "Original key lost"
 assert data["editor.tabSize"] == 4, "Trailing comma caused loss"
 
 # Add a key and save atomically
 data["window.zoomLevel"] = 1
-atomic_save_json(path, data)
+atomic_save_json(path, data, indent=4)
 assert os.path.exists(path + ".bak"), "Backup file was not created"
 
 # Verify modified file
 with open(path) as f:
     saved = json.load(f)
 assert saved["window.zoomLevel"] == 1, "New key not saved"
+assert saved["http.proxy"] == "http://127.0.0.1:8080", "URL missing after save"
 assert saved["editor.fontSize"] == 14, "Original key missing after save"
-print("JSONC atomic parsing test passed.")
+print("JSONC atomic parsing test (with URLs) passed.")
 ' "$TEST_JSON"
 
-assert_eq 0 $? "JSONC comments and trailing commas parsed and saved atomically"
+assert_eq 0 $? "JSONC comments, trailing commas, and URL strings parsed and saved atomically"
 
 # ------------------------------------------------------------------------------
-# Test 5: PAM Fingerprint Safeguard
+# Test 5: PAM Fingerprint Safeguard (configure_pam_fingerprint)
 # ------------------------------------------------------------------------------
 echo "--- Testing PAM Fingerprint Configuration ---"
 TEST_PAM="$TEST_DIR/pam_sudo"
@@ -220,17 +221,32 @@ session    include      system-auth
 password   include      system-auth
 EOF
 
-# Simulate configure_pam_fingerprint logic on fixture
-pam_target="$TEST_PAM"
-if [[ ! -f "$pam_target.pre-fprintd" ]]; then
-    cp -a "$pam_target" "$pam_target.pre-fprintd"
-fi
-sed -i '0,/^auth/{s/^auth/auth       sufficient   pam_fprintd.so\nauth/}' "$pam_target"
+# Call actual configure_pam_fingerprint helper
+configure_pam_fingerprint "$TEST_PAM"
 
-auth_count=$(grep -cE '^[[:space:]]*auth' "$pam_target" || true)
+auth_count=$(grep -cE '^[[:space:]]*auth' "$TEST_PAM" || true)
 assert_eq 1 "$(( auth_count >= 2 ))" "PAM has at least 2 auth lines (sufficient + fallback)"
 assert_eq 1 "$([[ -f $TEST_PAM.pre-fprintd ]] && echo 1 || echo 0)" "PAM pre-fprintd backup created"
 assert_eq 1 "$(grep -q "auth       include      system-auth" "$TEST_PAM" && echo 1 || echo 0)" "Fallback system-auth rule preserved"
+
+# Idempotency check on second pass
+pam_hash1=$(md5sum "$TEST_PAM" | cut -d' ' -f1)
+configure_pam_fingerprint "$TEST_PAM"
+pam_hash2=$(md5sum "$TEST_PAM" | cut -d' ' -f1)
+assert_eq "$pam_hash1" "$pam_hash2" "configure_pam_fingerprint is idempotent on second run"
+
+# Rollback guard check: PAM file with no fallback auth rule must be rejected and reverted
+TEST_PAM_BAD="$TEST_DIR/pam_no_auth"
+cat << 'EOF' > "$TEST_PAM_BAD"
+#%PAM-1.0
+account    include      system-auth
+EOF
+if configure_pam_fingerprint "$TEST_PAM_BAD" 2>/dev/null; then
+    assert_eq 1 0 "configure_pam_fingerprint must reject PAM file without fallback auth"
+else
+    assert_eq 0 0 "configure_pam_fingerprint rejects and reverts PAM without fallback auth"
+fi
+assert_eq 0 "$(grep -c "pam_fprintd.so" "$TEST_PAM_BAD" || true)" "Rejected PAM file reverted to original content"
 
 # ------------------------------------------------------------------------------
 # Test 6: Idempotent set_grub_var Helper

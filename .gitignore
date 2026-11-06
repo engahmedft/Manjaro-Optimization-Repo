@@ -1,7 +1,44 @@
-Manjaro-Optimization.log
+# ==============================================================================
+# Git Ignore Rules for Manjaro-Optimization-Repo
+# ==============================================================================
+
+# Logs & Temporary Execution Files
+*.log
+*.log.*
+*.tmp
+*.temp
+
+# Arch Linux Makepkg Intermediate Build Directories
+# (Note: Driver packages under drivers/goodix-538d/ are not excluded)
+src/
+pkg/
 drivers/goodix-538d/src/
 drivers/goodix-538d/pkg/
 drivers/goodix-538d/libfprint/
 
+# Python Bytecode and Cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Editor & IDE Directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.bak.*
+*.orig
+*.rej
+
+# Desktop & OS Metadata
+.directory
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test Sandboxes & Scratch Directories
+tests/scratch/
