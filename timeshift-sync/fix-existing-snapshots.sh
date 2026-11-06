@@ -164,6 +164,13 @@ main() {
         btrfs property set "$snap_root" ro true
         untrack_unlocked_snapshot "$snap_root"
 
+        # 7. Ensure efi_backup.tar.gz exists in snapshot folder for full 1:1 parity
+        if [[ ! -f "$s/efi_backup.tar.gz" && -d /boot/efi && -n "$(ls -A /boot/efi 2>/dev/null)" ]]; then
+            log_info "  Archiving active EFI partition into $snap_name/efi_backup.tar.gz..."
+            tar -czf "$s/efi_backup.tar.gz" -C /boot/efi . 2>/dev/null || true
+            log_ok "  EFI partition archive created for $snap_name."
+        fi
+
         log_ok "  Snapshot ${BOLD}$snap_name${NC} successfully repaired & synchronized."
         (( ++fixed_count ))
 

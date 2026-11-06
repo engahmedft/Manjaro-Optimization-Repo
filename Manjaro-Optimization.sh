@@ -4,7 +4,7 @@
 # Target: Dell Inspiron 7706 | GNOME Wayland | RustDesk | Full AUR & Kernel Sync
 # ==============================================================================
 
-SCRIPT_VERSION="10.0.1-dev"
+SCRIPT_VERSION="9.5.10-dev"
 
 # Allow non-privileged queries (--help, --version, -h, -v) before root checks or side effects
 case "${1:-}" in
@@ -944,8 +944,8 @@ optimize_system() {
     echo ""
     log_info "=== STARTING CORE SYSTEM OPTIMIZATION ==="
 
-    log_info "1/9: Checking Timeshift & creating system restore point..."
-    ensure_session_snapshot "Before System Optimization"
+    log_info "1/9: Ensuring safety snapshot before system upgrade..."
+    ensure_session_snapshot "Before System Upgrade"
 
     log_info "2/9: Ensuring download accelerator and pacman formatting..."
     init_downloads
@@ -1160,6 +1160,7 @@ install_vscode_extensions() {
         "heaths.vscode-guid"
         "GitHub.remotehub"
         "ms-dotnettools.csdevkit"
+        "ms-python.python"
         "moshfeu.compare-folders"
         "nhoizey.gremlins"
         "github.github-vscode-theme"
@@ -2157,7 +2158,7 @@ menu_dev_apps() {
         echo -e "${BOLD}========================================================================${NC}"
         echo -e "${BOLD}                     DEVELOPMENT & AI TOOLS                             ${NC}"
         echo -e "${BOLD}========================================================================${NC}"
-        echo -e " 1) VS Code + Extension Suite        $st_vscode ${CYAN}[OFFICIAL + 20 DEV EXTENSIONS]${NC}"
+        echo -e " 1) VS Code + Extension Suite        $st_vscode ${CYAN}[OFFICIAL + 21 DEV EXTENSIONS]${NC}"
         echo -e " 2) Antigravity IDE                  $st_ag_ide ${CYAN}[OFFICIAL]${NC}"
         echo -e " 3) Antigravity 2.0 Platform         $st_ag_app ${CYAN}[OFFICIAL AUR: antigravity]${NC}"
         echo -e " 4) .NET Core SDK & ASP.NET (LTS)    $st_dotnet ${CYAN}[DYNAMIC LTS: v$(get_dotnet_latest_lts)]${NC}"
@@ -3763,7 +3764,7 @@ while true; do
     echo -e "${BOLD}========================================================================${NC}"
     echo -e "${BOLD}              MANJARO CONTROL CENTER (v${SCRIPT_VERSION})               ${NC}"
     echo -e "${BOLD}========================================================================${NC}"
-    echo -e " ${BOLD}1)${NC} Optimize the system (Timeshift, Kernel Check, Full AUR/Repo Sync, ZRAM, Sysctl)"
+    echo -e " ${BOLD}1)${NC} Optimize the system (Kernel Check, Full AUR/Repo Sync, ZRAM, Sysctl)"
     echo -e " ${BOLD}2)${NC} Desktop UI, Storage & Hardware Settings"
     echo -e " ${BOLD}3)${NC} Extra Apps (Install, Reinstall & Uninstall Hub)"
     echo -e " ${BOLD}4)${NC} Timeshift Snapshots & Boot Synchronization Manager"

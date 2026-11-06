@@ -36,19 +36,21 @@ rm -f /etc/systemd/system/timeshift-boot-sync.service
 systemctl daemon-reload
 log_ok "Systemd service removed."
 
-# 2. Remove native Timeshift restore hook
-log_info "2/5: Removing Timeshift native restore hook..."
+# 2. Remove native Timeshift restore and backup hooks
+log_info "2/6: Removing Timeshift native hooks..."
 rm -f /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync
 rm -f /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync.sh
-log_ok "Timeshift restore hook removed."
+rm -f /etc/timeshift/backup-hooks.d/01-timeshift-efi-backup
+rm -f /etc/timeshift/backup-hooks.d/01-timeshift-efi-backup.sh
+log_ok "Timeshift hooks removed."
 
 # 3. Remove desktop notification autostart
-log_info "3/5: Removing desktop notification autostart..."
+log_info "3/6: Removing desktop notification autostart..."
 rm -f /etc/xdg/autostart/timeshift-sync-notify.desktop
 log_ok "Autostart entry removed."
 
 # 4. Remove CLI binaries
-log_info "4/5: Removing CLI binaries from /usr/local/bin..."
+log_info "4/6: Removing CLI binaries from /usr/local/bin..."
 rm -f /usr/local/bin/timeshift-restore-sync \
       /usr/local/bin/timeshift-boot-sync.sh \
       /usr/local/bin/timeshift-sync-notify.sh \
@@ -57,7 +59,7 @@ rm -f /usr/local/bin/timeshift-restore-sync \
 log_ok "CLI binaries removed."
 
 # 5. Clean runtime and state flags
-log_info "5/5: Clearing transient state files..."
+log_info "5/6: Clearing transient state files..."
 rm -rf /run/timeshift-sync /var/lib/timeshift-sync /usr/local/lib/manjaro-opt
 log_ok "State and runtime directories cleared."
 

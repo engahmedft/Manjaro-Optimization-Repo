@@ -155,6 +155,13 @@ if [[ -n "$efi_dev" && -b "$efi_dev" ]] && ! mountpoint -q "$chroot_dir/boot/efi
     mount "$efi_dev" "$chroot_dir/boot/efi" && mounted_efi=true
 fi
 
+# 1:1 Pure Original EFI restore if snapshot contains efi_backup.tar.gz
+if [[ -n "${TS_SNAPSHOT_PATH:-}" && -f "$TS_SNAPSHOT_PATH/efi_backup.tar.gz" && -d "$chroot_dir/boot/efi" ]]; then
+    echo "[INFO] Restoring 1:1 original EFI partition from $TS_SNAPSHOT_PATH/efi_backup.tar.gz..."
+    tar -xzf "$TS_SNAPSHOT_PATH/efi_backup.tar.gz" -C "$chroot_dir/boot/efi"
+    echo "[OK] EFI partition restored from snapshot archive."
+fi
+
 mount --bind /dev "$chroot_dir/dev"
 mount --bind /proc "$chroot_dir/proc"
 mount --bind /sys "$chroot_dir/sys"

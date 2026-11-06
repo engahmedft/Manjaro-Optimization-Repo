@@ -186,6 +186,9 @@ main() {
     if [[ -d "/mnt/ts-sync-root/@home" ]]; then
         btrfs subvolume snapshot -r "/mnt/ts-sync-root/@home" "$pre_snap_dir/@home" >/dev/null
     fi
+    if [[ -d "/boot/efi" && -n "$(ls -A /boot/efi 2>/dev/null)" ]]; then
+        tar -czf "$pre_snap_dir/efi_backup.tar.gz" -C /boot/efi . 2>/dev/null || true
+    fi
     cat << EOF > "$pre_snap_dir/info.json"
 {
   "created" : "$(date +'%Y-%m-%d %H:%M:%S')",
@@ -278,6 +281,13 @@ EOF
         mount "$efi_dev" "$chroot_dir/boot/efi"
     fi
 
+    # 1:1 Pure Original EFI restore if snapshot contains efi_backup.tar.gz
+    if [[ -f "$selected_snap/efi_backup.tar.gz" && -d "$chroot_dir/boot/efi" ]]; then
+        log_info "Restoring 1:1 original EFI partition from $selected_snap/efi_backup.tar.gz..."
+        tar -xzf "$selected_snap/efi_backup.tar.gz" -C "$chroot_dir/boot/efi"
+        log_ok "EFI partition restored from snapshot archive."
+    fi
+
     mount --bind /dev "$chroot_dir/dev"
     mount --bind /proc "$chroot_dir/proc"
     mount --bind /sys "$chroot_dir/sys"
@@ -330,7 +340,12 @@ EOF
     echo -e " Restored Snapshot: ${BOLD}$selected_name${NC}"
     echo -e " Kernels Active:    ${BOLD}$snap_kernels${NC}"
     echo -e " GRUB Boot Menu:    ${GREEN}Synchronized with zero missing-kernel errors${NC}"
-    echo -e " User Data (@home): ${GREEN}Safely preserved${NC}"
+    local home_status="Safely preserved (untouched)"
+    [[ "$home_choice" == "2" ]] && home_status="Rolled back to snapshot state"
+    echo -e " User Data (@home): ${GREEN}${home_status}${NC}"
+    if [[ -f "$selected_snap/efi_backup.tar.gz" ]]; then
+        echo -e " EFI Bootloader:    ${GREEN}Restored 1:1 from snapshot archive${NC}"
+    fi
     echo -e " Safety Backup:     ${BOLD}${ts_timestamp}_pre_restore_sync${NC}"
     echo "----------------------------------------------------------------"
     

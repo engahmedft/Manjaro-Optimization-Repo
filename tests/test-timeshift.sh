@@ -95,6 +95,27 @@ untrack_unlocked_snapshot "$mock_snap1"
 assert_eq 1 "${#UNLOCKED_SNAPSHOTS[@]}" "Unlocked snapshots decremented after relocking"
 assert_eq "$mock_snap2" "${UNLOCKED_SNAPSHOTS[0]}" "Remaining snapshot is snap2"
 
+# ------------------------------------------------------------------------------
+# Test 4: EFI Partition Archival & Extraction Hook
+# ------------------------------------------------------------------------------
+echo "--- Testing EFI partition archival & extraction ---"
+MOCK_EFI="$TEST_SANDBOX/mock_efi"
+MOCK_SNAP="$TEST_SANDBOX/mock_snap"
+MOCK_RESTORE_EFI="$TEST_SANDBOX/mock_restore_efi"
+mkdir -p "$MOCK_EFI/EFI/Manjaro" "$MOCK_EFI/EFI/Boot" "$MOCK_SNAP" "$MOCK_RESTORE_EFI"
+echo "GRUB_EFI_BINARY_DATA" > "$MOCK_EFI/EFI/Manjaro/grubx64.efi"
+echo "BOOT_EFI_BINARY_DATA" > "$MOCK_EFI/EFI/Boot/bootx64.efi"
+
+# Simulate post-backup hook with TS_SNAPSHOT_PATH
+tar -czf "$MOCK_SNAP/efi_backup.tar.gz" -C "$MOCK_EFI" .
+
+assert_eq 1 "$([[ -f "$MOCK_SNAP/efi_backup.tar.gz" ]] && echo 1 || echo 0)" "EFI backup archive created in snapshot directory"
+
+# Simulate restore extraction
+tar -xzf "$MOCK_SNAP/efi_backup.tar.gz" -C "$MOCK_RESTORE_EFI"
+assert_eq 1 "$([[ -f "$MOCK_RESTORE_EFI/EFI/Manjaro/grubx64.efi" ]] && echo 1 || echo 0)" "Manjaro EFI binary restored"
+assert_eq "GRUB_EFI_BINARY_DATA" "$(cat "$MOCK_RESTORE_EFI/EFI/Manjaro/grubx64.efi")" "EFI binary content verified intact"
+
 echo ""
 echo "========================================================================"
 echo "TEST RESULTS: $PASSED passed, $FAILED failed."

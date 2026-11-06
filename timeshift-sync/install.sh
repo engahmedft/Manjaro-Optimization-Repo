@@ -31,7 +31,7 @@ echo -e "${BOLD}${CYAN}  INSTALLING TIMESHIFT, BOOT & KERNEL SYNCHRONIZATION SYS
 echo -e "${BOLD}${CYAN}================================================================${NC}"
 
 # 1. Install shared library and global CLI commands
-log_info "1/6: Installing global CLI commands into /usr/local/bin..."
+log_info "1/7: Installing global CLI commands into /usr/local/bin..."
 if [[ -f "$SCRIPT_DIR/../lib/common.sh" ]]; then
     install -Dm644 "$SCRIPT_DIR/../lib/common.sh" /usr/local/lib/manjaro-opt/common.sh
 fi
@@ -52,38 +52,46 @@ chmod +x /usr/local/bin/timeshift-check-grub
 log_ok "Global CLI commands installed (timeshift-restore-sync, timeshift-fix-snapshots, timeshift-check-grub)."
 
 # 2. Install Native Timeshift GUI/CLI Restore Hook (Must NOT have .sh extension for run-parts)
-log_info "2/6: Installing native Timeshift post-restore hook..."
+log_info "2/7: Installing native Timeshift post-restore hook..."
 mkdir -p /etc/timeshift/restore-hooks.d
 rm -f /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync.sh
 cp "$SCRIPT_DIR/timeshift-restore-hook.sh" /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync
 chmod +x /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync
 log_ok "Native hook active at /etc/timeshift/restore-hooks.d/00-timeshift-boot-sync (validated for run-parts)."
 
-# 3. Install First-Boot Systemd Service
-log_info "3/6: Installing first-boot safeguard systemd service..."
+# 3. Install Native Timeshift Post-Backup Hook for EFI Archiving
+log_info "3/7: Installing native Timeshift post-backup hook for EFI partition archiving..."
+mkdir -p /etc/timeshift/backup-hooks.d
+rm -f /etc/timeshift/backup-hooks.d/01-timeshift-efi-backup.sh
+cp "$SCRIPT_DIR/timeshift-efi-backup-hook.sh" /etc/timeshift/backup-hooks.d/01-timeshift-efi-backup
+chmod +x /etc/timeshift/backup-hooks.d/01-timeshift-efi-backup
+log_ok "Native backup hook active at /etc/timeshift/backup-hooks.d/01-timeshift-efi-backup."
+
+# 4. Install First-Boot Systemd Service
+log_info "4/7: Installing first-boot safeguard systemd service..."
 cp "$SCRIPT_DIR/timeshift-boot-sync.service" /etc/systemd/system/timeshift-boot-sync.service
 systemctl daemon-reload
 systemctl enable timeshift-boot-sync.service
 log_ok "Service enabled: timeshift-boot-sync.service."
 
-# 4. Install Desktop Notification Autostart
-log_info "4/6: Configuring desktop notification handler..."
+# 5. Install Desktop Notification Autostart
+log_info "5/7: Configuring desktop notification handler..."
 mkdir -p /etc/xdg/autostart
 cp "$SCRIPT_DIR/timeshift-sync-notify.desktop" /etc/xdg/autostart/timeshift-sync-notify.desktop
 log_ok "Desktop notification handler installed."
 
-# 5. Fix Existing Older Snapshots (On-Demand)
+# 6. Fix Existing Older Snapshots (On-Demand)
 if [[ "$REPAIR_SNAPSHOTS" == "true" ]]; then
-    log_info "5/6: Inspecting and fixing existing Timeshift snapshots (--repair-snapshots enabled)..."
+    log_info "6/7: Inspecting and fixing existing Timeshift snapshots (--repair-snapshots enabled)..."
     bash "$SCRIPT_DIR/fix-existing-snapshots.sh"
     log_ok "Existing snapshots repaired and verified."
 else
-    log_info "5/6: Existing snapshot repair skipped by default."
+    log_info "6/7: Existing snapshot repair skipped by default."
     log_info "     (Use --repair-snapshots or run 'timeshift-fix-snapshots' on demand)."
 fi
 
-# 6. Ensure GRUB BTRFS daemon is watching
-log_info "6/6: Verifying grub-btrfsd daemon..."
+# 7. Ensure GRUB BTRFS daemon is watching
+log_info "7/7: Verifying grub-btrfsd daemon..."
 if systemctl is-active grub-btrfsd.service &>/dev/null; then
     log_ok "grub-btrfsd daemon is active and monitoring."
 elif systemctl is-enabled grub-btrfsd.service &>/dev/null; then
